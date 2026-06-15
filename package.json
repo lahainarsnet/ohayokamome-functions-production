@@ -1,0 +1,8 @@
+{
+  "name": "ohayo-kamome-cloud-functions",
+  "private": true,
+  "description": "firebase.json がある階層（正本: github.com/lahainars/ohayou-kamome）。このディレクトリで npm run deploy:sendPushNotification",
+  "scripts": {
+    "deploy:sendPushNotification": "firebase deploy --only functions:sendPushNotification"
+  }
+}
