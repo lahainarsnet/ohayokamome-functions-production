@@ -706,6 +706,7 @@ exports.adminUpsertUserSubscription = onCall(async (request) => {
     subscriptionBasePlanId = "",
     subscriptionOfferId = "",
     expiryTimeMillis = null,     // 例: Date.now() + 30*24*60*60*1000
+    trialEndsAtMillis = null,    // 例: Date.now() + 7*24*60*60*1000
     activePurchaseTokens = [],   // string[]
     source = "manual_test"
   } = request.data || {};
@@ -714,7 +715,7 @@ exports.adminUpsertUserSubscription = onCall(async (request) => {
     throw new HttpsError("invalid-argument", "Parameter 'uid' is required.");
   }
 
-  const allowedStatuses = ["active", "grace", "paused", "expired", "canceled", "none"];
+  const allowedStatuses = ["active", "trial", "grace", "paused", "expired", "canceled", "none"];
   if (!allowedStatuses.includes(subscriptionStatus)) {
     throw new HttpsError("invalid-argument", "Invalid 'subscriptionStatus'.");
   }
@@ -737,6 +738,14 @@ exports.adminUpsertUserSubscription = onCall(async (request) => {
       throw new HttpsError("invalid-argument", "expiryTimeMillis must be a positive number.");
     }
     update.subscriptionExpiryTime = admin.Timestamp.fromMillis(n);
+  }
+
+  if (trialEndsAtMillis !== null) {
+    const n = Number(trialEndsAtMillis);
+    if (Number.isNaN(n) || n <= 0) {
+      throw new HttpsError("invalid-argument", "trialEndsAtMillis must be a positive number.");
+    }
+    update.subscriptionTrialEndsAt = admin.Timestamp.fromMillis(n);
   }
 
   await userRef.set(update, { merge: true });
