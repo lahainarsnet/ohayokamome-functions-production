@@ -6,10 +6,30 @@
 
 const { onDocumentCreated } = require("firebase-functions/v2/firestore");
 const { onCall, HttpsError } = require("firebase-functions/v2/https");
+const { defineSecret } = require("firebase-functions/params");
 const logger = require("firebase-functions/logger");
-const { randomUUID } = require("node:crypto");
+const crypto = require("node:crypto");
+const { google } = require("googleapis");
 const admin = require("./firebaseAdmin");
 const { transcribeExperiment } = require("./transcribeExperiment");
+
+const { randomUUID } = crypto;
+
+const APP_STORE_CONNECT_ISSUER_ID = defineSecret("APP_STORE_CONNECT_ISSUER_ID");
+const APP_STORE_CONNECT_KEY_ID = defineSecret("APP_STORE_CONNECT_KEY_ID");
+const APP_STORE_CONNECT_PRIVATE_KEY = defineSecret("APP_STORE_CONNECT_PRIVATE_KEY");
+
+const APP_STORE_PRODUCT_ID = "ohayo_kamome_monthly";
+const APP_STORE_BUNDLE_ID = "com.lahainarsnet.ohayokamome.live";
+const APP_STORE_API_PRODUCTION_BASE_URL = "https://api.storekit.itunes.apple.com";
+const APP_STORE_API_SANDBOX_BASE_URL = "https://api.storekit-sandbox.itunes.apple.com";
+const GOOGLE_PLAY_PACKAGE_NAME = "com.lahainarsnet.ohayokamome.live";
+const GOOGLE_PLAY_MONTHLY_PRODUCT_ID = "ohayo_kamome_monthly";
+const GOOGLE_PLAY_ACTIVE_STATES = new Set([
+  "SUBSCRIPTION_STATE_ACTIVE",
+  "SUBSCRIPTION_STATE_IN_GRACE_PERIOD",
+]);
+const GOOGLE_PLAY_BILLING_TRACE = "KAMOME_BILLING_TRACE";
 
 /* =========================================================
  * ユーティリティ：JST の日付キー (YYYY-MM-DD) を得る
@@ -113,6 +133,251 @@ async function loadAppConfig() {
     logger.warn("Failed to read config/app; using defaults.", e);
     return defaults;
   }
+}
+
+function readSecret(secret, envName) {
+  try {
+    const value = secret.value();
+    if (typeof value === "string" && value.trim().length > 0) {
+      return value.trim();
+    }
+  } catch (error) {
+    // Local syntax checks and non-secret deployments can still use process.env.
+  }
+
+  const envValue = process.env[envName];
+  return typeof envValue === "string" ? envValue.trim() : "";
+}
+
+function normalizePrivateKey(rawPrivateKey) {
+  return rawPrivateKey.replace(/\\n/g, "\n");
+}
+
+function base64UrlEncode(value) {
+  return Buffer.from(value)
+    .toString("base64")
+    .replace(/\+/g, "-")
+    .replace(/\//g, "_")
+    .replace(/=+$/g, "");
+}
+
+function base64UrlDecodeJson(value) {
+  const padded = value + "=".repeat((4 - (value.length % 4)) % 4);
+  const json = Buffer.from(
+    padded.replace(/-/g, "+").replace(/_/g, "/"),
+    "base64"
+  ).toString("utf8");
+  return JSON.parse(json);
+}
+
+function createAppStoreServerApiJwt() {
+  const issuerId = readSecret(
+    APP_STORE_CONNECT_ISSUER_ID,
+    "APP_STORE_CONNECT_ISSUER_ID"
+  );
+  const keyId = readSecret(APP_STORE_CONNECT_KEY_ID, "APP_STORE_CONNECT_KEY_ID");
+  const privateKey = normalizePrivateKey(
+    readSecret(APP_STORE_CONNECT_PRIVATE_KEY, "APP_STORE_CONNECT_PRIVATE_KEY")
+  );
+
+  if (!issuerId || !keyId || !privateKey) {
+    throw new HttpsError(
+      "failed-precondition",
+      "App Store Server API credentials are not configured."
+    );
+  }
+
+  const nowSeconds = Math.floor(Date.now() / 1000);
+  const header = { alg: "ES256", kid: keyId, typ: "JWT" };
+  const payload = {
+    iss: issuerId,
+    iat: nowSeconds,
+    exp: nowSeconds + 20 * 60,
+    aud: "appstoreconnect-v1",
+    bid: APP_STORE_BUNDLE_ID,
+  };
+
+  const signingInput = [
+    base64UrlEncode(JSON.stringify(header)),
+    base64UrlEncode(JSON.stringify(payload)),
+  ].join(".");
+
+  const signature = crypto.sign("sha256", Buffer.from(signingInput), {
+    key: crypto.createPrivateKey(privateKey),
+    dsaEncoding: "ieee-p1363",
+  });
+
+  return `${signingInput}.${base64UrlEncode(signature)}`;
+}
+
+function extractAppStoreTransactionId(data) {
+  const candidates = [
+    data?.transactionId,
+    data?.originalTransactionId,
+    data?.purchaseId,
+    data?.purchaseID,
+    data?.serverVerificationData,
+  ];
+
+  for (const candidate of candidates) {
+    if (typeof candidate !== "string") continue;
+    const value = candidate.trim();
+    if (/^\d{5,}$/.test(value)) {
+      return value;
+    }
+    const parts = value.split(".");
+    if (parts.length === 3) {
+      try {
+        const payload = base64UrlDecodeJson(parts[1]);
+        if (typeof payload.transactionId === "string" && /^\d{5,}$/.test(payload.transactionId)) {
+          return payload.transactionId;
+        }
+        if (
+          typeof payload.originalTransactionId === "string" &&
+          /^\d{5,}$/.test(payload.originalTransactionId)
+        ) {
+          return payload.originalTransactionId;
+        }
+      } catch (error) {
+        // Not a StoreKit JWS; keep checking the remaining candidates.
+      }
+    }
+  }
+
+  return "";
+}
+
+function extractAppStoreEnvironmentHint(data) {
+  const candidates = [
+    data?.transactionId,
+    data?.originalTransactionId,
+    data?.purchaseId,
+    data?.purchaseID,
+    data?.serverVerificationData,
+  ];
+
+  for (const candidate of candidates) {
+    if (typeof candidate !== "string") continue;
+    const parts = candidate.trim().split(".");
+    if (parts.length !== 3) continue;
+
+    try {
+      const payload = base64UrlDecodeJson(parts[1]);
+      if (payload.environment === "Sandbox") {
+        return "Sandbox";
+      }
+      if (payload.environment === "Production") {
+        return "Production";
+      }
+    } catch (error) {
+      // Not a StoreKit JWS; keep checking the remaining candidates.
+    }
+  }
+
+  return "";
+}
+
+function decodeSignedTransactionInfo(signedTransactionInfo) {
+  if (typeof signedTransactionInfo !== "string") {
+    throw new Error("MISSING_SIGNED_TRANSACTION_INFO");
+  }
+
+  const parts = signedTransactionInfo.split(".");
+  if (parts.length !== 3) {
+    throw new Error("INVALID_SIGNED_TRANSACTION_INFO");
+  }
+
+  return base64UrlDecodeJson(parts[1]);
+}
+
+async function fetchAppStoreTransactionInfo(transactionId, environmentHint = "") {
+  const jwt = createAppStoreServerApiJwt();
+  const path = `/inApps/v1/transactions/${encodeURIComponent(transactionId)}`;
+  const defaultEnvironments = [
+    { name: "Production", baseUrl: APP_STORE_API_PRODUCTION_BASE_URL },
+    { name: "Sandbox", baseUrl: APP_STORE_API_SANDBOX_BASE_URL },
+  ];
+  const environments =
+    environmentHint === "Sandbox"
+      ? [defaultEnvironments[1], defaultEnvironments[0]]
+      : defaultEnvironments;
+
+  const errors = [];
+  for (const environment of environments) {
+    const response = await fetch(`${environment.baseUrl}${path}`, {
+      method: "GET",
+      headers: {
+        Authorization: `Bearer ${jwt}`,
+        Accept: "application/json",
+      },
+    });
+
+    const responseText = await response.text();
+    let responseBody = null;
+    if (responseText) {
+      try {
+        responseBody = JSON.parse(responseText);
+      } catch (error) {
+        responseBody = { raw: responseText.slice(0, 500) };
+      }
+    }
+
+    if (response.ok && responseBody?.signedTransactionInfo) {
+      return {
+        environment: environment.name,
+        signedTransactionInfo: responseBody.signedTransactionInfo,
+        transactionInfo: decodeSignedTransactionInfo(responseBody.signedTransactionInfo),
+      };
+    }
+
+    const appleErrorCode = responseBody?.errorCode || null;
+    errors.push({
+      environment: environment.name,
+      status: response.status,
+      appleErrorCode,
+      appleErrorMessage: responseBody?.errorMessage || null,
+    });
+  }
+
+  const credentialsRejected =
+    errors.length === environments.length &&
+    errors.every((item) => item.status === 401 || item.status === 403);
+  const error = new Error(
+    credentialsRejected
+      ? "APP_STORE_API_CREDENTIALS_REJECTED"
+      : "APP_STORE_TRANSACTION_LOOKUP_FAILED"
+  );
+  error.lookupErrors = errors;
+  error.credentialsRejected = credentialsRejected;
+  throw error;
+}
+
+function validateAppStoreSubscription(transactionInfo) {
+  const now = Date.now();
+  const expiresDate = Number(transactionInfo?.expiresDate || 0);
+  const productId = transactionInfo?.productId || "";
+  const bundleId = transactionInfo?.bundleId || "";
+  const revocationDate = Number(transactionInfo?.revocationDate || 0);
+
+  if (bundleId !== APP_STORE_BUNDLE_ID) {
+    return { active: false, code: "BUNDLE_ID_MISMATCH", expiresDate };
+  }
+  if (productId !== APP_STORE_PRODUCT_ID) {
+    return { active: false, code: "PRODUCT_ID_MISMATCH", expiresDate };
+  }
+  if (revocationDate > 0) {
+    return { active: false, code: "TRANSACTION_REVOKED", expiresDate };
+  }
+  if (!Number.isFinite(expiresDate) || expiresDate <= now) {
+    return { active: false, code: "SUBSCRIPTION_EXPIRED", expiresDate };
+  }
+
+  return { active: true, code: "ACTIVE", expiresDate };
+}
+
+function tokenSuffix(token) {
+  if (!token) return "empty";
+  return token.length <= 6 ? token : token.slice(-6);
 }
 
 /* =========================================================
@@ -687,6 +952,348 @@ exports.getUserInfoByAccountId = onCall(async (request) => {
     throw new HttpsError("internal", "Failed to retrieve user information.");
   }
 });
+
+/* =========================================================
+ * Subscription: Google Play subscription purchase verifier
+ *  - 本番Firebaseに存在するAndroid課金関数を正本リポジトリへ復元。
+ * =======================================================*/
+exports.verifyGooglePlaySubscriptionPurchase = onCall(
+  { region: "us-central1" },
+  async (request) => {
+    const uid = request.auth && request.auth.uid;
+    console.info(`${GOOGLE_PLAY_BILLING_TRACE} function called`, {
+      hasAuth: Boolean(request.auth),
+      uid: uid || null,
+    });
+    if (!uid) {
+      console.warn(`${GOOGLE_PLAY_BILLING_TRACE} function unauthenticated`, {
+        hasAuth: Boolean(request.auth),
+      });
+      throw new HttpsError("unauthenticated", "Sign-in is required.");
+    }
+
+    const data = request.data || {};
+    const productId = String(data.productId || "").trim();
+    const purchaseToken = String(data.purchaseToken || "").trim();
+    const packageName = String(data.packageName || GOOGLE_PLAY_PACKAGE_NAME).trim();
+    const source = String(data.source || "google_play_purchase").trim();
+    console.info(`${GOOGLE_PLAY_BILLING_TRACE} function payload`, {
+      uid,
+      productId,
+      packageName,
+      source,
+      hasPurchaseToken: Boolean(purchaseToken),
+      tokenSuffix: tokenSuffix(purchaseToken),
+    });
+
+    if (packageName !== GOOGLE_PLAY_PACKAGE_NAME) {
+      console.warn(`${GOOGLE_PLAY_BILLING_TRACE} function invalid packageName`, {
+        uid,
+        packageName,
+        expectedPackageName: GOOGLE_PLAY_PACKAGE_NAME,
+      });
+      throw new HttpsError("invalid-argument", "Unexpected package name.");
+    }
+    if (productId !== GOOGLE_PLAY_MONTHLY_PRODUCT_ID) {
+      console.warn(`${GOOGLE_PLAY_BILLING_TRACE} function invalid productId`, {
+        uid,
+        productId,
+        expectedProductId: GOOGLE_PLAY_MONTHLY_PRODUCT_ID,
+      });
+      throw new HttpsError("invalid-argument", "Unexpected product ID.");
+    }
+    if (!purchaseToken) {
+      console.warn(`${GOOGLE_PLAY_BILLING_TRACE} function missing purchaseToken`, {
+        uid,
+        productId,
+        packageName,
+      });
+      throw new HttpsError("invalid-argument", "purchaseToken is required.");
+    }
+
+    console.info(`${GOOGLE_PLAY_BILLING_TRACE} google play api auth start`, {
+      uid,
+      productId,
+      packageName,
+      tokenSuffix: tokenSuffix(purchaseToken),
+    });
+    const auth = await google.auth.getClient({
+      scopes: ["https://www.googleapis.com/auth/androidpublisher"],
+    });
+    const androidpublisher = google.androidpublisher({
+      version: "v3",
+      auth,
+    });
+
+    let subscription;
+    try {
+      console.info(`${GOOGLE_PLAY_BILLING_TRACE} google play api call start`, {
+        uid,
+        productId,
+        packageName,
+        tokenSuffix: tokenSuffix(purchaseToken),
+      });
+      const response = await androidpublisher.purchases.subscriptionsv2.get({
+        packageName,
+        token: purchaseToken,
+      });
+      subscription = response.data;
+      console.info(`${GOOGLE_PLAY_BILLING_TRACE} google play api call success`, {
+        uid,
+        productId,
+        packageName,
+        tokenSuffix: tokenSuffix(purchaseToken),
+        subscriptionState: subscription.subscriptionState || "",
+      });
+    } catch (error) {
+      console.error(`${GOOGLE_PLAY_BILLING_TRACE} google play api call failed`, {
+        uid,
+        productId,
+        packageName,
+        tokenSuffix: tokenSuffix(purchaseToken),
+        message: error && error.message,
+      });
+      throw new HttpsError(
+        "failed-precondition",
+        "Could not verify Google Play purchase.",
+      );
+    }
+
+    const lineItems = Array.isArray(subscription.lineItems)
+      ? subscription.lineItems
+      : [];
+    const matchedLineItem = lineItems.find(
+      (item) => item.productId === GOOGLE_PLAY_MONTHLY_PRODUCT_ID,
+    );
+    const subscriptionState = subscription.subscriptionState || "";
+    const isActive =
+      GOOGLE_PLAY_ACTIVE_STATES.has(subscriptionState) &&
+      matchedLineItem !== undefined;
+    console.info(`${GOOGLE_PLAY_BILLING_TRACE} google play verification result`, {
+      uid,
+      productId,
+      packageName,
+      tokenSuffix: tokenSuffix(purchaseToken),
+      subscriptionState,
+      matchedProduct: Boolean(matchedLineItem),
+      isActive,
+    });
+
+    if (!isActive) {
+      throw new HttpsError(
+        "failed-precondition",
+        "Google Play subscription is not active.",
+      );
+    }
+
+    const expiryTime =
+      matchedLineItem && matchedLineItem.expiryTime
+        ? matchedLineItem.expiryTime
+        : null;
+    const now = admin.FieldValue.serverTimestamp();
+
+    try {
+      console.info(`${GOOGLE_PLAY_BILLING_TRACE} firestore users update start`, {
+        uid,
+        productId,
+        packageName,
+        tokenSuffix: tokenSuffix(purchaseToken),
+        expiryTime,
+      });
+      await admin.getDb().collection("users").doc(uid).set(
+        {
+          subscriptionStatus: "active",
+          subscriptionProductId: GOOGLE_PLAY_MONTHLY_PRODUCT_ID,
+          subscriptionExpiryTime: expiryTime,
+          activePurchaseTokens: admin.FieldValue.arrayUnion(
+            purchaseToken,
+          ),
+          lastSubscriptionSource: source,
+          lastSubscriptionCheckedAt: now,
+          updatedAt: now,
+        },
+        { merge: true },
+      );
+      console.info(`${GOOGLE_PLAY_BILLING_TRACE} firestore users update success`, {
+        uid,
+        productId,
+        packageName,
+        tokenSuffix: tokenSuffix(purchaseToken),
+      });
+    } catch (error) {
+      console.error(`${GOOGLE_PLAY_BILLING_TRACE} firestore users update failed`, {
+        uid,
+        productId,
+        packageName,
+        tokenSuffix: tokenSuffix(purchaseToken),
+        message: error && error.message,
+      });
+      throw new HttpsError(
+        "internal",
+        "Could not update subscription status.",
+      );
+    }
+
+    console.info(`${GOOGLE_PLAY_BILLING_TRACE} function success`, {
+      uid,
+      productId,
+      packageName,
+      tokenSuffix: tokenSuffix(purchaseToken),
+      expiryTime,
+    });
+
+    return {
+      ok: true,
+      subscriptionStatus: "active",
+      productId: GOOGLE_PLAY_MONTHLY_PRODUCT_ID,
+      expiryTime,
+    };
+  },
+);
+
+/* =========================================================
+ * Subscription: App Store Server API purchase verifier
+ *  - iOS購入後、クライアントから transactionId / purchaseId を受け取り、
+ *    Appleの正式APIで取引情報を取得して有効なサブスクだけ active にする。
+ * =======================================================*/
+exports.verifyAppStoreSubscriptionPurchase = onCall(
+  {
+    secrets: [
+      APP_STORE_CONNECT_ISSUER_ID,
+      APP_STORE_CONNECT_KEY_ID,
+      APP_STORE_CONNECT_PRIVATE_KEY,
+    ],
+  },
+  async (request) => {
+    if (!request.auth) {
+      throw new HttpsError("unauthenticated", "Authentication required.");
+    }
+
+    const uid = request.auth.uid;
+    const data = request.data || {};
+    const transactionId = extractAppStoreTransactionId(data);
+    const environmentHint = extractAppStoreEnvironmentHint(data);
+
+    if (!transactionId) {
+      logger.warn("verifyAppStoreSubscriptionPurchase: missing transaction id.", {
+        uid,
+        hasServerVerificationData:
+          typeof request.data?.serverVerificationData === "string" &&
+          request.data.serverVerificationData.length > 0,
+      });
+      throw new HttpsError(
+        "invalid-argument",
+        "A valid App Store transactionId is required. Pass PurchaseDetails.purchaseID or transactionId from Flutter."
+      );
+    }
+
+    try {
+      const result = await fetchAppStoreTransactionInfo(
+        transactionId,
+        environmentHint
+      );
+      const validation = validateAppStoreSubscription(result.transactionInfo);
+
+      if (!validation.active) {
+        logger.warn("verifyAppStoreSubscriptionPurchase: inactive transaction.", {
+          uid,
+          transactionId,
+          environment: result.environment,
+          code: validation.code,
+          productId: result.transactionInfo?.productId || null,
+          bundleId: result.transactionInfo?.bundleId || null,
+          expiresDate: result.transactionInfo?.expiresDate || null,
+          revocationDate: result.transactionInfo?.revocationDate || null,
+        });
+
+        const inactiveUpdate = {
+          subscriptionStatus:
+            validation.code === "SUBSCRIPTION_EXPIRED" ? "expired" : "none",
+          subscriptionProductId: result.transactionInfo?.productId || "",
+          activePurchaseTokens: [],
+          lastSubscriptionSource: "app_store_server_api",
+          lastSubscriptionCheckedAt: admin.FieldValue.serverTimestamp(),
+          appStoreEnvironment:
+            result.transactionInfo?.environment || result.environment,
+          appStoreTransactionId: result.transactionInfo?.transactionId || transactionId,
+          appStoreOriginalTransactionId:
+            result.transactionInfo?.originalTransactionId || "",
+          appStoreValidationCode: validation.code,
+        };
+
+        if (validation.expiresDate > 0) {
+          inactiveUpdate.subscriptionExpiryTime =
+            admin.Timestamp.fromMillis(validation.expiresDate);
+        }
+
+        await admin.getDb().collection("users").doc(uid).set(
+          inactiveUpdate,
+          { merge: true }
+        );
+
+        throw new HttpsError(
+          "failed-precondition",
+          `App Store subscription is not active: ${validation.code}`
+        );
+      }
+
+      const update = {
+        subscriptionStatus: "active",
+        subscriptionProductId: APP_STORE_PRODUCT_ID,
+        subscriptionBasePlanId: "",
+        subscriptionOfferId: "",
+        subscriptionExpiryTime: admin.Timestamp.fromMillis(validation.expiresDate),
+        activePurchaseTokens: [transactionId],
+        lastSubscriptionSource: "app_store_server_api",
+        lastSubscriptionCheckedAt: admin.FieldValue.serverTimestamp(),
+        subscriptionPlatform: "ios",
+        appStoreEnvironment:
+          result.transactionInfo?.environment || result.environment,
+        appStoreTransactionId: result.transactionInfo?.transactionId || transactionId,
+        appStoreOriginalTransactionId:
+          result.transactionInfo?.originalTransactionId || "",
+        appStoreWebOrderLineItemId:
+          result.transactionInfo?.webOrderLineItemId || "",
+        appStoreValidationCode: validation.code,
+      };
+
+      await admin.getDb().collection("users").doc(uid).set(update, { merge: true });
+
+      logger.info("verifyAppStoreSubscriptionPurchase succeeded.", {
+        uid,
+        transactionId,
+        environment: update.appStoreEnvironment,
+        expiresDate: validation.expiresDate,
+      });
+
+      return {
+        success: true,
+        subscriptionStatus: "active",
+        productId: APP_STORE_PRODUCT_ID,
+        expiresDateMillis: validation.expiresDate,
+        environment: update.appStoreEnvironment,
+      };
+    } catch (error) {
+      if (error instanceof HttpsError) {
+        throw error;
+      }
+
+      logger.error("verifyAppStoreSubscriptionPurchase failed.", {
+        uid,
+        transactionId,
+        environmentHint: environmentHint || null,
+        credentialsRejected: error.credentialsRejected || false,
+        lookupErrors: error.lookupErrors || null,
+        message: error.message,
+        error,
+      });
+      throw new HttpsError(
+        "internal",
+        "Failed to verify App Store subscription purchase."
+      );
+    }
+  }
+);
 
 /* =========================================================
  * Subscription: admin callable updater (temporary)
