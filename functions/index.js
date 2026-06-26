@@ -194,6 +194,7 @@ function isSubscriptionUsable(subscriptionStatus, subscriptionExpiryTime, now = 
 function logRecipientSubscriptionGuard({
   recipientUidTail,
   subscriptionStatus,
+  subscriptionPlatform,
   expiry,
   expiryIsFuture,
   isSubscriptionUsable: usable,
@@ -203,14 +204,19 @@ function logRecipientSubscriptionGuard({
     (subscriptionStatus || "").trim().length === 0
       ? "(empty)"
       : (subscriptionStatus || "").trim().toLowerCase();
+  const platformForLog =
+    (subscriptionPlatform || "").trim().length === 0
+      ? "(empty)"
+      : (subscriptionPlatform || "").trim().toLowerCase();
   const expiryStr =
     expiry instanceof Date && !Number.isNaN(expiry.getTime())
       ? expiry.toISOString()
       : "null";
   logger.info(
     `[RecipientSubscriptionGuard] recipientUidTail=${recipientUidTail} ` +
-      `subscriptionStatus=${statusForLog} expiry=${expiryStr} ` +
-      `expiryIsFuture=${expiryIsFuture} isSubscriptionUsable=${usable} action=${action}`,
+      `subscriptionStatus=${statusForLog} recipientPlatform=${platformForLog} ` +
+      `expiry=${expiryStr} expiryIsFuture=${expiryIsFuture} ` +
+      `isSubscriptionUsable=${usable} action=${action}`,
   );
 }
 
@@ -818,6 +824,7 @@ exports.sendMessageWithLimit = onCall(async (request) => {
     .get();
   const recipientData = recipientDoc.exists ? recipientDoc.data() || {} : {};
   const subscriptionStatus = recipientData.subscriptionStatus;
+  const subscriptionPlatform = recipientData.subscriptionPlatform;
   const expiry = parseSubscriptionExpiryTime(recipientData.subscriptionExpiryTime);
   const now = new Date();
   const expiryIsFuture =
@@ -835,6 +842,7 @@ exports.sendMessageWithLimit = onCall(async (request) => {
     logRecipientSubscriptionGuard({
       recipientUidTail: uidTailForLog(recipientId),
       subscriptionStatus,
+      subscriptionPlatform,
       expiry,
       expiryIsFuture,
       isSubscriptionUsable: true,
@@ -844,6 +852,7 @@ exports.sendMessageWithLimit = onCall(async (request) => {
     logRecipientSubscriptionGuard({
       recipientUidTail: uidTailForLog(recipientId),
       subscriptionStatus,
+      subscriptionPlatform,
       expiry,
       expiryIsFuture,
       isSubscriptionUsable: false,
@@ -1225,6 +1234,7 @@ exports.verifyGooglePlaySubscriptionPurchase = onCall(
           subscriptionStatus: "active",
           subscriptionProductId: GOOGLE_PLAY_MONTHLY_PRODUCT_ID,
           subscriptionExpiryTime: expiryTime,
+          subscriptionPlatform: "android",
           activePurchaseTokens: admin.FieldValue.arrayUnion(
             purchaseToken,
           ),
