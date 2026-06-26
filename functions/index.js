@@ -135,6 +135,85 @@ async function loadAppConfig() {
   }
 }
 
+function uidTailForLog(uid) {
+  if (typeof uid !== "string" || uid.length === 0) {
+    return "(empty)";
+  }
+  return uid.length <= 6 ? uid : uid.slice(-6);
+}
+
+function parseSubscriptionExpiryTime(value) {
+  if (value == null) {
+    return null;
+  }
+  if (value instanceof admin.Timestamp) {
+    return value.toDate();
+  }
+  if (value instanceof Date) {
+    return value;
+  }
+  if (typeof value.toDate === "function") {
+    return value.toDate();
+  }
+  if (typeof value === "number") {
+    const millis = Math.trunc(value);
+    if (millis <= 0) {
+      return null;
+    }
+    return new Date(millis);
+  }
+  if (typeof value === "string") {
+    const trimmed = value.trim();
+    if (trimmed.length === 0) {
+      return null;
+    }
+    const millis = Number.parseInt(trimmed, 10);
+    if (!Number.isNaN(millis) && millis > 0) {
+      return new Date(millis);
+    }
+    const parsed = Date.parse(trimmed);
+    if (!Number.isNaN(parsed)) {
+      return new Date(parsed);
+    }
+    return null;
+  }
+  return null;
+}
+
+function isSubscriptionUsable(subscriptionStatus, subscriptionExpiryTime, now = new Date()) {
+  const normalized = (subscriptionStatus || "").trim().toLowerCase();
+  const statusAllowsAccess = normalized === "active" || normalized === "trial";
+  const expiryIsFuture =
+    subscriptionExpiryTime != null &&
+    subscriptionExpiryTime instanceof Date &&
+    !Number.isNaN(subscriptionExpiryTime.getTime()) &&
+    subscriptionExpiryTime.getTime() > now.getTime();
+  return statusAllowsAccess && expiryIsFuture;
+}
+
+function logRecipientSubscriptionGuard({
+  recipientUidTail,
+  subscriptionStatus,
+  expiry,
+  expiryIsFuture,
+  isSubscriptionUsable: usable,
+  action,
+}) {
+  const statusForLog =
+    (subscriptionStatus || "").trim().length === 0
+      ? "(empty)"
+      : (subscriptionStatus || "").trim().toLowerCase();
+  const expiryStr =
+    expiry instanceof Date && !Number.isNaN(expiry.getTime())
+      ? expiry.toISOString()
+      : "null";
+  logger.info(
+    `[RecipientSubscriptionGuard] recipientUidTail=${recipientUidTail} ` +
+      `subscriptionStatus=${statusForLog} expiry=${expiryStr} ` +
+      `expiryIsFuture=${expiryIsFuture} isSubscriptionUsable=${usable} action=${action}`,
+  );
+}
+
 function readSecret(secret, envName) {
   try {
     const value = secret.value();
@@ -730,6 +809,47 @@ exports.sendMessageWithLimit = onCall(async (request) => {
       { recipientId, senderId },
     );
     return { success: false, code: "RECIPIENT_CONTACT_MISSING" };
+  }
+
+  const recipientDoc = await admin
+    .getDb()
+    .collection("users")
+    .doc(recipientId)
+    .get();
+  const recipientData = recipientDoc.exists ? recipientDoc.data() || {} : {};
+  const subscriptionStatus = recipientData.subscriptionStatus;
+  const expiry = parseSubscriptionExpiryTime(recipientData.subscriptionExpiryTime);
+  const now = new Date();
+  const expiryIsFuture =
+    expiry != null &&
+    expiry instanceof Date &&
+    !Number.isNaN(expiry.getTime()) &&
+    expiry.getTime() > now.getTime();
+  const subscriptionUsable = isSubscriptionUsable(
+    subscriptionStatus,
+    expiry,
+    now,
+  );
+
+  if (subscriptionUsable) {
+    logRecipientSubscriptionGuard({
+      recipientUidTail: uidTailForLog(recipientId),
+      subscriptionStatus,
+      expiry,
+      expiryIsFuture,
+      isSubscriptionUsable: true,
+      action: "allowSend",
+    });
+  } else {
+    logRecipientSubscriptionGuard({
+      recipientUidTail: uidTailForLog(recipientId),
+      subscriptionStatus,
+      expiry,
+      expiryIsFuture,
+      isSubscriptionUsable: false,
+      action: "blockSend",
+    });
+    return { success: false, code: "SEND_UNAVAILABLE" };
   }
 
   const today = getJstDateKey(new Date());
