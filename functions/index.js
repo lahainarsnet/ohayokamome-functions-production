@@ -142,45 +142,97 @@ function uidTailForLog(uid) {
   return uid.length <= 6 ? uid : uid.slice(-6);
 }
 
-function parseSubscriptionExpiryTime(value) {
+function previewExpiryRawForLog(value) {
   if (value == null) {
-    return null;
+    return "(null)";
   }
   if (value instanceof admin.Timestamp) {
-    return value.toDate();
+    return "timestamp";
   }
   if (value instanceof Date) {
-    return value;
+    return value.toISOString().slice(0, 28);
+  }
+  if (typeof value === "number") {
+    return String(Math.trunc(value));
+  }
+  if (typeof value === "string") {
+    const trimmed = value.trim();
+    if (trimmed.length <= 28) {
+      return trimmed;
+    }
+    return `${trimmed.slice(0, 28)}…`;
+  }
+  return typeof value;
+}
+
+function rawExpiryTypeForLog(value) {
+  if (value == null) {
+    return "null";
+  }
+  if (value instanceof admin.Timestamp) {
+    return "timestamp";
+  }
+  if (value instanceof Date) {
+    return "date";
   }
   if (typeof value.toDate === "function") {
-    return value.toDate();
+    return "timestampLike";
+  }
+  if (typeof value === "number") {
+    return "number";
+  }
+  if (typeof value === "string") {
+    return "string";
+  }
+  return typeof value;
+}
+
+function parseSubscriptionExpiryTimeWithMeta(value) {
+  if (value == null) {
+    return { expiry: null, parsePath: "null" };
+  }
+  if (value instanceof admin.Timestamp) {
+    return { expiry: value.toDate(), parsePath: "timestamp" };
+  }
+  if (value instanceof Date) {
+    return { expiry: value, parsePath: "date" };
+  }
+  if (typeof value.toDate === "function") {
+    return { expiry: value.toDate(), parsePath: "timestampLike" };
   }
   if (typeof value === "number") {
     const millis = Math.trunc(value);
     if (millis <= 0) {
-      return null;
+      return { expiry: null, parsePath: "numberInvalid" };
     }
-    return new Date(millis);
+    return { expiry: new Date(millis), parsePath: "number" };
   }
   if (typeof value === "string") {
     const trimmed = value.trim();
     if (trimmed.length === 0) {
-      return null;
+      return { expiry: null, parsePath: "emptyString" };
     }
-    const millis = Number.parseInt(trimmed, 10);
-    if (!Number.isNaN(millis) && millis > 0) {
-      return new Date(millis);
+    if (/^\d+$/.test(trimmed)) {
+      const millis = Number(trimmed);
+      if (Number.isFinite(millis) && millis > 0) {
+        return { expiry: new Date(millis), parsePath: "numericString" };
+      }
+      return { expiry: null, parsePath: "numericStringInvalid" };
     }
     const parsed = Date.parse(trimmed);
     if (!Number.isNaN(parsed)) {
-      return new Date(parsed);
+      return { expiry: new Date(parsed), parsePath: "isoString" };
     }
-    return null;
+    return { expiry: null, parsePath: "stringUnparsed" };
   }
-  return null;
+  return { expiry: null, parsePath: "unsupportedType" };
 }
 
-function isSubscriptionUsable(subscriptionStatus, subscriptionExpiryTime, now = new Date()) {
+function parseSubscriptionExpiryTime(value) {
+  return parseSubscriptionExpiryTimeWithMeta(value).expiry;
+}
+
+function describeSubscriptionUsability(subscriptionStatus, subscriptionExpiryTime, now = new Date()) {
   const normalized = (subscriptionStatus || "").trim().toLowerCase();
   const statusAllowsAccess = normalized === "active" || normalized === "trial";
   const expiryIsFuture =
@@ -188,16 +240,35 @@ function isSubscriptionUsable(subscriptionStatus, subscriptionExpiryTime, now = 
     subscriptionExpiryTime instanceof Date &&
     !Number.isNaN(subscriptionExpiryTime.getTime()) &&
     subscriptionExpiryTime.getTime() > now.getTime();
-  return statusAllowsAccess && expiryIsFuture;
+  return {
+    statusAllowsAccess,
+    expiryIsFuture,
+    subscriptionUsable: statusAllowsAccess && expiryIsFuture,
+  };
+}
+
+function isSubscriptionUsable(subscriptionStatus, subscriptionExpiryTime, now = new Date()) {
+  return describeSubscriptionUsability(
+    subscriptionStatus,
+    subscriptionExpiryTime,
+    now,
+  ).subscriptionUsable;
 }
 
 function logRecipientSubscriptionGuard({
   recipientUidTail,
   subscriptionStatus,
   subscriptionPlatform,
+  rawExpiryType,
+  rawExpiryPreview,
+  parsePath,
   expiry,
+  parsedExpiryISO,
+  nowISO,
+  deltaMs,
+  statusAllowsAccess,
   expiryIsFuture,
-  isSubscriptionUsable: usable,
+  isSubscriptionUsable: subscriptionUsable,
   action,
 }) {
   const statusForLog =
@@ -208,15 +279,13 @@ function logRecipientSubscriptionGuard({
     (subscriptionPlatform || "").trim().length === 0
       ? "(empty)"
       : (subscriptionPlatform || "").trim().toLowerCase();
-  const expiryStr =
-    expiry instanceof Date && !Number.isNaN(expiry.getTime())
-      ? expiry.toISOString()
-      : "null";
   logger.info(
     `[RecipientSubscriptionGuard] recipientUidTail=${recipientUidTail} ` +
       `subscriptionStatus=${statusForLog} recipientPlatform=${platformForLog} ` +
-      `expiry=${expiryStr} expiryIsFuture=${expiryIsFuture} ` +
-      `isSubscriptionUsable=${usable} action=${action}`,
+      `rawExpiryType=${rawExpiryType} rawExpiryPreview=${rawExpiryPreview} parsePath=${parsePath} ` +
+      `parsedExpiryISO=${parsedExpiryISO} nowISO=${nowISO} deltaMs=${deltaMs} ` +
+      `statusAllowsAccess=${statusAllowsAccess} expiryIsFuture=${expiryIsFuture} ` +
+      `subscriptionUsable=${subscriptionUsable} action=${action}`,
   );
 }
 
@@ -825,37 +894,47 @@ exports.sendMessageWithLimit = onCall(async (request) => {
   const recipientData = recipientDoc.exists ? recipientDoc.data() || {} : {};
   const subscriptionStatus = recipientData.subscriptionStatus;
   const subscriptionPlatform = recipientData.subscriptionPlatform;
-  const expiry = parseSubscriptionExpiryTime(recipientData.subscriptionExpiryTime);
+  const rawExpiry = recipientData.subscriptionExpiryTime;
+  const { expiry, parsePath } = parseSubscriptionExpiryTimeWithMeta(rawExpiry);
   const now = new Date();
-  const expiryIsFuture =
-    expiry != null &&
-    expiry instanceof Date &&
-    !Number.isNaN(expiry.getTime()) &&
-    expiry.getTime() > now.getTime();
-  const subscriptionUsable = isSubscriptionUsable(
+  const usability = describeSubscriptionUsability(
     subscriptionStatus,
     expiry,
     now,
   );
+  const parsedExpiryISO =
+    expiry instanceof Date && !Number.isNaN(expiry.getTime())
+      ? expiry.toISOString()
+      : "null";
+  const nowISO = now.toISOString();
+  const deltaMs =
+    expiry instanceof Date && !Number.isNaN(expiry.getTime())
+      ? expiry.getTime() - now.getTime()
+      : "null";
+  const guardLogBase = {
+    recipientUidTail: uidTailForLog(recipientId),
+    subscriptionStatus,
+    subscriptionPlatform,
+    rawExpiryType: rawExpiryTypeForLog(rawExpiry),
+    rawExpiryPreview: previewExpiryRawForLog(rawExpiry),
+    parsePath,
+    expiry,
+    parsedExpiryISO,
+    nowISO,
+    deltaMs,
+    statusAllowsAccess: usability.statusAllowsAccess,
+    expiryIsFuture: usability.expiryIsFuture,
+    isSubscriptionUsable: usability.subscriptionUsable,
+  };
 
-  if (subscriptionUsable) {
+  if (usability.subscriptionUsable) {
     logRecipientSubscriptionGuard({
-      recipientUidTail: uidTailForLog(recipientId),
-      subscriptionStatus,
-      subscriptionPlatform,
-      expiry,
-      expiryIsFuture,
-      isSubscriptionUsable: true,
+      ...guardLogBase,
       action: "allowSend",
     });
   } else {
     logRecipientSubscriptionGuard({
-      recipientUidTail: uidTailForLog(recipientId),
-      subscriptionStatus,
-      subscriptionPlatform,
-      expiry,
-      expiryIsFuture,
-      isSubscriptionUsable: false,
+      ...guardLogBase,
       action: "blockSend",
     });
     return { success: false, code: "SEND_UNAVAILABLE" };
