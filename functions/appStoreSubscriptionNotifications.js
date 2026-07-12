@@ -29,6 +29,15 @@ function normalizeEnvironment(value) {
   return "";
 }
 
+function resolveNotificationEnvironment(decodedOrPeeked, fallback = "") {
+  return (
+    normalizeEnvironment(decodedOrPeeked?.data?.environment) ||
+    normalizeEnvironment(decodedOrPeeked?.environment) ||
+    normalizeEnvironment(fallback) ||
+    ""
+  );
+}
+
 function toLibraryEnvironment(environment) {
   return environment === "Sandbox" ? Environment.SANDBOX : Environment.PRODUCTION;
 }
@@ -65,7 +74,7 @@ function createSignedDataVerifier(environment, getAppAppleId) {
 
 function buildVerifierForSignedPayload(signedPayload, getAppAppleId) {
   const peeked = peekJwsPayload(signedPayload);
-  const environment = normalizeEnvironment(peeked?.environment);
+  const environment = resolveNotificationEnvironment(peeked);
   if (!environment) {
     return {
       verifier: createSignedDataVerifier("Production", getAppAppleId),
@@ -88,7 +97,7 @@ async function verifyNotificationPayload(signedPayload, getAppAppleId) {
     buildVerifierForSignedPayload(signedPayload, getAppAppleId);
   try {
     const decoded = await verifier.verifyAndDecodeNotification(signedPayload);
-    return { decoded, environment: normalizeEnvironment(decoded?.environment) || environment };
+    return { decoded, environment: resolveNotificationEnvironment(decoded, environment) };
   } catch (primaryError) {
     try {
       const decoded = await fallbackVerifier.verifyAndDecodeNotification(
@@ -96,7 +105,7 @@ async function verifyNotificationPayload(signedPayload, getAppAppleId) {
       );
       return {
         decoded,
-        environment: normalizeEnvironment(decoded?.environment) || environment,
+        environment: resolveNotificationEnvironment(decoded, environment),
       };
     } catch (fallbackError) {
       const error = new Error("JWS_VERIFICATION_FAILED");
@@ -126,7 +135,7 @@ function eventBaseFields(decodedNotification, environment) {
     notificationUUID: decodedNotification?.notificationUUID || "",
     notificationType: decodedNotification?.notificationType || "",
     subtype: decodedNotification?.subtype || "",
-    environment: environment || normalizeEnvironment(decodedNotification?.environment),
+    environment: resolveNotificationEnvironment(decodedNotification, environment),
     receivedAt: new Date(),
   };
 }
@@ -513,6 +522,8 @@ function createAppStoreNotificationHandler({
         errorMessage: error?.message || String(error),
         errorName: error?.name || null,
         errorStack: error?.stack || null,
+        errorStatus: error?.status ?? null,
+        errorCauseMessage: error?.cause?.message ?? null,
         primaryMessage: error?.primaryMessage,
         fallbackMessage: error?.fallbackMessage,
         lookupErrors: error?.lookupErrors || null,
@@ -521,13 +532,8 @@ function createAppStoreNotificationHandler({
       if (notificationUUID) {
         await writeSubscriptionEvent(db, notificationUUID, {
           ...eventBaseFields(
-            {
-              notificationUUID,
-              notificationType: peeked?.notificationType || "",
-              subtype: peeked?.subtype || "",
-              environment: peeked?.environment || "",
-            },
-            normalizeEnvironment(peeked?.environment)
+            peeked || {},
+            resolveNotificationEnvironment(peeked)
           ),
           status: "failed",
           errorCode: error?.message || "UNKNOWN_ERROR",
