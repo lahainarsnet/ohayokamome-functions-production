@@ -15,6 +15,10 @@ const { transcribeExperiment } = require("./transcribeExperiment");
 const {
   createAppStoreNotificationHandler,
 } = require("./appStoreSubscriptionNotifications");
+const {
+  createGooglePlayRtdnHandler,
+} = require("./googlePlaySubscriptionNotifications");
+const { onMessagePublished } = require("firebase-functions/v2/pubsub");
 
 const { randomUUID } = crypto;
 
@@ -1600,6 +1604,23 @@ exports.handleAppStoreServerNotification = onRequest(
     },
     getAppAppleId: () => APP_STORE_CONNECT_APP_APPLE_ID.value(),
   })
+);
+
+/* =========================================================
+ * Subscription: Google Play RTDN (phase 1)
+ *  - 自動更新・解約・期限切れ・返金などを受信し Firestore を同期
+ *  - verifyGooglePlaySubscriptionPurchase は変更しない
+ * =======================================================*/
+exports.handleGooglePlayRtdn = onMessagePublished(
+  {
+    topic: "google-play-rtdn",
+    region: "us-central1",
+  },
+  createGooglePlayRtdnHandler({
+    getDb: admin.getDb,
+    admin,
+    logger,
+  }),
 );
 
 exports.transcribeExperiment = transcribeExperiment;
