@@ -1582,6 +1582,7 @@ exports.adminUpsertUserSubscription = onCall(async (request) => {
 exports.handleAppStoreServerNotification = onRequest(
   {
     region: "us-central1",
+    invoker: "public",
     secrets: [
       APP_STORE_CONNECT_ISSUER_ID,
       APP_STORE_CONNECT_KEY_ID,
