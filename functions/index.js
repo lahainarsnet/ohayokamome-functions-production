@@ -299,6 +299,24 @@ function logRecipientSubscriptionGuard({
   );
 }
 
+function logSenderSubscriptionGuard({
+  senderUidTail,
+  subscriptionStatus,
+  expiryMillis,
+  action,
+  code,
+}) {
+  const statusForLog =
+    (subscriptionStatus || "").trim().length === 0
+      ? "(empty)"
+      : (subscriptionStatus || "").trim().toLowerCase();
+  logger.info(
+    `[SenderSubscriptionGuard] senderUidTail=${senderUidTail} ` +
+      `subscriptionStatus=${statusForLog} expiryMillis=${expiryMillis} ` +
+      `action=${action} code=${code}`,
+  );
+}
+
 function readSecret(secret, envName) {
   try {
     const value = secret.value();
@@ -952,6 +970,7 @@ exports.sendMessageWithLimit = onCall(async (request) => {
 
   const today = getJstDateKey(new Date());
   const userRef = admin.getDb().collection("users").doc(senderId);
+  let senderSubscriptionBlocked = false;
 
   try {
     await admin.getDb().runTransaction(async (transaction) => {
@@ -960,6 +979,32 @@ exports.sendMessageWithLimit = onCall(async (request) => {
       let lastSentDate = today;
 
       if (userDoc.exists) {
+        const senderData = userDoc.data() || {};
+        const senderSubscriptionStatus = senderData.subscriptionStatus;
+        const senderRawExpiry = senderData.subscriptionExpiryTime;
+        const { expiry: senderExpiry } =
+          parseSubscriptionExpiryTimeWithMeta(senderRawExpiry);
+        const senderUsability = describeSubscriptionUsability(
+          senderSubscriptionStatus,
+          senderExpiry,
+        );
+        if (!senderUsability.subscriptionUsable) {
+          const senderExpiryMillis =
+            senderExpiry instanceof Date &&
+            !Number.isNaN(senderExpiry.getTime())
+              ? senderExpiry.getTime()
+              : "null";
+          logSenderSubscriptionGuard({
+            senderUidTail: uidTailForLog(senderId),
+            subscriptionStatus: senderSubscriptionStatus,
+            expiryMillis: senderExpiryMillis,
+            action: "blockSend",
+            code: "SEND_UNAVAILABLE",
+          });
+          senderSubscriptionBlocked = true;
+          return;
+        }
+
         dailyCount = userDoc.get("dailyCount") || 0;
         lastSentDate = userDoc.get("lastSentDate") || today;
         if (lastSentDate !== today) {
@@ -1010,6 +1055,10 @@ exports.sendMessageWithLimit = onCall(async (request) => {
       };
       transaction.set(msgRef, messageData);
     });
+
+    if (senderSubscriptionBlocked) {
+      return { success: false, code: "SEND_UNAVAILABLE" };
+    }
 
     return { success: true };
   } catch (error) {
