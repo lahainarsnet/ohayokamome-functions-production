@@ -1613,7 +1613,7 @@ exports.handleAppStoreServerNotification = onRequest(
  * =======================================================*/
 exports.handleGooglePlayRtdn = onMessagePublished(
   {
-    topic: "google-play-rtdn",
+    topic: "ohayokamome-google-play-rtdn",
     region: "us-central1",
   },
   createGooglePlayRtdnHandler({
