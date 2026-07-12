@@ -248,12 +248,12 @@ async function applyUserSubscriptionUpdate(db, admin, uid, derived, source) {
       ? [derived.latestTransactionId]
       : [],
     lastSubscriptionSource: source,
-    lastSubscriptionCheckedAt: admin.firestore.FieldValue.serverTimestamp(),
-    updatedAt: admin.firestore.FieldValue.serverTimestamp(),
+    lastSubscriptionCheckedAt: admin.FieldValue.serverTimestamp(),
+    updatedAt: admin.FieldValue.serverTimestamp(),
   };
 
   if (derived.expiresDate > 0) {
-    update.subscriptionExpiryTime = admin.firestore.Timestamp.fromMillis(
+    update.subscriptionExpiryTime = admin.Timestamp.fromMillis(
       derived.expiresDate
     );
   }
@@ -510,7 +510,9 @@ function createAppStoreNotificationHandler({
       const notificationUUID = peeked?.notificationUUID || "";
       logger.error(`${NOTIFICATION_TRACE} failed`, {
         notificationUUID: notificationUUID || null,
-        message: error?.message,
+        errorMessage: error?.message || String(error),
+        errorName: error?.name || null,
+        errorStack: error?.stack || null,
         primaryMessage: error?.primaryMessage,
         fallbackMessage: error?.fallbackMessage,
         lookupErrors: error?.lookupErrors || null,
@@ -529,6 +531,7 @@ function createAppStoreNotificationHandler({
           ),
           status: "failed",
           errorCode: error?.message || "UNKNOWN_ERROR",
+          errorMessage: error?.message || String(error),
         });
       }
 
