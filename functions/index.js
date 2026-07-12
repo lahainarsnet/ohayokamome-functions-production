@@ -18,6 +18,11 @@ const {
 const {
   createGooglePlayRtdnHandler,
 } = require("./googlePlaySubscriptionNotifications");
+const {
+  fetchAppStoreAllSubscriptionStatuses,
+  pickLatestTransactionEntry,
+  deriveSubscriptionState,
+} = require("./appStoreServerCommon");
 const { onMessagePublished } = require("firebase-functions/v2/pubsub");
 
 const { randomUUID } = crypto;
@@ -555,6 +560,105 @@ function validateAppStoreSubscription(transactionInfo) {
   }
 
   return { active: true, code: "ACTIVE", expiresDate };
+}
+
+function buildAppStoreVerifySecrets() {
+  return {
+    issuerSecret: APP_STORE_CONNECT_ISSUER_ID,
+    keyIdSecret: APP_STORE_CONNECT_KEY_ID,
+    privateKeySecret: APP_STORE_CONNECT_PRIVATE_KEY,
+  };
+}
+
+async function fetchLatestAppStoreSubscriptionState({
+  lookupTransactionId,
+  environmentHint = "",
+}) {
+  const apiResult = await fetchAppStoreAllSubscriptionStatuses(
+    lookupTransactionId,
+    environmentHint,
+    buildAppStoreVerifySecrets()
+  );
+  const latestEntry = await pickLatestTransactionEntry(
+    apiResult.body,
+    (signedInfo) => Promise.resolve(decodeSignedTransactionInfo(signedInfo))
+  );
+  if (!latestEntry?.transactionInfo) {
+    return null;
+  }
+
+  const derived = deriveSubscriptionState(latestEntry.transactionInfo);
+  derived.environment =
+    latestEntry.transactionInfo?.environment || apiResult.environment || "";
+  return {
+    derived,
+    environment: apiResult.environment,
+    transactionInfo: latestEntry.transactionInfo,
+  };
+}
+
+function buildAppStoreVerifyActiveUpdate({
+  derived,
+  environment,
+  transactionInfo,
+  lookupTransactionId,
+}) {
+  const latestTransactionId =
+    derived.latestTransactionId ||
+    transactionInfo?.transactionId ||
+    lookupTransactionId;
+  return {
+    subscriptionStatus: "active",
+    subscriptionProductId: APP_STORE_PRODUCT_ID,
+    subscriptionBasePlanId: "",
+    subscriptionOfferId: "",
+    subscriptionExpiryTime: admin.Timestamp.fromMillis(derived.expiresDate),
+    activePurchaseTokens: [latestTransactionId],
+    lastSubscriptionSource: "app_store_server_api",
+    lastSubscriptionCheckedAt: admin.FieldValue.serverTimestamp(),
+    subscriptionPlatform: "ios",
+    appStoreEnvironment: derived.environment || environment || "",
+    appStoreTransactionId: latestTransactionId,
+    appStoreOriginalTransactionId: derived.originalTransactionId || "",
+    appStoreWebOrderLineItemId: transactionInfo?.webOrderLineItemId || "",
+    appStoreValidationCode: derived.validationCode || "ACTIVE",
+  };
+}
+
+function buildAppStoreVerifyInactiveUpdate({
+  derived,
+  environment,
+  transactionInfo,
+  lookupTransactionId,
+  validationCode,
+}) {
+  const latestTransactionId =
+    derived?.latestTransactionId ||
+    transactionInfo?.transactionId ||
+    lookupTransactionId;
+  const code = validationCode || derived?.validationCode || "SUBSCRIPTION_EXPIRED";
+  const inactiveUpdate = {
+    subscriptionStatus: code === "SUBSCRIPTION_EXPIRED" ? "expired" : "none",
+    subscriptionProductId: transactionInfo?.productId || APP_STORE_PRODUCT_ID,
+    activePurchaseTokens: [],
+    lastSubscriptionSource: "app_store_server_api",
+    lastSubscriptionCheckedAt: admin.FieldValue.serverTimestamp(),
+    appStoreEnvironment:
+      derived?.environment || transactionInfo?.environment || environment || "",
+    appStoreTransactionId: latestTransactionId,
+    appStoreOriginalTransactionId:
+      derived?.originalTransactionId ||
+      transactionInfo?.originalTransactionId ||
+      "",
+    appStoreValidationCode: code,
+  };
+  const expiresDate = Number(
+    derived?.expiresDate || transactionInfo?.expiresDate || 0
+  );
+  if (expiresDate > 0) {
+    inactiveUpdate.subscriptionExpiryTime = admin.Timestamp.fromMillis(expiresDate);
+  }
+  return inactiveUpdate;
 }
 
 function tokenSuffix(token) {
@@ -1474,25 +1578,93 @@ exports.verifyAppStoreSubscriptionPurchase = onCall(
           revocationDate: result.transactionInfo?.revocationDate || null,
         });
 
-        const inactiveUpdate = {
-          subscriptionStatus:
-            validation.code === "SUBSCRIPTION_EXPIRED" ? "expired" : "none",
-          subscriptionProductId: result.transactionInfo?.productId || "",
-          activePurchaseTokens: [],
-          lastSubscriptionSource: "app_store_server_api",
-          lastSubscriptionCheckedAt: admin.FieldValue.serverTimestamp(),
-          appStoreEnvironment:
-            result.transactionInfo?.environment || result.environment,
-          appStoreTransactionId: result.transactionInfo?.transactionId || transactionId,
-          appStoreOriginalTransactionId:
-            result.transactionInfo?.originalTransactionId || "",
-          appStoreValidationCode: validation.code,
-        };
-
-        if (validation.expiresDate > 0) {
-          inactiveUpdate.subscriptionExpiryTime =
-            admin.Timestamp.fromMillis(validation.expiresDate);
+        if (validation.code === "SUBSCRIPTION_EXPIRED") {
+          const lookupTransactionId =
+            result.transactionInfo?.originalTransactionId || transactionId;
+          try {
+            const latest = await fetchLatestAppStoreSubscriptionState({
+              lookupTransactionId,
+              environmentHint: environmentHint || result.environment,
+            });
+            if (latest?.derived?.status === "active") {
+              const update = buildAppStoreVerifyActiveUpdate({
+                derived: latest.derived,
+                environment: latest.environment,
+                transactionInfo: latest.transactionInfo,
+                lookupTransactionId,
+              });
+              await admin.getDb().collection("users").doc(uid).set(update, {
+                merge: true,
+              });
+              logger.info(
+                "verifyAppStoreSubscriptionPurchase succeeded via latest subscription status.",
+                {
+                  uid,
+                  transactionId,
+                  lookupTransactionId,
+                  latestTransactionId: update.appStoreTransactionId,
+                  environment: update.appStoreEnvironment,
+                  expiresDate: latest.derived.expiresDate,
+                }
+              );
+              return {
+                success: true,
+                subscriptionStatus: "active",
+                productId: APP_STORE_PRODUCT_ID,
+                expiresDateMillis: latest.derived.expiresDate,
+                environment: update.appStoreEnvironment,
+              };
+            }
+            if (latest?.derived) {
+              logger.warn(
+                "verifyAppStoreSubscriptionPurchase: latest subscription status still inactive.",
+                {
+                  uid,
+                  transactionId,
+                  lookupTransactionId,
+                  code: latest.derived.validationCode,
+                  expiresDate: latest.derived.expiresDate,
+                }
+              );
+              const inactiveUpdate = buildAppStoreVerifyInactiveUpdate({
+                derived: latest.derived,
+                environment: latest.environment,
+                transactionInfo: latest.transactionInfo,
+                lookupTransactionId,
+                validationCode: latest.derived.validationCode,
+              });
+              await admin.getDb().collection("users").doc(uid).set(
+                inactiveUpdate,
+                { merge: true }
+              );
+              throw new HttpsError(
+                "failed-precondition",
+                `App Store subscription is not active: ${latest.derived.validationCode}`
+              );
+            }
+          } catch (fallbackError) {
+            if (fallbackError instanceof HttpsError) {
+              throw fallbackError;
+            }
+            logger.warn(
+              "verifyAppStoreSubscriptionPurchase: latest subscription fallback failed.",
+              {
+                uid,
+                transactionId,
+                lookupTransactionId,
+                message: fallbackError?.message || null,
+              }
+            );
+          }
         }
+
+        const inactiveUpdate = buildAppStoreVerifyInactiveUpdate({
+          derived: null,
+          environment: result.environment,
+          transactionInfo: result.transactionInfo,
+          lookupTransactionId: transactionId,
+          validationCode: validation.code,
+        });
 
         await admin.getDb().collection("users").doc(uid).set(
           inactiveUpdate,
@@ -1505,25 +1677,19 @@ exports.verifyAppStoreSubscriptionPurchase = onCall(
         );
       }
 
-      const update = {
-        subscriptionStatus: "active",
-        subscriptionProductId: APP_STORE_PRODUCT_ID,
-        subscriptionBasePlanId: "",
-        subscriptionOfferId: "",
-        subscriptionExpiryTime: admin.Timestamp.fromMillis(validation.expiresDate),
-        activePurchaseTokens: [transactionId],
-        lastSubscriptionSource: "app_store_server_api",
-        lastSubscriptionCheckedAt: admin.FieldValue.serverTimestamp(),
-        subscriptionPlatform: "ios",
-        appStoreEnvironment:
-          result.transactionInfo?.environment || result.environment,
-        appStoreTransactionId: result.transactionInfo?.transactionId || transactionId,
-        appStoreOriginalTransactionId:
-          result.transactionInfo?.originalTransactionId || "",
-        appStoreWebOrderLineItemId:
-          result.transactionInfo?.webOrderLineItemId || "",
-        appStoreValidationCode: validation.code,
-      };
+      const update = buildAppStoreVerifyActiveUpdate({
+        derived: {
+          latestTransactionId:
+            result.transactionInfo?.transactionId || transactionId,
+          originalTransactionId: result.transactionInfo?.originalTransactionId || "",
+          expiresDate: validation.expiresDate,
+          validationCode: validation.code,
+          environment: result.transactionInfo?.environment || result.environment,
+        },
+        environment: result.environment,
+        transactionInfo: result.transactionInfo,
+        lookupTransactionId: transactionId,
+      });
 
       await admin.getDb().collection("users").doc(uid).set(update, { merge: true });
 
