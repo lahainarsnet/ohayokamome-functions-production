@@ -5,13 +5,16 @@
 // 初回実行時まで遅延（デプロイ時のコードロードタイムアウト対策）。
 
 const { onDocumentCreated } = require("firebase-functions/v2/firestore");
-const { onCall, HttpsError } = require("firebase-functions/v2/https");
+const { onCall, onRequest, HttpsError } = require("firebase-functions/v2/https");
 const { defineSecret } = require("firebase-functions/params");
 const logger = require("firebase-functions/logger");
 const crypto = require("node:crypto");
 const { google } = require("googleapis");
 const admin = require("./firebaseAdmin");
 const { transcribeExperiment } = require("./transcribeExperiment");
+const {
+  createAppStoreNotificationHandler,
+} = require("./appStoreSubscriptionNotifications");
 
 const { randomUUID } = crypto;
 
@@ -1567,5 +1570,31 @@ exports.adminUpsertUserSubscription = onCall(async (request) => {
   await userRef.set(update, { merge: true });
   return { success: true };
 });
+
+/* =========================================================
+ * Subscription: App Store Server Notifications V2 (phase 1)
+ *  - 自動更新・解約・期限切れ・返金などを受信し Firestore を同期
+ *  - verifyAppStoreSubscriptionPurchase は変更しない
+ * =======================================================*/
+exports.handleAppStoreServerNotification = onRequest(
+  {
+    region: "us-central1",
+    secrets: [
+      APP_STORE_CONNECT_ISSUER_ID,
+      APP_STORE_CONNECT_KEY_ID,
+      APP_STORE_CONNECT_PRIVATE_KEY,
+    ],
+  },
+  createAppStoreNotificationHandler({
+    getDb: admin.getDb,
+    admin,
+    logger,
+    secrets: {
+      issuerSecret: APP_STORE_CONNECT_ISSUER_ID,
+      keyIdSecret: APP_STORE_CONNECT_KEY_ID,
+      privateKeySecret: APP_STORE_CONNECT_PRIVATE_KEY,
+    },
+  })
+);
 
 exports.transcribeExperiment = transcribeExperiment;
