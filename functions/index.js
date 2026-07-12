@@ -6,7 +6,7 @@
 
 const { onDocumentCreated } = require("firebase-functions/v2/firestore");
 const { onCall, onRequest, HttpsError } = require("firebase-functions/v2/https");
-const { defineSecret } = require("firebase-functions/params");
+const { defineSecret, defineString } = require("firebase-functions/params");
 const logger = require("firebase-functions/logger");
 const crypto = require("node:crypto");
 const { google } = require("googleapis");
@@ -21,6 +21,9 @@ const { randomUUID } = crypto;
 const APP_STORE_CONNECT_ISSUER_ID = defineSecret("APP_STORE_CONNECT_ISSUER_ID");
 const APP_STORE_CONNECT_KEY_ID = defineSecret("APP_STORE_CONNECT_KEY_ID");
 const APP_STORE_CONNECT_PRIVATE_KEY = defineSecret("APP_STORE_CONNECT_PRIVATE_KEY");
+const APP_STORE_CONNECT_APP_APPLE_ID = defineString("APP_STORE_CONNECT_APP_APPLE_ID", {
+  default: "6782558611",
+});
 
 const APP_STORE_PRODUCT_ID = "ohayo_kamome_monthly";
 const APP_STORE_BUNDLE_ID = "com.lahainarsnet.ohayokamome.live";
@@ -1594,6 +1597,7 @@ exports.handleAppStoreServerNotification = onRequest(
       keyIdSecret: APP_STORE_CONNECT_KEY_ID,
       privateKeySecret: APP_STORE_CONNECT_PRIVATE_KEY,
     },
+    getAppAppleId: () => APP_STORE_CONNECT_APP_APPLE_ID.value(),
   })
 );
 

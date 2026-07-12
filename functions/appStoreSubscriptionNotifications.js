@@ -33,8 +33,7 @@ function toLibraryEnvironment(environment) {
   return environment === "Sandbox" ? Environment.SANDBOX : Environment.PRODUCTION;
 }
 
-function readAppAppleId() {
-  const raw = process.env.APP_STORE_CONNECT_APP_APPLE_ID;
+function parseAppAppleId(raw) {
   if (!raw) {
     return undefined;
   }
@@ -42,8 +41,16 @@ function readAppAppleId() {
   return Number.isFinite(parsed) && parsed > 0 ? parsed : undefined;
 }
 
-function createSignedDataVerifier(environment) {
-  const appAppleId = readAppAppleId();
+function readAppAppleId(getAppAppleId) {
+  const raw =
+    typeof getAppAppleId === "function"
+      ? getAppAppleId()
+      : process.env.APP_STORE_CONNECT_APP_APPLE_ID;
+  return parseAppAppleId(raw);
+}
+
+function createSignedDataVerifier(environment, getAppAppleId) {
+  const appAppleId = readAppAppleId(getAppAppleId);
   if (environment === "Production" && appAppleId === undefined) {
     throw new Error("APP_STORE_CONNECT_APP_APPLE_ID_REQUIRED_FOR_PRODUCTION");
   }
@@ -56,29 +63,29 @@ function createSignedDataVerifier(environment) {
   );
 }
 
-function buildVerifierForSignedPayload(signedPayload) {
+function buildVerifierForSignedPayload(signedPayload, getAppAppleId) {
   const peeked = peekJwsPayload(signedPayload);
   const environment = normalizeEnvironment(peeked?.environment);
   if (!environment) {
     return {
-      verifier: createSignedDataVerifier("Production"),
+      verifier: createSignedDataVerifier("Production", getAppAppleId),
       environment: "Production",
-      fallbackVerifier: createSignedDataVerifier("Sandbox"),
+      fallbackVerifier: createSignedDataVerifier("Sandbox", getAppAppleId),
     };
   }
   return {
-    verifier: createSignedDataVerifier(environment),
+    verifier: createSignedDataVerifier(environment, getAppAppleId),
     environment,
     fallbackVerifier:
       environment === "Production"
-        ? createSignedDataVerifier("Sandbox")
-        : createSignedDataVerifier("Production"),
+        ? createSignedDataVerifier("Sandbox", getAppAppleId)
+        : createSignedDataVerifier("Production", getAppAppleId),
   };
 }
 
-async function verifyNotificationPayload(signedPayload) {
+async function verifyNotificationPayload(signedPayload, getAppAppleId) {
   const { verifier, environment, fallbackVerifier } =
-    buildVerifierForSignedPayload(signedPayload);
+    buildVerifierForSignedPayload(signedPayload, getAppAppleId);
   try {
     const decoded = await verifier.verifyAndDecodeNotification(signedPayload);
     return { decoded, environment: normalizeEnvironment(decoded?.environment) || environment };
@@ -259,7 +266,13 @@ function isTestNotification(decodedNotification) {
   return type === "TEST";
 }
 
-function createAppStoreNotificationHandler({ getDb, admin, logger, secrets }) {
+function createAppStoreNotificationHandler({
+  getDb,
+  admin,
+  logger,
+  secrets,
+  getAppAppleId,
+}) {
   return async (req, res) => {
     if (req.method !== "POST") {
       res.status(405).send("Method Not Allowed");
@@ -276,7 +289,10 @@ function createAppStoreNotificationHandler({ getDb, admin, logger, secrets }) {
     const db = getDb();
 
     try {
-      const { decoded, environment } = await verifyNotificationPayload(signedPayload);
+      const { decoded, environment } = await verifyNotificationPayload(
+        signedPayload,
+        getAppAppleId
+      );
       const notificationUUID = decoded?.notificationUUID || "";
       const baseFields = eventBaseFields(decoded, environment);
 
@@ -314,7 +330,8 @@ function createAppStoreNotificationHandler({ getDb, admin, logger, secrets }) {
       }
 
       const verifier = createSignedDataVerifier(
-        environment === "Sandbox" ? "Sandbox" : "Production"
+        environment === "Sandbox" ? "Sandbox" : "Production",
+        getAppAppleId
       );
       const signedTransactionInfo = decoded?.data?.signedTransactionInfo || null;
       const signedRenewalInfo = decoded?.data?.signedRenewalInfo || null;
