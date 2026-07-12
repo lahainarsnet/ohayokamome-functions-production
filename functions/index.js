@@ -270,6 +270,52 @@ function isSubscriptionUsable(subscriptionStatus, subscriptionExpiryTime, now = 
   ).subscriptionUsable;
 }
 
+function normalizeSubscriptionPlatform(value) {
+  return (value || "").trim().toLowerCase();
+}
+
+const SUBSCRIPTION_PLATFORM_MISMATCH_MESSAGE = "SUBSCRIPTION_PLATFORM_MISMATCH";
+
+async function assertPurchasingPlatformAllowed(uid, purchasingPlatform) {
+  const normalizedPurchasing = normalizeSubscriptionPlatform(purchasingPlatform);
+  if (normalizedPurchasing !== "ios" && normalizedPurchasing !== "android") {
+    throw new HttpsError("internal", "Invalid purchasing platform.");
+  }
+
+  const userSnap = await admin.getDb().collection("users").doc(uid).get();
+  if (!userSnap.exists) {
+    return;
+  }
+
+  const userData = userSnap.data() || {};
+  const existingPlatform = normalizeSubscriptionPlatform(userData.subscriptionPlatform);
+  const { expiry } = parseSubscriptionExpiryTimeWithMeta(
+    userData.subscriptionExpiryTime
+  );
+  const usability = describeSubscriptionUsability(
+    userData.subscriptionStatus,
+    expiry
+  );
+
+  if (!usability.subscriptionUsable) {
+    return;
+  }
+
+  if (existingPlatform && existingPlatform !== normalizedPurchasing) {
+    logger.warn("Subscription purchase blocked due to platform mismatch.", {
+      uid,
+      existingPlatform,
+      purchasingPlatform: normalizedPurchasing,
+      subscriptionStatus: userData.subscriptionStatus,
+      code: SUBSCRIPTION_PLATFORM_MISMATCH_MESSAGE,
+    });
+    throw new HttpsError(
+      "failed-precondition",
+      SUBSCRIPTION_PLATFORM_MISMATCH_MESSAGE
+    );
+  }
+}
+
 function logRecipientSubscriptionGuard({
   recipientUidTail,
   subscriptionStatus,
@@ -1343,6 +1389,8 @@ exports.verifyGooglePlaySubscriptionPurchase = onCall(
       throw new HttpsError("unauthenticated", "Sign-in is required.");
     }
 
+    await assertPurchasingPlatformAllowed(uid, "android");
+
     const data = request.data || {};
     const productId = String(data.productId || "").trim();
     const purchaseToken = String(data.purchaseToken || "").trim();
@@ -1545,6 +1593,8 @@ exports.verifyAppStoreSubscriptionPurchase = onCall(
     const data = request.data || {};
     const transactionId = extractAppStoreTransactionId(data);
     const environmentHint = extractAppStoreEnvironmentHint(data);
+
+    await assertPurchasingPlatformAllowed(uid, "ios");
 
     if (!transactionId) {
       logger.warn("verifyAppStoreSubscriptionPurchase: missing transaction id.", {
