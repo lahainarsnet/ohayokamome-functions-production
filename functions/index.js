@@ -677,12 +677,23 @@ async function fetchLatestAppStoreSubscriptionState({
     environmentHint,
     buildAppStoreVerifySecrets()
   );
+  const meta = {};
   const latestEntry = await pickLatestTransactionEntry(
     apiResult.body,
-    (signedInfo) => Promise.resolve(decodeSignedTransactionInfo(signedInfo))
+    (signedInfo) => Promise.resolve(decodeSignedTransactionInfo(signedInfo)),
+    {
+      activeOnly: true,
+      now: Date.now(),
+      meta,
+    }
   );
   if (!latestEntry?.transactionInfo) {
-    return null;
+    return {
+      derived: null,
+      environment: apiResult.environment,
+      transactionInfo: null,
+      meta,
+    };
   }
 
   const derived = deriveSubscriptionState(latestEntry.transactionInfo);
@@ -692,6 +703,7 @@ async function fetchLatestAppStoreSubscriptionState({
     derived,
     environment: apiResult.environment,
     transactionInfo: latestEntry.transactionInfo,
+    meta,
   };
 }
 
@@ -1758,6 +1770,9 @@ exports.verifyAppStoreSubscriptionPurchase = onCall(
                 latest?.derived?.originalTransactionId || null,
               latestExpiresDate: latest?.derived?.expiresDate || null,
               latestValidationCode: latest?.derived?.validationCode || null,
+              latestCandidateCount: latest?.meta?.latestCandidateCount ?? 0,
+              activeCandidateCount: latest?.meta?.activeCandidateCount ?? 0,
+              adoptedTransactionId: latest?.meta?.adoptedTransactionId || null,
               latestTransactionInfo: summarizeTransactionInfo(
                 latest?.transactionInfo
               ),
@@ -1822,33 +1837,48 @@ exports.verifyAppStoreSubscriptionPurchase = onCall(
                 environment: update.appStoreEnvironment,
               };
             }
-            if (latest?.derived) {
-              logger.warn(
-                "verifyAppStoreSubscriptionPurchase: latest subscription status still inactive.",
-                {
-                  uid,
-                  transactionId,
-                  lookupTransactionId,
-                  code: latest.derived.validationCode,
-                  expiresDate: latest.derived.expiresDate,
-                }
-              );
-              const inactiveUpdate = buildAppStoreVerifyInactiveUpdate({
-                derived: latest.derived,
-                environment: latest.environment,
-                transactionInfo: latest.transactionInfo,
+            const fallbackExpiresDate =
+              latest?.derived?.expiresDate ||
+              result.transactionInfo?.expiresDate ||
+              null;
+            finalLog.reject("verify.latest_fallback.no_active_entitlement", {
+              transactionId,
+              originalTransactionId:
+                result.transactionInfo?.originalTransactionId || lookupTransactionId,
+              expiresDate: fallbackExpiresDate,
+              latestCandidateCount: latest?.meta?.latestCandidateCount ?? 0,
+              activeCandidateCount: latest?.meta?.activeCandidateCount ?? 0,
+              adoptedTransactionId: latest?.meta?.adoptedTransactionId || null,
+              rejectCode: "NO_ACTIVE_ENTITLEMENT",
+              billingTraceId: traceId || null,
+            });
+            logger.warn(
+              "verifyAppStoreSubscriptionPurchase: no active entitlement in latest subscription status.",
+              {
+                uid,
+                billingTraceId: traceId,
+                transactionId,
                 lookupTransactionId,
-                validationCode: latest.derived.validationCode,
-              });
-              await admin.getDb().collection("users").doc(uid).set(
-                inactiveUpdate,
-                { merge: true }
-              );
-              throw new HttpsError(
-                "failed-precondition",
-                `App Store subscription is not active: ${latest.derived.validationCode}`
-              );
-            }
+                latestCandidateCount: latest?.meta?.latestCandidateCount ?? 0,
+                activeCandidateCount: latest?.meta?.activeCandidateCount ?? 0,
+                expiresDate: fallbackExpiresDate,
+                rejectCode: "NO_ACTIVE_ENTITLEMENT",
+              }
+            );
+            throw new HttpsError(
+              "failed-precondition",
+              "App Store subscription is not active: SUBSCRIPTION_EXPIRED",
+              {
+                code: "NO_ACTIVE_ENTITLEMENT",
+                rejectCode: "NO_ACTIVE_ENTITLEMENT",
+                billingTraceId: traceId || null,
+                transactionId,
+                originalTransactionId:
+                  result.transactionInfo?.originalTransactionId ||
+                  lookupTransactionId,
+                expiresDate: fallbackExpiresDate,
+              }
+            );
           } catch (fallbackError) {
             if (fallbackError instanceof HttpsError) {
               throw fallbackError;

@@ -232,11 +232,18 @@ function deriveSubscriptionState(transactionInfo, nowMillis = Date.now()) {
   };
 }
 
-async function pickLatestTransactionEntry(statusResponseBody, decodeTransaction) {
+async function pickLatestTransactionEntry(statusResponseBody, decodeTransaction, options = {}) {
+  const {
+    activeOnly = false,
+    now = Date.now(),
+    meta = null,
+  } = options || {};
   const groups = Array.isArray(statusResponseBody?.data)
     ? statusResponseBody.data
     : [];
   let best = null;
+  let latestCandidateCount = 0;
+  let activeCandidateCount = 0;
 
   for (const group of groups) {
     const lastTransactions = Array.isArray(group?.lastTransactions)
@@ -256,6 +263,14 @@ async function pickLatestTransactionEntry(statusResponseBody, decodeTransaction)
         continue;
       }
       const expiresDate = Number(transactionInfo?.expiresDate || 0);
+      latestCandidateCount += 1;
+      const isActive = Number.isFinite(expiresDate) && expiresDate > now;
+      if (isActive) {
+        activeCandidateCount += 1;
+      }
+      if (activeOnly && !isActive) {
+        continue;
+      }
       if (!best || expiresDate > best.expiresDate) {
         best = {
           expiresDate,
@@ -265,6 +280,13 @@ async function pickLatestTransactionEntry(statusResponseBody, decodeTransaction)
         };
       }
     }
+  }
+
+  if (meta && typeof meta === "object") {
+    meta.latestCandidateCount = latestCandidateCount;
+    meta.activeCandidateCount = activeCandidateCount;
+    meta.adoptedTransactionId = best?.transactionInfo?.transactionId || null;
+    meta.activeOnly = activeOnly;
   }
 
   return best;
