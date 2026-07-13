@@ -23,6 +23,10 @@ const {
   pickLatestTransactionEntry,
   deriveSubscriptionState,
 } = require("./appStoreServerCommon");
+const {
+  assertSubscriptionNotLinkedToOtherUser,
+  ownershipIdentifiersFromAppStoreUpdate,
+} = require("./subscriptionOwnership");
 const { onMessagePublished } = require("firebase-functions/v2/pubsub");
 
 const { randomUUID } = crypto;
@@ -1512,6 +1516,13 @@ exports.verifyGooglePlaySubscriptionPurchase = onCall(
     const now = admin.FieldValue.serverTimestamp();
 
     try {
+      await assertSubscriptionNotLinkedToOtherUser(admin.getDb(), {
+        uid,
+        platform: "android",
+        identifiers: { purchaseToken },
+        log: console,
+      });
+
       console.info(`${GOOGLE_PLAY_BILLING_TRACE} firestore users update start`, {
         uid,
         productId,
@@ -1541,6 +1552,9 @@ exports.verifyGooglePlaySubscriptionPurchase = onCall(
         tokenSuffix: tokenSuffix(purchaseToken),
       });
     } catch (error) {
+      if (error instanceof HttpsError) {
+        throw error;
+      }
       console.error(`${GOOGLE_PLAY_BILLING_TRACE} firestore users update failed`, {
         uid,
         productId,
@@ -1643,6 +1657,12 @@ exports.verifyAppStoreSubscriptionPurchase = onCall(
                 transactionInfo: latest.transactionInfo,
                 lookupTransactionId,
               });
+              await assertSubscriptionNotLinkedToOtherUser(admin.getDb(), {
+                uid,
+                platform: "ios",
+                identifiers: ownershipIdentifiersFromAppStoreUpdate(update),
+                log: logger,
+              });
               await admin.getDb().collection("users").doc(uid).set(update, {
                 merge: true,
               });
@@ -1739,6 +1759,13 @@ exports.verifyAppStoreSubscriptionPurchase = onCall(
         environment: result.environment,
         transactionInfo: result.transactionInfo,
         lookupTransactionId: transactionId,
+      });
+
+      await assertSubscriptionNotLinkedToOtherUser(admin.getDb(), {
+        uid,
+        platform: "ios",
+        identifiers: ownershipIdentifiersFromAppStoreUpdate(update),
+        log: logger,
       });
 
       await admin.getDb().collection("users").doc(uid).set(update, { merge: true });
