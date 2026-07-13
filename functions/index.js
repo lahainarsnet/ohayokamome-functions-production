@@ -26,6 +26,9 @@ const {
 const {
   assertSubscriptionNotLinkedToOtherUser,
   ownershipIdentifiersFromAppStoreUpdate,
+  ensureAppStoreAppAccountTokenForUser,
+  claimIosSubscriptionOwnership,
+  claimAndroidSubscriptionOwnership,
 } = require("./subscriptionOwnership");
 const { onMessagePublished } = require("firebase-functions/v2/pubsub");
 
@@ -1522,6 +1525,14 @@ exports.verifyGooglePlaySubscriptionPurchase = onCall(
         identifiers: { purchaseToken },
         log: console,
       });
+      const linkedPurchaseToken = String(subscription.linkedPurchaseToken || "").trim();
+      await claimAndroidSubscriptionOwnership(admin.getDb(), admin, {
+        uid,
+        purchaseToken,
+        linkedPurchaseToken,
+        productId: GOOGLE_PLAY_MONTHLY_PRODUCT_ID,
+        log: console,
+      });
 
       console.info(`${GOOGLE_PLAY_BILLING_TRACE} firestore users update start`, {
         uid,
@@ -1663,6 +1674,13 @@ exports.verifyAppStoreSubscriptionPurchase = onCall(
                 identifiers: ownershipIdentifiersFromAppStoreUpdate(update),
                 log: logger,
               });
+              await claimIosSubscriptionOwnership(admin.getDb(), admin, {
+                uid,
+                update,
+                transactionInfo: latest.transactionInfo,
+                productId: APP_STORE_PRODUCT_ID,
+                log: logger,
+              });
               await admin.getDb().collection("users").doc(uid).set(update, {
                 merge: true,
               });
@@ -1767,6 +1785,13 @@ exports.verifyAppStoreSubscriptionPurchase = onCall(
         identifiers: ownershipIdentifiersFromAppStoreUpdate(update),
         log: logger,
       });
+      await claimIosSubscriptionOwnership(admin.getDb(), admin, {
+        uid,
+        update,
+        transactionInfo: result.transactionInfo,
+        productId: APP_STORE_PRODUCT_ID,
+        log: logger,
+      });
 
       await admin.getDb().collection("users").doc(uid).set(update, { merge: true });
 
@@ -1805,6 +1830,27 @@ exports.verifyAppStoreSubscriptionPurchase = onCall(
     }
   }
 );
+
+/* =========================================================
+ * Subscription: ensure App Store appAccountToken (UUID)
+ *  - users/{uid}.appStoreAppAccountToken を1ユーザー1UUIDで固定
+ * =======================================================*/
+exports.ensureAppStoreAppAccountToken = onCall(async (request) => {
+  if (!request.auth) {
+    throw new HttpsError("unauthenticated", "Authentication required.");
+  }
+
+  const uid = request.auth.uid;
+  const token = await ensureAppStoreAppAccountTokenForUser(admin.getDb(), admin, {
+    uid,
+    randomUuid: randomUUID,
+    log: logger,
+  });
+
+  return {
+    appStoreAppAccountToken: token,
+  };
+});
 
 /* =========================================================
  * Subscription: admin callable updater (temporary)
