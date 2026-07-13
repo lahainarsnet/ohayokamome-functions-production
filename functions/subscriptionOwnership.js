@@ -74,33 +74,47 @@ async function queryOtherOwnerUids(db, { uid, field, op, value, match }) {
   return matches;
 }
 
-function throwSubscriptionAlreadyLinked({ platform, ownerUid, ownershipId, log }) {
+function throwSubscriptionAlreadyLinked({
+  platform,
+  ownerUid,
+  ownershipId,
+  log,
+  traceId,
+  rejectCode = SUBSCRIPTION_ALREADY_LINKED_CODE,
+  rejectReason = "ownership_claim_rejected",
+}) {
   const payload = {
     platform,
     ownerUid: ownerUid || null,
+    ownershipId: ownershipId || null,
     ownershipIdSuffix: identifierSuffix(ownershipId),
+    billingTraceId: traceId || null,
+    rejectCode,
+    rejectReason,
   };
   if (typeof log === "function") {
-    log.warn("Subscription ownership claim rejected.", payload);
+    log.warn("subscription_ownership.claim_rejected", payload);
   }
-  throw new HttpsError(
-    "failed-precondition",
-    SUBSCRIPTION_ALREADY_LINKED_CODE,
-    {
-      code: SUBSCRIPTION_ALREADY_LINKED_CODE,
-      platform,
-    }
-  );
+  throw new HttpsError("failed-precondition", rejectCode, {
+    code: rejectCode,
+    platform,
+    ownerUid: ownerUid || null,
+    ownershipIdSuffix: identifierSuffix(ownershipId),
+  });
 }
 
-function throwSubscriptionTokenMismatch({ uid, ownershipId, log }) {
+function throwSubscriptionTokenMismatch({ uid, ownershipId, log, traceId }) {
   const payload = {
     platform: "ios",
     requestUid: uid,
+    ownershipId: ownershipId || null,
     ownershipIdSuffix: identifierSuffix(ownershipId),
+    billingTraceId: traceId || null,
+    rejectCode: SUBSCRIPTION_TOKEN_MISMATCH_CODE,
+    rejectReason: "app_account_token_mismatch",
   };
   if (typeof log === "function") {
-    log.warn("App Store appAccountToken mismatch.", payload);
+    log.warn("subscription_ownership.token_mismatch", payload);
   }
   throw new HttpsError(
     "failed-precondition",
@@ -128,10 +142,22 @@ async function claimOwnershipDocument(
     ownershipFields,
     linkedOwnershipId = "",
     log,
+    traceId,
   }
 ) {
   const now = admin.FieldValue.serverTimestamp();
   const linkedId = String(linkedOwnershipId || "").trim();
+
+  if (typeof log === "function") {
+    log.info("subscription_ownership.claim.start", {
+      billingTraceId: traceId || null,
+      platform,
+      requestUid: uid,
+      ownershipId,
+      ownershipIdSuffix: identifierSuffix(ownershipId),
+      linkedOwnershipId: linkedId || null,
+    });
+  }
 
   await db.runTransaction(async (tx) => {
     const { ref, snap } = await readOwnershipDoc(tx, db, ownershipId);
@@ -146,6 +172,8 @@ async function claimOwnershipDocument(
             ownerUid: linkedOwnerUid,
             ownershipId: linkedId,
             log,
+            traceId,
+            rejectReason: "linked_ownership_conflict",
           });
         }
         if (linkedOwnerUid === uid) {
@@ -230,13 +258,15 @@ async function claimOwnershipDocument(
       ownerUid: existingOwnerUid,
       ownershipId,
       log,
+      traceId,
+      rejectReason: "existing_owner_conflict",
     });
   });
 }
 
 async function assertSubscriptionNotLinkedToOtherUser(
   db,
-  { uid, platform, identifiers, log }
+  { uid, platform, identifiers, log, traceId }
 ) {
   const queries = [];
 
@@ -245,6 +275,16 @@ async function assertSubscriptionNotLinkedToOtherUser(
       identifiers?.originalTransactionId || ""
     ).trim();
     const transactionId = String(identifiers?.transactionId || "").trim();
+
+    if (typeof log === "function") {
+      log.info("subscription_ownership.users_search.start", {
+        billingTraceId: traceId || null,
+        platform,
+        requestUid: uid,
+        originalTransactionId: originalTransactionId || null,
+        transactionId: transactionId || null,
+      });
+    }
 
     if (originalTransactionId) {
       queries.push({
@@ -294,17 +334,28 @@ async function assertSubscriptionNotLinkedToOtherUser(
   }
 
   if (ownerUids.size === 0) {
+    if (typeof log === "function") {
+      log.info("subscription_ownership.users_search.allow", {
+        billingTraceId: traceId || null,
+        platform,
+        requestUid: uid,
+        hitCount: 0,
+      });
+    }
     return;
   }
 
   const ownerUidList = [...ownerUids];
   if (typeof log === "function") {
-    log.warn("Subscription ownership conflict in users collection.", {
+    log.warn("subscription_ownership.users_search.reject", {
+      billingTraceId: traceId || null,
       platform,
       requestUid: uid,
       ownerUidCount: ownerUidList.length,
       ownerUids: ownerUidList,
       matches: ownerMatches,
+      rejectCode: SUBSCRIPTION_ALREADY_LINKED_CODE,
+      rejectReason: "users_collection_conflict",
     });
   }
 
@@ -322,24 +373,44 @@ async function assertSubscriptionNotLinkedToOtherUser(
 async function ensureAppStoreAppAccountTokenForUser(
   db,
   admin,
-  { uid, randomUuid, log }
+  { uid, randomUuid, log, traceId }
 ) {
   const userRef = db.collection("users").doc(uid);
   let resolvedToken = "";
+  let tokenAction = "unknown";
+
+  if (typeof log === "function") {
+    log.info("ensure_app_account_token.enter", {
+      billingTraceId: traceId || null,
+      uid,
+    });
+  }
 
   await db.runTransaction(async (tx) => {
     const snap = await tx.get(userRef);
+    const docExists = snap.exists;
     const existing = normalizeUuid(
       snap.exists ? snap.get("appStoreAppAccountToken") : ""
     );
+    if (typeof log === "function") {
+      log.info("ensure_app_account_token.transaction.read", {
+        billingTraceId: traceId || null,
+        uid,
+        usersDocExists: docExists,
+        hasExistingToken: Boolean(existing),
+        existingTokenSuffix: identifierSuffix(existing),
+      });
+    }
     if (existing) {
       resolvedToken = existing;
+      tokenAction = "reused";
       return;
     }
     resolvedToken = normalizeUuid(randomUuid());
     if (!resolvedToken) {
       throw new HttpsError("internal", "Failed to generate app account token.");
     }
+    tokenAction = "generated";
     tx.set(
       userRef,
       {
@@ -351,8 +422,10 @@ async function ensureAppStoreAppAccountTokenForUser(
   });
 
   if (typeof log === "function") {
-    log.info("App Store app account token ensured.", {
+    log.info("ensure_app_account_token.success", {
+      billingTraceId: traceId || null,
       uid,
+      tokenAction,
       tokenSuffix: identifierSuffix(resolvedToken),
     });
   }
@@ -375,26 +448,46 @@ async function assertIosAppAccountTokenPolicy(
     transactionInfo,
     ownershipId,
     log,
+    traceId,
   }
 ) {
   const appleToken = normalizeUuid(transactionInfo?.appAccountToken);
   if (!appleToken) {
     if (typeof log === "function") {
-      log.info("App Store verify using legacy ownership route.", {
+      log.info("subscription_ownership.token_policy.legacy_route", {
+        billingTraceId: traceId || null,
         uid,
+        ownershipId,
         ownershipIdSuffix: identifierSuffix(ownershipId),
+        appleHasToken: false,
+        usersHasToken: false,
       });
     }
     return { legacyRoute: true, appleToken: "" };
   }
 
   const userToken = await loadUserAppStoreAppAccountToken(db, uid);
+  const matched = Boolean(userToken) && appleToken === userToken;
+  if (typeof log === "function") {
+    log.info("subscription_ownership.token_policy.compare", {
+      billingTraceId: traceId || null,
+      uid,
+      ownershipId,
+      ownershipIdSuffix: identifierSuffix(ownershipId),
+      appleHasToken: true,
+      usersHasToken: Boolean(userToken),
+      appleTokenSuffix: identifierSuffix(appleToken),
+      usersTokenSuffix: identifierSuffix(userToken),
+      matched,
+    });
+  }
   if (!userToken || appleToken !== userToken) {
-    throwSubscriptionTokenMismatch({ uid, ownershipId, log });
+    throwSubscriptionTokenMismatch({ uid, ownershipId, log, traceId });
   }
 
   if (typeof log === "function") {
-    log.info("App Store appAccountToken matched.", {
+    log.info("subscription_ownership.token_policy.match", {
+      billingTraceId: traceId || null,
       uid,
       ownershipIdSuffix: identifierSuffix(ownershipId),
       tokenSuffix: identifierSuffix(appleToken),
@@ -413,6 +506,7 @@ async function claimIosSubscriptionOwnership(
     transactionInfo,
     productId,
     log,
+    traceId,
   }
 ) {
   const originalTransactionId = String(
@@ -426,6 +520,7 @@ async function claimIosSubscriptionOwnership(
     transactionInfo,
     ownershipId,
     log,
+    traceId,
   });
 
   await claimOwnershipDocument(db, admin, {
@@ -439,6 +534,7 @@ async function claimIosSubscriptionOwnership(
       appAccountToken: tokenPolicy.appleToken || "",
     },
     log,
+    traceId,
   });
 
   return ownershipId;

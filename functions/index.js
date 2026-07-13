@@ -30,6 +30,14 @@ const {
   claimIosSubscriptionOwnership,
   claimAndroidSubscriptionOwnership,
 } = require("./subscriptionOwnership");
+const {
+  extractBillingTraceId,
+  tokenSuffix: billingTokenSuffix,
+  createBillingFinalLogger,
+  summarizeTransactionInfo,
+  payloadKeys,
+  summarizeHttpsError,
+} = require("./billingFinalTrace");
 const { onMessagePublished } = require("firebase-functions/v2/pubsub");
 
 const { randomUUID } = crypto;
@@ -283,7 +291,11 @@ function normalizeSubscriptionPlatform(value) {
 
 const SUBSCRIPTION_PLATFORM_MISMATCH_MESSAGE = "SUBSCRIPTION_PLATFORM_MISMATCH";
 
-async function assertPurchasingPlatformAllowed(uid, purchasingPlatform) {
+async function assertPurchasingPlatformAllowed(
+  uid,
+  purchasingPlatform,
+  traceId = null
+) {
   const normalizedPurchasing = normalizeSubscriptionPlatform(purchasingPlatform);
   if (normalizedPurchasing !== "ios" && normalizedPurchasing !== "android") {
     throw new HttpsError("internal", "Invalid purchasing platform.");
@@ -291,6 +303,12 @@ async function assertPurchasingPlatformAllowed(uid, purchasingPlatform) {
 
   const userSnap = await admin.getDb().collection("users").doc(uid).get();
   if (!userSnap.exists) {
+    logger.info("KAMOME_BILLING_FINAL_TRACE", {
+      step: "platform_mismatch.allow_no_user_doc",
+      billingTraceId: traceId,
+      uid,
+      purchasingPlatform: normalizedPurchasing,
+    });
     return;
   }
 
@@ -305,10 +323,28 @@ async function assertPurchasingPlatformAllowed(uid, purchasingPlatform) {
   );
 
   if (!usability.subscriptionUsable) {
+    logger.info("KAMOME_BILLING_FINAL_TRACE", {
+      step: "platform_mismatch.allow_inactive_subscription",
+      billingTraceId: traceId,
+      uid,
+      purchasingPlatform: normalizedPurchasing,
+      existingPlatform: existingPlatform || null,
+      subscriptionStatus: userData.subscriptionStatus || null,
+      subscriptionUsable: false,
+    });
     return;
   }
 
   if (existingPlatform && existingPlatform !== normalizedPurchasing) {
+    logger.warn("KAMOME_BILLING_FINAL_TRACE", {
+      step: "platform_mismatch.reject",
+      billingTraceId: traceId,
+      uid,
+      existingPlatform,
+      purchasingPlatform: normalizedPurchasing,
+      subscriptionStatus: userData.subscriptionStatus,
+      rejectCode: SUBSCRIPTION_PLATFORM_MISMATCH_MESSAGE,
+    });
     logger.warn("Subscription purchase blocked due to platform mismatch.", {
       uid,
       existingPlatform,
@@ -321,6 +357,15 @@ async function assertPurchasingPlatformAllowed(uid, purchasingPlatform) {
       SUBSCRIPTION_PLATFORM_MISMATCH_MESSAGE
     );
   }
+
+  logger.info("KAMOME_BILLING_FINAL_TRACE", {
+    step: "platform_mismatch.allow",
+    billingTraceId: traceId,
+    uid,
+    existingPlatform: existingPlatform || null,
+    purchasingPlatform: normalizedPurchasing,
+    subscriptionUsable: true,
+  });
 }
 
 function logRecipientSubscriptionGuard({
@@ -1616,17 +1661,40 @@ exports.verifyAppStoreSubscriptionPurchase = onCall(
 
     const uid = request.auth.uid;
     const data = request.data || {};
+    const traceId = extractBillingTraceId(data);
+    const finalLog = createBillingFinalLogger(logger, {
+      traceId,
+      uid,
+      functionName: "verifyAppStoreSubscriptionPurchase",
+    });
+    const ownershipLog = finalLog.asOwnershipLog();
     const transactionId = extractAppStoreTransactionId(data);
     const environmentHint = extractAppStoreEnvironmentHint(data);
+    const serverVerificationData = String(data.serverVerificationData || "").trim();
 
-    await assertPurchasingPlatformAllowed(uid, "ios");
+    finalLog.info("verify.enter", {
+      source: data.source || null,
+      platform: data.platform || null,
+      productId: data.productId || null,
+      payloadKeys: payloadKeys(data),
+      hasServerVerificationData: serverVerificationData.length > 0,
+      serverVerificationDataLength: serverVerificationData.length,
+      serverVerificationDataSuffix: billingTokenSuffix(serverVerificationData),
+      dataTransactionId: data.transactionId || null,
+      extractedTransactionId: transactionId || null,
+      environmentHint: environmentHint || null,
+    });
+
+    await assertPurchasingPlatformAllowed(uid, "ios", traceId);
 
     if (!transactionId) {
+      finalLog.reject("verify.missing_transaction_id", {
+        hasServerVerificationData: serverVerificationData.length > 0,
+      });
       logger.warn("verifyAppStoreSubscriptionPurchase: missing transaction id.", {
         uid,
-        hasServerVerificationData:
-          typeof request.data?.serverVerificationData === "string" &&
-          request.data.serverVerificationData.length > 0,
+        billingTraceId: traceId,
+        hasServerVerificationData: serverVerificationData.length > 0,
       });
       throw new HttpsError(
         "invalid-argument",
@@ -1635,15 +1703,30 @@ exports.verifyAppStoreSubscriptionPurchase = onCall(
     }
 
     try {
+      finalLog.info("verify.apple_api.start", {
+        lookupTransactionId: transactionId,
+        environmentHint: environmentHint || null,
+      });
       const result = await fetchAppStoreTransactionInfo(
         transactionId,
         environmentHint
       );
+      finalLog.info("verify.apple_api.success", {
+        environment: result.environment,
+        transactionInfo: summarizeTransactionInfo(result.transactionInfo),
+      });
       const validation = validateAppStoreSubscription(result.transactionInfo);
 
       if (!validation.active) {
+        finalLog.warn("verify.inactive_transaction", {
+          transactionId,
+          environment: result.environment,
+          validationCode: validation.code,
+          transactionInfo: summarizeTransactionInfo(result.transactionInfo),
+        });
         logger.warn("verifyAppStoreSubscriptionPurchase: inactive transaction.", {
           uid,
+          billingTraceId: traceId,
           transactionId,
           environment: result.environment,
           code: validation.code,
@@ -1651,15 +1734,33 @@ exports.verifyAppStoreSubscriptionPurchase = onCall(
           bundleId: result.transactionInfo?.bundleId || null,
           expiresDate: result.transactionInfo?.expiresDate || null,
           revocationDate: result.transactionInfo?.revocationDate || null,
+          originalTransactionId:
+            result.transactionInfo?.originalTransactionId || null,
         });
 
         if (validation.code === "SUBSCRIPTION_EXPIRED") {
           const lookupTransactionId =
             result.transactionInfo?.originalTransactionId || transactionId;
+          finalLog.info("verify.latest_fallback.start", {
+            lookupTransactionId,
+            reason: validation.code,
+          });
           try {
             const latest = await fetchLatestAppStoreSubscriptionState({
               lookupTransactionId,
               environmentHint: environmentHint || result.environment,
+            });
+            finalLog.info("verify.latest_fallback.result", {
+              lookupTransactionId,
+              latestStatus: latest?.derived?.status || null,
+              latestTransactionId: latest?.derived?.latestTransactionId || null,
+              latestOriginalTransactionId:
+                latest?.derived?.originalTransactionId || null,
+              latestExpiresDate: latest?.derived?.expiresDate || null,
+              latestValidationCode: latest?.derived?.validationCode || null,
+              latestTransactionInfo: summarizeTransactionInfo(
+                latest?.transactionInfo
+              ),
             });
             if (latest?.derived?.status === "active") {
               const update = buildAppStoreVerifyActiveUpdate({
@@ -1672,17 +1773,35 @@ exports.verifyAppStoreSubscriptionPurchase = onCall(
                 uid,
                 platform: "ios",
                 identifiers: ownershipIdentifiersFromAppStoreUpdate(update),
-                log: logger,
+                log: ownershipLog,
+                traceId,
               });
               await claimIosSubscriptionOwnership(admin.getDb(), admin, {
                 uid,
                 update,
                 transactionInfo: latest.transactionInfo,
                 productId: APP_STORE_PRODUCT_ID,
-                log: logger,
+                log: ownershipLog,
+                traceId,
+              });
+              finalLog.info("verify.users_update.start", {
+                updateKeys: Object.keys(update).sort(),
+                subscriptionStatus: update.subscriptionStatus || null,
+                appStoreTransactionId: update.appStoreTransactionId || null,
+                appStoreOriginalTransactionId:
+                  update.appStoreOriginalTransactionId || null,
               });
               await admin.getDb().collection("users").doc(uid).set(update, {
                 merge: true,
+              });
+              finalLog.success("verify.exit", {
+                path: "latest_fallback_active",
+                transactionId,
+                lookupTransactionId,
+                latestTransactionId: update.appStoreTransactionId,
+                originalTransactionId: update.appStoreOriginalTransactionId,
+                environment: update.appStoreEnvironment,
+                expiresDate: latest.derived.expiresDate,
               });
               logger.info(
                 "verifyAppStoreSubscriptionPurchase succeeded via latest subscription status.",
@@ -1783,21 +1902,38 @@ exports.verifyAppStoreSubscriptionPurchase = onCall(
         uid,
         platform: "ios",
         identifiers: ownershipIdentifiersFromAppStoreUpdate(update),
-        log: logger,
+        log: ownershipLog,
+        traceId,
       });
       await claimIosSubscriptionOwnership(admin.getDb(), admin, {
         uid,
         update,
         transactionInfo: result.transactionInfo,
         productId: APP_STORE_PRODUCT_ID,
-        log: logger,
+        log: ownershipLog,
+        traceId,
       });
 
+      finalLog.info("verify.users_update.start", {
+        updateKeys: Object.keys(update).sort(),
+        subscriptionStatus: update.subscriptionStatus || null,
+        appStoreTransactionId: update.appStoreTransactionId || null,
+        appStoreOriginalTransactionId: update.appStoreOriginalTransactionId || null,
+      });
       await admin.getDb().collection("users").doc(uid).set(update, { merge: true });
+      finalLog.success("verify.exit", {
+        path: "active_transaction",
+        transactionId,
+        originalTransactionId: update.appStoreOriginalTransactionId,
+        environment: update.appStoreEnvironment,
+        expiresDate: validation.expiresDate,
+      });
 
       logger.info("verifyAppStoreSubscriptionPurchase succeeded.", {
         uid,
+        billingTraceId: traceId,
         transactionId,
+        originalTransactionId: update.appStoreOriginalTransactionId,
         environment: update.appStoreEnvironment,
         expiresDate: validation.expiresDate,
       });
@@ -1811,11 +1947,22 @@ exports.verifyAppStoreSubscriptionPurchase = onCall(
       };
     } catch (error) {
       if (error instanceof HttpsError) {
+        finalLog.reject("verify.exit", {
+          ...summarizeHttpsError(error),
+          transactionId,
+        });
         throw error;
       }
 
+      finalLog.error("verify.unexpected_error", {
+        transactionId,
+        credentialsRejected: error.credentialsRejected || false,
+        lookupErrors: error.lookupErrors || null,
+        message: error.message,
+      });
       logger.error("verifyAppStoreSubscriptionPurchase failed.", {
         uid,
+        billingTraceId: traceId,
         transactionId,
         environmentHint: environmentHint || null,
         credentialsRejected: error.credentialsRejected || false,
@@ -1841,15 +1988,42 @@ exports.ensureAppStoreAppAccountToken = onCall(async (request) => {
   }
 
   const uid = request.auth.uid;
-  const token = await ensureAppStoreAppAccountTokenForUser(admin.getDb(), admin, {
+  const data = request.data || {};
+  const traceId = extractBillingTraceId(data);
+  const finalLog = createBillingFinalLogger(logger, {
+    traceId,
     uid,
-    randomUuid: randomUUID,
-    log: logger,
+    functionName: "ensureAppStoreAppAccountToken",
+  });
+  const ownershipLog = finalLog.asOwnershipLog();
+
+  finalLog.info("ensure.enter", {
+    payloadKeys: payloadKeys(data),
   });
 
-  return {
-    appStoreAppAccountToken: token,
-  };
+  try {
+    const token = await ensureAppStoreAppAccountTokenForUser(admin.getDb(), admin, {
+      uid,
+      randomUuid: randomUUID,
+      log: ownershipLog,
+      traceId,
+    });
+    finalLog.success("ensure.exit", {
+      tokenSuffix: billingTokenSuffix(token),
+    });
+    return {
+      appStoreAppAccountToken: token,
+    };
+  } catch (error) {
+    if (error instanceof HttpsError) {
+      finalLog.reject("ensure.exit", summarizeHttpsError(error));
+      throw error;
+    }
+    finalLog.error("ensure.unexpected_error", {
+      message: error?.message || null,
+    });
+    throw error;
+  }
 });
 
 /* =========================================================
