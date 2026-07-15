@@ -1,0 +1,15 @@
+const OPENAI_TRANSCRIBE_URL = "https://api.openai.com/v1/audio/transcriptions";
+const OPENAI_TRANSCRIBE_MODEL = "gpt-4o-mini-transcribe";
+const DAILY_TRANSCRIBE_LIMIT = 5;
+const MAX_AUDIO_BYTES = 25 * 1024 * 1024;
+const STT_PROVIDER_OPENAI = "openai";
+const ALLOWED_STT_PROVIDERS = new Set([STT_PROVIDER_OPENAI]);
+
+module.exports = {
+  OPENAI_TRANSCRIBE_URL,
+  OPENAI_TRANSCRIBE_MODEL,
+  DAILY_TRANSCRIBE_LIMIT,
+  MAX_AUDIO_BYTES,
+  STT_PROVIDER_OPENAI,
+  ALLOWED_STT_PROVIDERS,
+};

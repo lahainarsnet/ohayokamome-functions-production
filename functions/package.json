@@ -6,7 +6,9 @@
     "node": "20"
   },
   "scripts": {
-    "deploy": "firebase deploy --only functions"
+    "deploy": "firebase deploy --only functions",
+    "test": "node subscriptionOwnership.test.js && node googlePlayRevocationSafety.test.js && node stt/registry.test.js && node stt/openaiProvider.test.js && node transcribeExperiment.test.js",
+    "lint": "node --check index.js && node --check transcribeExperiment.js && node --check stt/constants.js && node --check stt/registry.js && node --check stt/openaiProvider.js"
   },
   "dependencies": {
     "@apple/app-store-server-library": "^3.1.0",

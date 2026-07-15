@@ -1,5 +1,5 @@
 /**
- * Phase 3: Base64 音声 → OpenAI Speech-to-text（/v1/audio/transcriptions）。
+ * Phase 3: Base64 音声 → STT provider（現行: OpenAI）→ text 返却。
  *
  * - 音声内容や変換結果は保存しない。
  *
@@ -12,21 +12,36 @@
 
 const logger = require("firebase-functions/logger");
 const { onCall } = require("firebase-functions/v2/https");
-const { defineSecret } = require("firebase-functions/params");
+const { defineSecret, defineString } = require("firebase-functions/params");
 const admin = require("./firebaseAdmin");
+const {
+  DAILY_TRANSCRIBE_LIMIT,
+  MAX_AUDIO_BYTES,
+  STT_PROVIDER_OPENAI,
+} = require("./stt/constants");
+const { resolveSttProvider } = require("./stt/registry");
+const { transcribeWithOpenAI } = require("./stt/openaiProvider");
 
 const OPENAI_API_KEY = defineSecret("OPENAI_API_KEY");
-
-const TRANSCRIBE_URL = "https://api.openai.com/v1/audio/transcriptions";
-const MODEL = "gpt-4o-mini-transcribe";
-const DAILY_TRANSCRIBE_LIMIT = 5;
-/** OpenAI 上限に合わせたガード（https://platform.openai.com/docs/api-reference/audio） */
-const MAX_AUDIO_BYTES = 25 * 1024 * 1024;
+const STT_PROVIDER = defineString("STT_PROVIDER", {
+  default: STT_PROVIDER_OPENAI,
+});
 
 function getJstDateKey(baseDate = new Date()) {
   const JST_OFFSET_MS = 9 * 60 * 60 * 1000;
   const jst = new Date(baseDate.getTime() + JST_OFFSET_MS);
   return jst.toISOString().slice(0, 10);
+}
+
+function uidSuffix(uid) {
+  if (!uid) {
+    return "none";
+  }
+  return uid.length <= 6 ? uid : uid.slice(-6);
+}
+
+function logSttEvent(fields) {
+  logger.info("STT_TRACE", fields);
 }
 
 async function reserveDailyTranscribeQuota(uid) {
@@ -86,21 +101,110 @@ async function reserveDailyTranscribeQuota(uid) {
   });
 }
 
+async function invokeSttProvider({
+  provider,
+  audioBuffer,
+  mimeType,
+  receivedBytes,
+  apiKey,
+}) {
+  if (provider === STT_PROVIDER_OPENAI) {
+    return transcribeWithOpenAI({
+      audioBuffer,
+      mimeType,
+      apiKey,
+      receivedBytes,
+      logger,
+    });
+  }
+  return {
+    ok: false,
+    code: "STT_PROVIDER_INVALID",
+    provider,
+    model: "",
+    apiLatencyMs: 0,
+  };
+}
+
 exports.transcribeExperiment = onCall(
   { secrets: [OPENAI_API_KEY] },
   async (request) => {
+    const startedAt = Date.now();
     const uid = request.auth?.uid || null;
     if (!uid) {
       logger.warn("transcribeExperiment: UNAUTHENTICATED");
+      logSttEvent({
+        event: "transcribe_failed",
+        provider: null,
+        model: null,
+        receivedBytes: null,
+        apiLatencyMs: null,
+        totalLatencyMs: Date.now() - startedAt,
+        success: false,
+        errorCode: "UNAUTHENTICATED",
+        textLength: null,
+        uidSuffix: uidSuffix(uid),
+        sttProviderSetting: null,
+      });
       return { ok: false, code: "UNAUTHENTICATED" };
     }
+
+    const providerResolution = resolveSttProvider(STT_PROVIDER.value());
+    if (!providerResolution.ok) {
+      logger.warn("transcribeExperiment: STT_PROVIDER_INVALID", {
+        configuredProvider: String(STT_PROVIDER.value() || ""),
+        resolvedProvider: providerResolution.provider || null,
+        uidSuffix: uidSuffix(uid),
+      });
+      logSttEvent({
+        event: "transcribe_failed",
+        provider: providerResolution.provider || null,
+        model: null,
+        receivedBytes: null,
+        apiLatencyMs: null,
+        totalLatencyMs: Date.now() - startedAt,
+        success: false,
+        errorCode: providerResolution.code,
+        textLength: null,
+        uidSuffix: uidSuffix(uid),
+        sttProviderSetting: String(STT_PROVIDER.value() || ""),
+      });
+      return { ok: false, code: providerResolution.code };
+    }
+    const provider = providerResolution.provider;
 
     const { audioBase64, mimeType } = request.data || {};
 
     if (typeof audioBase64 !== "string" || audioBase64.length === 0) {
+      logSttEvent({
+        event: "transcribe_failed",
+        provider,
+        model: null,
+        receivedBytes: null,
+        apiLatencyMs: null,
+        totalLatencyMs: Date.now() - startedAt,
+        success: false,
+        errorCode: "MISSING_AUDIO_BASE64",
+        textLength: null,
+        uidSuffix: uidSuffix(uid),
+        sttProviderSetting: provider,
+      });
       return { ok: false, code: "MISSING_AUDIO_BASE64" };
     }
     if (typeof mimeType !== "string" || mimeType.trim() === "") {
+      logSttEvent({
+        event: "transcribe_failed",
+        provider,
+        model: null,
+        receivedBytes: null,
+        apiLatencyMs: null,
+        totalLatencyMs: Date.now() - startedAt,
+        success: false,
+        errorCode: "MISSING_MIME_TYPE",
+        textLength: null,
+        uidSuffix: uidSuffix(uid),
+        sttProviderSetting: provider,
+      });
       return { ok: false, code: "MISSING_MIME_TYPE" };
     }
 
@@ -108,6 +212,19 @@ exports.transcribeExperiment = onCall(
     try {
       buf = Buffer.from(audioBase64, "base64");
     } catch (_) {
+      logSttEvent({
+        event: "transcribe_failed",
+        provider,
+        model: null,
+        receivedBytes: null,
+        apiLatencyMs: null,
+        totalLatencyMs: Date.now() - startedAt,
+        success: false,
+        errorCode: "INVALID_BASE64",
+        textLength: null,
+        uidSuffix: uidSuffix(uid),
+        sttProviderSetting: provider,
+      });
       return { ok: false, code: "INVALID_BASE64" };
     }
 
@@ -116,6 +233,21 @@ exports.transcribeExperiment = onCall(
       logger.warn("transcribeExperiment: AUDIO_TOO_LARGE", {
         receivedBytes,
         maxBytes: MAX_AUDIO_BYTES,
+        provider,
+        uidSuffix: uidSuffix(uid),
+      });
+      logSttEvent({
+        event: "transcribe_failed",
+        provider,
+        model: null,
+        receivedBytes,
+        apiLatencyMs: null,
+        totalLatencyMs: Date.now() - startedAt,
+        success: false,
+        errorCode: "AUDIO_TOO_LARGE",
+        textLength: null,
+        uidSuffix: uidSuffix(uid),
+        sttProviderSetting: provider,
       });
       return { ok: false, code: "AUDIO_TOO_LARGE" };
     }
@@ -126,11 +258,43 @@ exports.transcribeExperiment = onCall(
     } catch (_) {
       logger.warn("transcribeExperiment: SECRET_READ_FAILED", {
         receivedBytes,
+        provider,
+        uidSuffix: uidSuffix(uid),
+      });
+      logSttEvent({
+        event: "transcribe_failed",
+        provider,
+        model: null,
+        receivedBytes,
+        apiLatencyMs: null,
+        totalLatencyMs: Date.now() - startedAt,
+        success: false,
+        errorCode: "SECRET_READ_FAILED",
+        textLength: null,
+        uidSuffix: uidSuffix(uid),
+        sttProviderSetting: provider,
       });
       return { ok: false, code: "SECRET_READ_FAILED" };
     }
     if (typeof apiKey !== "string" || apiKey.length === 0) {
-      logger.warn("transcribeExperiment: SECRET_EMPTY", { receivedBytes });
+      logger.warn("transcribeExperiment: SECRET_EMPTY", {
+        receivedBytes,
+        provider,
+        uidSuffix: uidSuffix(uid),
+      });
+      logSttEvent({
+        event: "transcribe_failed",
+        provider,
+        model: null,
+        receivedBytes,
+        apiLatencyMs: null,
+        totalLatencyMs: Date.now() - startedAt,
+        success: false,
+        errorCode: "SECRET_EMPTY",
+        textLength: null,
+        uidSuffix: uidSuffix(uid),
+        sttProviderSetting: provider,
+      });
       return { ok: false, code: "SECRET_EMPTY" };
     }
 
@@ -142,6 +306,19 @@ exports.transcribeExperiment = onCall(
         uid,
         receivedBytes,
       });
+      logSttEvent({
+        event: "transcribe_failed",
+        provider,
+        model: null,
+        receivedBytes,
+        apiLatencyMs: null,
+        totalLatencyMs: Date.now() - startedAt,
+        success: false,
+        errorCode: "QUOTA_CHECK_FAILED",
+        textLength: null,
+        uidSuffix: uidSuffix(uid),
+        sttProviderSetting: provider,
+      });
       return { ok: false, code: "QUOTA_CHECK_FAILED" };
     }
     if (!quota.allowed) {
@@ -152,6 +329,19 @@ exports.transcribeExperiment = onCall(
         dateKey: quota.dateKey,
         receivedBytes,
       });
+      logSttEvent({
+        event: "transcribe_failed",
+        provider,
+        model: null,
+        receivedBytes,
+        apiLatencyMs: null,
+        totalLatencyMs: Date.now() - startedAt,
+        success: false,
+        errorCode: "DAILY_TRANSCRIBE_LIMIT_EXCEEDED",
+        textLength: null,
+        uidSuffix: uidSuffix(uid),
+        sttProviderSetting: provider,
+      });
       return {
         ok: false,
         code: "DAILY_TRANSCRIBE_LIMIT_EXCEEDED",
@@ -159,80 +349,62 @@ exports.transcribeExperiment = onCall(
       };
     }
 
-    const trimmedMime = mimeType.trim();
-    const filename = trimmedMime.toLowerCase().includes("mp4")
-      ? "audio.mp4"
-      : "audio.m4a";
+    const providerResult = await invokeSttProvider({
+      provider,
+      audioBuffer: buf,
+      mimeType,
+      receivedBytes,
+      apiKey,
+    });
 
-    const blob = new Blob([buf], { type: trimmedMime });
-    const formData = new FormData();
-    formData.append("file", blob, filename);
-    formData.append("model", MODEL);
-    /** plain text より JSON の方が応答構造が安定してパースが最小 */
-    formData.append("response_format", "json");
-
-    let res;
-    try {
-      res = await fetch(TRANSCRIBE_URL, {
-        method: "POST",
-        headers: {
-          Authorization: `Bearer ${apiKey}`,
-        },
-        body: formData,
-      });
-    } catch (e) {
-      logger.error("transcribeExperiment: OPENAI_REQUEST_FAILED", {
-        fetchErrorName: e && typeof e.name === "string" ? e.name : "Error",
+    if (!providerResult.ok) {
+      logSttEvent({
+        event: "transcribe_failed",
+        provider: providerResult.provider || provider,
+        model: providerResult.model || null,
         receivedBytes,
+        apiLatencyMs: providerResult.apiLatencyMs ?? null,
+        totalLatencyMs: Date.now() - startedAt,
+        success: false,
+        errorCode: providerResult.code,
+        textLength: null,
+        uidSuffix: uidSuffix(uid),
+        sttProviderSetting: provider,
       });
-      return { ok: false, code: "OPENAI_REQUEST_FAILED" };
+      return { ok: false, code: providerResult.code };
     }
 
-    const rawBody = await res.text();
-    if (!res.ok) {
-      let openaiErrorType = "unknown";
-      try {
-        const errJson = JSON.parse(rawBody);
-        if (
-          errJson &&
-          errJson.error &&
-          typeof errJson.error.type === "string"
-        ) {
-          openaiErrorType = errJson.error.type;
-        }
-      } catch (_) {
-        /* 本文はログに載せない */
-      }
-      logger.warn("transcribeExperiment: OPENAI_HTTP_ERROR", {
-        status: res.status,
-        openaiErrorType,
-        receivedBytes,
-      });
-      return { ok: false, code: "OPENAI_HTTP_ERROR" };
-    }
-
-    let data;
-    try {
-      data = JSON.parse(rawBody);
-    } catch (_) {
-      logger.warn("transcribeExperiment: OPENAI_BAD_RESPONSE (parse)", {
-        receivedBytes,
-      });
-      return { ok: false, code: "OPENAI_BAD_RESPONSE" };
-    }
-
-    if (!data || typeof data.text !== "string") {
-      logger.warn("transcribeExperiment: OPENAI_BAD_RESPONSE (shape)", {
-        receivedBytes,
-      });
-      return { ok: false, code: "OPENAI_BAD_RESPONSE" };
-    }
-
-    logger.info("transcribeExperiment: transcription ok", { receivedBytes });
+    logger.info("transcribeExperiment: transcription ok", {
+      receivedBytes,
+      provider: providerResult.provider,
+      model: providerResult.model,
+      apiLatencyMs: providerResult.apiLatencyMs,
+      uidSuffix: uidSuffix(uid),
+    });
+    logSttEvent({
+      event: "transcribe_succeeded",
+      provider: providerResult.provider,
+      model: providerResult.model,
+      receivedBytes,
+      apiLatencyMs: providerResult.apiLatencyMs,
+      totalLatencyMs: Date.now() - startedAt,
+      success: true,
+      errorCode: null,
+      textLength: providerResult.text.length,
+      uidSuffix: uidSuffix(uid),
+      sttProviderSetting: provider,
+    });
 
     return {
       ok: true,
-      text: data.text,
+      text: providerResult.text,
     };
   },
 );
+
+module.exports.getJstDateKey = getJstDateKey;
+module.exports.reserveDailyTranscribeQuota = reserveDailyTranscribeQuota;
+module.exports.resolveSttProvider = resolveSttProvider;
+module.exports.invokeSttProvider = invokeSttProvider;
+module.exports.logSttEvent = logSttEvent;
+module.exports.uidSuffix = uidSuffix;
