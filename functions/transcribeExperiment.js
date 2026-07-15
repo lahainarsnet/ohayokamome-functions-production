@@ -1,5 +1,5 @@
 /**
- * Phase 3: Base64 音声 → STT provider（現行: OpenAI）→ text 返却。
+ * Phase 3: Base64 音声 → STT provider（OpenAI / Google）→ text 返却。
  *
  * - 音声内容や変換結果は保存しない。
  *
@@ -18,9 +18,13 @@ const {
   DAILY_TRANSCRIBE_LIMIT,
   MAX_AUDIO_BYTES,
   STT_PROVIDER_OPENAI,
+  STT_PROVIDER_GOOGLE,
+  GOOGLE_STT_DEFAULT_MODEL,
+  GOOGLE_STT_DEFAULT_LOCATION,
 } = require("./stt/constants");
 const { resolveSttProvider } = require("./stt/registry");
 const { transcribeWithOpenAI } = require("./stt/openaiProvider");
+const { transcribeWithGoogle } = require("./stt/googleProvider");
 
 const OPENAI_API_KEY = defineSecret("OPENAI_API_KEY");
 const STT_PROVIDER = defineString("STT_PROVIDER", {
@@ -107,6 +111,7 @@ async function invokeSttProvider({
   mimeType,
   receivedBytes,
   apiKey,
+  googleOptions = {},
 }) {
   if (provider === STT_PROVIDER_OPENAI) {
     return transcribeWithOpenAI({
@@ -114,6 +119,18 @@ async function invokeSttProvider({
       mimeType,
       apiKey,
       receivedBytes,
+      logger,
+    });
+  }
+  if (provider === STT_PROVIDER_GOOGLE) {
+    return transcribeWithGoogle({
+      audioBuffer,
+      mimeType,
+      receivedBytes,
+      projectId: googleOptions.projectId,
+      location: googleOptions.location,
+      model: googleOptions.model,
+      speechClientFactory: googleOptions.speechClientFactory,
       logger,
     });
   }
@@ -252,50 +269,52 @@ exports.transcribeExperiment = onCall(
       return { ok: false, code: "AUDIO_TOO_LARGE" };
     }
 
-    let apiKey;
-    try {
-      apiKey = OPENAI_API_KEY.value();
-    } catch (_) {
-      logger.warn("transcribeExperiment: SECRET_READ_FAILED", {
-        receivedBytes,
-        provider,
-        uidSuffix: uidSuffix(uid),
-      });
-      logSttEvent({
-        event: "transcribe_failed",
-        provider,
-        model: null,
-        receivedBytes,
-        apiLatencyMs: null,
-        totalLatencyMs: Date.now() - startedAt,
-        success: false,
-        errorCode: "SECRET_READ_FAILED",
-        textLength: null,
-        uidSuffix: uidSuffix(uid),
-        sttProviderSetting: provider,
-      });
-      return { ok: false, code: "SECRET_READ_FAILED" };
-    }
-    if (typeof apiKey !== "string" || apiKey.length === 0) {
-      logger.warn("transcribeExperiment: SECRET_EMPTY", {
-        receivedBytes,
-        provider,
-        uidSuffix: uidSuffix(uid),
-      });
-      logSttEvent({
-        event: "transcribe_failed",
-        provider,
-        model: null,
-        receivedBytes,
-        apiLatencyMs: null,
-        totalLatencyMs: Date.now() - startedAt,
-        success: false,
-        errorCode: "SECRET_EMPTY",
-        textLength: null,
-        uidSuffix: uidSuffix(uid),
-        sttProviderSetting: provider,
-      });
-      return { ok: false, code: "SECRET_EMPTY" };
+    let apiKey = null;
+    if (provider === STT_PROVIDER_OPENAI) {
+      try {
+        apiKey = OPENAI_API_KEY.value();
+      } catch (_) {
+        logger.warn("transcribeExperiment: SECRET_READ_FAILED", {
+          receivedBytes,
+          provider,
+          uidSuffix: uidSuffix(uid),
+        });
+        logSttEvent({
+          event: "transcribe_failed",
+          provider,
+          model: null,
+          receivedBytes,
+          apiLatencyMs: null,
+          totalLatencyMs: Date.now() - startedAt,
+          success: false,
+          errorCode: "SECRET_READ_FAILED",
+          textLength: null,
+          uidSuffix: uidSuffix(uid),
+          sttProviderSetting: provider,
+        });
+        return { ok: false, code: "SECRET_READ_FAILED" };
+      }
+      if (typeof apiKey !== "string" || apiKey.length === 0) {
+        logger.warn("transcribeExperiment: SECRET_EMPTY", {
+          receivedBytes,
+          provider,
+          uidSuffix: uidSuffix(uid),
+        });
+        logSttEvent({
+          event: "transcribe_failed",
+          provider,
+          model: null,
+          receivedBytes,
+          apiLatencyMs: null,
+          totalLatencyMs: Date.now() - startedAt,
+          success: false,
+          errorCode: "SECRET_EMPTY",
+          textLength: null,
+          uidSuffix: uidSuffix(uid),
+          sttProviderSetting: provider,
+        });
+        return { ok: false, code: "SECRET_EMPTY" };
+      }
     }
 
     let quota;
@@ -355,6 +374,12 @@ exports.transcribeExperiment = onCall(
       mimeType,
       receivedBytes,
       apiKey,
+      googleOptions: {
+        projectId:
+          process.env.GCLOUD_PROJECT || process.env.GOOGLE_CLOUD_PROJECT,
+        location: process.env.STT_GOOGLE_LOCATION || GOOGLE_STT_DEFAULT_LOCATION,
+        model: process.env.STT_GOOGLE_MODEL || GOOGLE_STT_DEFAULT_MODEL,
+      },
     });
 
     if (!providerResult.ok) {
@@ -362,6 +387,7 @@ exports.transcribeExperiment = onCall(
         event: "transcribe_failed",
         provider: providerResult.provider || provider,
         model: providerResult.model || null,
+        location: providerResult.location || null,
         receivedBytes,
         apiLatencyMs: providerResult.apiLatencyMs ?? null,
         totalLatencyMs: Date.now() - startedAt,
@@ -378,6 +404,7 @@ exports.transcribeExperiment = onCall(
       receivedBytes,
       provider: providerResult.provider,
       model: providerResult.model,
+      location: providerResult.location || null,
       apiLatencyMs: providerResult.apiLatencyMs,
       uidSuffix: uidSuffix(uid),
     });
@@ -385,6 +412,7 @@ exports.transcribeExperiment = onCall(
       event: "transcribe_succeeded",
       provider: providerResult.provider,
       model: providerResult.model,
+      location: providerResult.location || null,
       receivedBytes,
       apiLatencyMs: providerResult.apiLatencyMs,
       totalLatencyMs: Date.now() - startedAt,

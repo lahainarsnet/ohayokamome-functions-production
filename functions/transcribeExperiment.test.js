@@ -2,6 +2,7 @@ const assert = require("assert");
 const {
   MAX_AUDIO_BYTES,
   STT_PROVIDER_OPENAI,
+  STT_PROVIDER_GOOGLE,
 } = require("./stt/constants");
 const {
   resolveSttProvider,
@@ -66,9 +67,13 @@ async function runTests() {
   assert.strictEqual(openaiProvider.ok, true);
   assert.strictEqual(openaiProvider.provider, STT_PROVIDER_OPENAI);
 
-  const invalidProvider = resolveSttProvider("google");
-  assert.strictEqual(invalidProvider.ok, false);
-  assert.strictEqual(invalidProvider.code, "STT_PROVIDER_INVALID");
+  const googleProvider = resolveSttProvider("google");
+  assert.strictEqual(googleProvider.ok, true);
+  assert.strictEqual(googleProvider.provider, STT_PROVIDER_GOOGLE);
+
+  const typoProvider = resolveSttProvider("openai2");
+  assert.strictEqual(typoProvider.ok, false);
+  assert.strictEqual(typoProvider.code, "STT_PROVIDER_INVALID");
 
   const unauth = validateAuth({ auth: null });
   assert.deepStrictEqual(unauth, { ok: false, code: "UNAUTHENTICATED" });
@@ -133,8 +138,32 @@ async function runTests() {
   assert.ok(!serialized.includes("recognized text body"));
   assert.ok(!serialized.includes("audio bytes"));
 
+  const googleInvoke = await invokeSttProvider({
+    provider: STT_PROVIDER_GOOGLE,
+    audioBuffer: Buffer.from("audio"),
+    mimeType: "audio/mp4",
+    receivedBytes: 5,
+    googleOptions: {
+      projectId: "lahainarsnet-ohayokamome-live",
+      speechClientFactory: () => ({
+        recognize: async () => [
+          {
+            results: [{ alternatives: [{ transcript: "google text" }] }],
+          },
+        ],
+      }),
+    },
+  });
+  assert.strictEqual(googleInvoke.ok, true);
+  assert.strictEqual(googleInvoke.text, "google text");
+  assert.strictEqual(googleInvoke.provider, STT_PROVIDER_GOOGLE);
+  assert.deepStrictEqual(mapProviderResultToClient(googleInvoke), {
+    ok: true,
+    text: "google text",
+  });
+
   const invalidInvoke = await invokeSttProvider({
-    provider: "google",
+    provider: "unknown",
     audioBuffer: Buffer.from("audio"),
     mimeType: "audio/mp4",
     receivedBytes: 5,
@@ -143,7 +172,7 @@ async function runTests() {
   assert.deepStrictEqual(invalidInvoke, {
     ok: false,
     code: "STT_PROVIDER_INVALID",
-    provider: "google",
+    provider: "unknown",
     model: "",
     apiLatencyMs: 0,
   });

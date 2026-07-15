@@ -7,11 +7,12 @@
   },
   "scripts": {
     "deploy": "firebase deploy --only functions",
-    "test": "node subscriptionOwnership.test.js && node googlePlayRevocationSafety.test.js && node stt/registry.test.js && node stt/openaiProvider.test.js && node transcribeExperiment.test.js",
-    "lint": "node --check index.js && node --check transcribeExperiment.js && node --check stt/constants.js && node --check stt/registry.js && node --check stt/openaiProvider.js"
+    "test": "node subscriptionOwnership.test.js && node googlePlayRevocationSafety.test.js && node stt/registry.test.js && node stt/openaiProvider.test.js && node stt/googleProvider.test.js && node transcribeExperiment.test.js",
+    "lint": "node --check index.js && node --check transcribeExperiment.js && node --check stt/constants.js && node --check stt/registry.js && node --check stt/openaiProvider.js && node --check stt/googleProvider.js"
   },
   "dependencies": {
     "@apple/app-store-server-library": "^3.1.0",
+    "@google-cloud/speech": "^7.5.0",
     "firebase-admin": "^12.6.0",
     "firebase-functions": "^5.1.1",
     "googleapis": "^144.0.0"

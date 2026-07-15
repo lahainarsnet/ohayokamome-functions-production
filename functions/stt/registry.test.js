@@ -22,8 +22,7 @@ function runTests() {
   assert.strictEqual(emptyResolved.provider, "openai");
 
   const googleResolved = resolveSttProvider("google");
-  assert.strictEqual(googleResolved.ok, false);
-  assert.strictEqual(googleResolved.code, "STT_PROVIDER_INVALID");
+  assert.strictEqual(googleResolved.ok, true);
   assert.strictEqual(googleResolved.provider, "google");
 
   const typoResolved = resolveSttProvider("openai2");
