@@ -142,7 +142,7 @@ function deriveGooglePlayEntitlement({
     !Number.isNaN(expiryDate.getTime()) &&
     expiryDate.getTime() > now.getTime();
 
-  if (forceExpired || Number(notificationType) === REVOKED_NOTIFICATION_TYPE) {
+  if (forceExpired) {
     return {
       status: "expired",
       expiryTime: matchedLineItem?.expiryTime || null,
@@ -293,6 +293,202 @@ async function syncGooglePlaySubscriptionByPurchaseToken(packageName, purchaseTo
   return { subscription, matchedLineItem };
 }
 
+function isRevocationNotification(forceExpired, notificationType) {
+  return forceExpired || Number(notificationType) === REVOKED_NOTIFICATION_TYPE;
+}
+
+function collectTokensForRequery(existingData, notificationPurchaseToken) {
+  const tokens = new Set();
+  const primary = String(existingData?.googlePlayPrimaryPurchaseToken || "").trim();
+  if (primary) {
+    tokens.add(primary);
+  }
+  const notificationToken = String(notificationPurchaseToken || "").trim();
+  if (notificationToken) {
+    tokens.add(notificationToken);
+  }
+  for (const token of Array.isArray(existingData?.activePurchaseTokens)
+    ? existingData.activePurchaseTokens
+    : []) {
+    const normalized = String(token || "").trim();
+    if (normalized) {
+      tokens.add(normalized);
+    }
+  }
+  return [...tokens];
+}
+
+function isUsableGooglePlayEntitlement(derived) {
+  return derived?.status === "active";
+}
+
+function buildDerivedFromExistingActiveUser(existingData) {
+  const existingExpiry = parseFirestoreExpiryTime(existingData?.subscriptionExpiryTime);
+  let expiryTime = null;
+  if (typeof existingData?.subscriptionExpiryTime === "string") {
+    expiryTime = existingData.subscriptionExpiryTime;
+  } else if (existingExpiry instanceof Date && !Number.isNaN(existingExpiry.getTime())) {
+    expiryTime = existingExpiry.toISOString();
+  }
+
+  return {
+    status: "active",
+    expiryTime,
+    expiryDate: existingExpiry,
+    subscriptionState: String(existingData?.googlePlaySubscriptionState || ""),
+    latestOrderId: String(existingData?.googlePlayLatestOrderId || ""),
+    acknowledgementState: String(existingData?.googlePlayAcknowledgementState || ""),
+    testPurchase: existingData?.googlePlayTestPurchase === true,
+    linkedPurchaseToken: "",
+  };
+}
+
+function pickBestUsableEntitlement(tokenResults) {
+  const usable = tokenResults.filter(
+    (result) => result.ok && isUsableGooglePlayEntitlement(result.derived),
+  );
+  if (!usable.length) {
+    return null;
+  }
+  return usable.reduce((best, item) => {
+    const bestExpiry = best.derived?.expiryDate?.getTime() || 0;
+    const itemExpiry = item.derived?.expiryDate?.getTime() || 0;
+    return itemExpiry >= bestExpiry ? item : best;
+  });
+}
+
+function resolveRevocationUserEntitlement({
+  existingData,
+  notificationPurchaseToken,
+  notificationDerived,
+  notificationTokenConfirmed,
+  tokenResults,
+}) {
+  const usable = pickBestUsableEntitlement(tokenResults);
+  if (usable) {
+    return {
+      action: "keep_active",
+      derived: usable.derived,
+      primaryPurchaseToken: usable.purchaseToken,
+      revokedTokenIgnored: notificationPurchaseToken,
+    };
+  }
+
+  const failed = tokenResults.filter((result) => !result.ok);
+  const existingStatus = String(existingData?.subscriptionStatus || "")
+    .trim()
+    .toLowerCase();
+  const existingExpiry = parseFirestoreExpiryTime(existingData?.subscriptionExpiryTime);
+  const existingExpiryFuture =
+    existingExpiry instanceof Date &&
+    !Number.isNaN(existingExpiry.getTime()) &&
+    existingExpiry.getTime() > Date.now();
+  const tokenCount = tokenResults.length;
+
+  if (
+    failed.length > 0 &&
+    existingStatus === "active" &&
+    existingExpiryFuture &&
+    tokenCount > 1
+  ) {
+    return {
+      action: "keep_active_uncertain",
+      derived: buildDerivedFromExistingActiveUser(existingData),
+      primaryPurchaseToken:
+        String(existingData?.googlePlayPrimaryPurchaseToken || "").trim() ||
+        notificationPurchaseToken,
+      revokedTokenIgnored: notificationPurchaseToken,
+      uncertainApiFailures: failed.map((result) => tokenSuffix(result.purchaseToken)),
+    };
+  }
+
+  if (notificationTokenConfirmed) {
+    return {
+      action: "expire",
+      derived: notificationDerived,
+      primaryPurchaseToken: "",
+    };
+  }
+
+  if (existingStatus === "active" && existingExpiryFuture) {
+    return {
+      action: "keep_active_uncertain",
+      derived: buildDerivedFromExistingActiveUser(existingData),
+      primaryPurchaseToken:
+        String(existingData?.googlePlayPrimaryPurchaseToken || "").trim() ||
+        notificationPurchaseToken,
+      revokedTokenIgnored: notificationPurchaseToken,
+    };
+  }
+
+  return {
+    action: "expire",
+    derived: notificationDerived,
+    primaryPurchaseToken: "",
+  };
+}
+
+async function syncEntitlementForToken(packageName, purchaseToken) {
+  try {
+    const { subscription, matchedLineItem } =
+      await syncGooglePlaySubscriptionByPurchaseToken(packageName, purchaseToken);
+    const derived = deriveGooglePlayEntitlement({
+      subscription,
+      matchedLineItem,
+      notificationType: null,
+      forceExpired: false,
+    });
+    return {
+      ok: true,
+      purchaseToken,
+      derived,
+    };
+  } catch (error) {
+    if (isPermanentGooglePlayApiError(error)) {
+      return {
+        ok: true,
+        purchaseToken,
+        derived: {
+          status: "expired",
+          expiryTime: null,
+          expiryDate: null,
+          subscriptionState: "SUBSCRIPTION_STATE_EXPIRED",
+          latestOrderId: "",
+          acknowledgementState: "",
+          testPurchase: false,
+          linkedPurchaseToken: "",
+        },
+        permanentError: true,
+      };
+    }
+    return {
+      ok: false,
+      purchaseToken,
+      error,
+    };
+  }
+}
+
+async function resolveUserEntitlementAfterRevocation({
+  packageName,
+  existingData,
+  notificationPurchaseToken,
+  notificationDerived,
+  notificationTokenConfirmed,
+}) {
+  const tokens = collectTokensForRequery(existingData, notificationPurchaseToken);
+  const tokenResults = await Promise.all(
+    tokens.map((token) => syncEntitlementForToken(packageName, token)),
+  );
+  return resolveRevocationUserEntitlement({
+    existingData,
+    notificationPurchaseToken,
+    notificationDerived,
+    notificationTokenConfirmed,
+    tokenResults,
+  });
+}
+
 async function writeSubscriptionEvent(db, eventId, fields) {
   if (!eventId) {
     return;
@@ -414,6 +610,7 @@ async function applyGoogleSubscriptionUpdateToUser(
   uid,
   derived,
   purchaseToken,
+  options = {},
 ) {
   const userRef = db.collection("users").doc(uid);
   const userSnap = await userRef.get();
@@ -442,6 +639,17 @@ async function applyGoogleSubscriptionUpdateToUser(
 
   if (purchaseToken) {
     update.activePurchaseTokens = admin.FieldValue.arrayUnion(purchaseToken);
+  }
+
+  if (derived.status === "active") {
+    const primaryToken = String(
+      options.primaryPurchaseToken || purchaseToken || "",
+    ).trim();
+    if (primaryToken) {
+      update.googlePlayPrimaryPurchaseToken = primaryToken;
+    }
+  } else if (options.clearPrimaryPurchaseToken === true) {
+    update.googlePlayPrimaryPurchaseToken = "";
   }
 
   await userRef.set(update, { merge: true });
@@ -791,12 +999,56 @@ function createGooglePlayRtdnHandler({ getDb, admin, logger }) {
         return;
       }
 
+      const isRevocation = isRevocationNotification(forceExpired, notificationType);
+      let finalDerived = derived;
+      let applyOptions = {};
+      let revocationResolution = null;
+
+      if (isRevocation) {
+        const userRef = db.collection("users").doc(userLookup.uid);
+        const userSnap = await userRef.get();
+        const existingData = userSnap.exists ? userSnap.data() || {} : {};
+        const notificationTokenConfirmed =
+          forceExpired ||
+          Boolean(matchedLineItem) ||
+          derived.status === "expired";
+
+        revocationResolution = await resolveUserEntitlementAfterRevocation({
+          packageName,
+          existingData,
+          notificationPurchaseToken: purchaseToken,
+          notificationDerived: derived,
+          notificationTokenConfirmed,
+        });
+
+        finalDerived = revocationResolution.derived;
+        applyOptions = {
+          primaryPurchaseToken: revocationResolution.primaryPurchaseToken,
+          clearPrimaryPurchaseToken:
+            revocationResolution.action === "expire",
+        };
+
+        logger.info(`${NOTIFICATION_TRACE} revocation resolved`, {
+          messageId,
+          eventId,
+          uid: userLookup.uid,
+          action: revocationResolution.action,
+          notificationPurchaseTokenSuffix: tokenSuffix(purchaseToken),
+          revokedTokenIgnored: revocationResolution.revokedTokenIgnored
+            ? tokenSuffix(revocationResolution.revokedTokenIgnored)
+            : null,
+          uncertainApiFailures: revocationResolution.uncertainApiFailures || [],
+          finalSubscriptionStatus: finalDerived.status,
+        });
+      }
+
       const applyResult = await applyGoogleSubscriptionUpdateToUser(
         db,
         admin,
         userLookup.uid,
-        derived,
+        finalDerived,
         purchaseToken,
+        applyOptions,
       );
 
       await writeSubscriptionEvent(db, eventId, {
@@ -805,11 +1057,15 @@ function createGooglePlayRtdnHandler({ getDb, admin, logger }) {
         uid: userLookup.uid,
         userMatch: userLookup.match,
         linkedPurchaseTokenSuffix: tokenSuffix(linkedPurchaseToken),
-        subscriptionStatus: derived.status,
-        expiryTime: derived.expiryTime || null,
+        subscriptionStatus: finalDerived.status,
+        expiryTime: finalDerived.expiryTime || null,
         result: applyResult.applied ? "user_updated" : applyResult.reason,
-        googlePlaySubscriptionState: derived.subscriptionState || "",
-        googlePlayLatestOrderId: derived.latestOrderId || "",
+        googlePlaySubscriptionState: finalDerived.subscriptionState || "",
+        googlePlayLatestOrderId: finalDerived.latestOrderId || "",
+        revocationAction: revocationResolution?.action || null,
+        revokedTokenIgnored: revocationResolution?.revokedTokenIgnored
+          ? tokenSuffix(revocationResolution.revokedTokenIgnored)
+          : null,
       });
 
       logger.info(`${NOTIFICATION_TRACE} processed`, {
@@ -817,8 +1073,9 @@ function createGooglePlayRtdnHandler({ getDb, admin, logger }) {
         eventId,
         uid: userLookup.uid,
         purchaseTokenSuffix: tokenSuffix(purchaseToken),
-        subscriptionStatus: derived.status,
+        subscriptionStatus: finalDerived.status,
         result: applyResult.applied ? "user_updated" : applyResult.reason,
+        revocationAction: revocationResolution?.action || null,
       });
     } catch (error) {
       const fallbackEventId =
@@ -869,4 +1126,9 @@ module.exports = {
   createGooglePlayRtdnHandler,
   GOOGLE_PLAY_PACKAGE_NAME,
   GOOGLE_PLAY_MONTHLY_PRODUCT_ID,
+  collectTokensForRequery,
+  isUsableGooglePlayEntitlement,
+  resolveRevocationUserEntitlement,
+  deriveGooglePlayEntitlement,
+  parseFirestoreExpiryTime,
 };

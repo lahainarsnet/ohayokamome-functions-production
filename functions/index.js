@@ -1607,6 +1607,7 @@ exports.verifyGooglePlaySubscriptionPurchase = onCall(
           activePurchaseTokens: admin.FieldValue.arrayUnion(
             purchaseToken,
           ),
+          googlePlayPrimaryPurchaseToken: purchaseToken,
           lastSubscriptionSource: source,
           lastSubscriptionCheckedAt: now,
           updatedAt: now,
