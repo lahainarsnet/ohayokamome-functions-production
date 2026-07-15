@@ -1,6 +1,8 @@
 const assert = require("assert");
 const {
   buildRecognizerName,
+  buildSpeechApiEndpoint,
+  extractSafeGoogleErrorDiagnostics,
   extractTextFromGoogleResponse,
   normalizeGoogleError,
   transcribeWithGoogle,
@@ -20,9 +22,35 @@ function createMockClient(recognizeImpl) {
 
 function runTests() {
   assert.strictEqual(
-    buildRecognizerName("lahainarsnet-ohayokamome-live", "global"),
-    "projects/lahainarsnet-ohayokamome-live/locations/global/recognizers/_",
+    buildRecognizerName("lahainarsnet-ohayokamome-live", "us"),
+    "projects/lahainarsnet-ohayokamome-live/locations/us/recognizers/_",
   );
+  assert.strictEqual(buildSpeechApiEndpoint("us"), "us-speech.googleapis.com");
+  assert.strictEqual(
+    buildSpeechApiEndpoint("global"),
+    "speech.googleapis.com",
+  );
+
+  const diagnostics = extractSafeGoogleErrorDiagnostics({
+    code: 3,
+    message:
+      "3 INVALID_ARGUMENT: model 'chirp_3' does not exist in the location named 'global'",
+    details: [
+      {
+        "@type": "type.googleapis.com/google.rpc.BadRequest",
+        fieldViolations: [
+          {
+            field: "config.model",
+            description: "model chirp_3 is not available in global",
+          },
+        ],
+      },
+    ],
+  });
+  assert.strictEqual(diagnostics.grpcCode, 3);
+  assert.ok(diagnostics.messageSummary.includes("INVALID_ARGUMENT"));
+  assert.strictEqual(diagnostics.fieldViolations.length, 1);
+  assert.strictEqual(diagnostics.fieldViolations[0].field, "config.model");
 
   assert.strictEqual(
     extractTextFromGoogleResponse({
@@ -232,6 +260,47 @@ async function runAsyncTests() {
   assert.ok(!serializedLogs.includes("認識テキスト"));
   assert.ok(!serializedLogs.includes("api-key"));
   assert.ok(logLines.some((entry) => entry.fields?.errorCode === "GOOGLE_STT_PERMISSION"));
+
+  const diagnosticLogLines = [];
+  const diagnosticLogger = {
+    warn: (message, fields) => {
+      diagnosticLogLines.push({ message, fields });
+    },
+  };
+  await transcribeWithGoogle({
+    audioBuffer,
+    mimeType,
+    receivedBytes,
+    projectId,
+    logger: diagnosticLogger,
+    speechClientFactory: () =>
+      createMockClient(async () => {
+        const error = new Error(
+          "3 INVALID_ARGUMENT: model 'chirp_3' does not exist in the location named 'global'",
+        );
+        error.code = 3;
+        error.details = [
+          {
+            "@type": "type.googleapis.com/google.rpc.BadRequest",
+            fieldViolations: [
+              {
+                field: "config.model",
+                description: "model chirp_3 is not available in global",
+              },
+            ],
+          },
+        ];
+        throw error;
+      }),
+  });
+  const diagnosticEntry = diagnosticLogLines.find(
+    (entry) => entry.message === "transcribeExperiment: GOOGLE_STT_ERROR",
+  );
+  assert.ok(diagnosticEntry);
+  assert.strictEqual(diagnosticEntry.fields.grpcCode, 3);
+  assert.ok(diagnosticEntry.fields.messageSummary.includes("INVALID_ARGUMENT"));
+  assert.strictEqual(diagnosticEntry.fields.fieldViolations[0].field, "config.model");
+  assert.ok(!JSON.stringify(diagnosticLogLines).includes("fake-audio"));
 
   const slowClient = createMockClient(
     () =>
