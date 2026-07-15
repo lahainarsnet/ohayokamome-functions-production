@@ -4,7 +4,7 @@
  * - 音声内容や変換結果は保存しない。
  *
  * 期待ペイロード例:
- *   { audioBase64: "...", mimeType: "audio/mp4" }
+ *   { audioBase64: "...", mimeType: "audio/mp4", language: "ja" }
  *
  * 成功: { ok: true, text: "..." }
  * 失敗: { ok: false, code: "..." }
@@ -23,6 +23,7 @@ const {
   GOOGLE_STT_DEFAULT_LOCATION,
 } = require("./stt/constants");
 const { resolveSttProvider } = require("./stt/registry");
+const { resolveSttLanguage } = require("./stt/language");
 const { transcribeWithOpenAI } = require("./stt/openaiProvider");
 const { transcribeWithGoogle } = require("./stt/googleProvider");
 
@@ -109,6 +110,7 @@ async function invokeSttProvider({
   provider,
   audioBuffer,
   mimeType,
+  language,
   receivedBytes,
   apiKey,
   googleOptions = {},
@@ -117,6 +119,7 @@ async function invokeSttProvider({
     return transcribeWithOpenAI({
       audioBuffer,
       mimeType,
+      language,
       apiKey,
       receivedBytes,
       logger,
@@ -126,6 +129,7 @@ async function invokeSttProvider({
     return transcribeWithGoogle({
       audioBuffer,
       mimeType,
+      language,
       receivedBytes,
       projectId: googleOptions.projectId,
       location: googleOptions.location,
@@ -190,7 +194,7 @@ exports.transcribeExperiment = onCall(
     }
     const provider = providerResolution.provider;
 
-    const { audioBase64, mimeType } = request.data || {};
+    const { audioBase64, mimeType, language: rawLanguage } = request.data || {};
 
     if (typeof audioBase64 !== "string" || audioBase64.length === 0) {
       logSttEvent({
@@ -268,6 +272,34 @@ exports.transcribeExperiment = onCall(
       });
       return { ok: false, code: "AUDIO_TOO_LARGE" };
     }
+
+    const languageResolution = resolveSttLanguage(rawLanguage);
+    if (!languageResolution.ok) {
+      logger.warn("transcribeExperiment: STT_LANGUAGE_INVALID", {
+        configuredLanguage: String(rawLanguage ?? ""),
+        resolvedLanguage: languageResolution.language || null,
+        provider,
+        uidSuffix: uidSuffix(uid),
+      });
+      logSttEvent({
+        event: "transcribe_failed",
+        provider,
+        model: null,
+        location: null,
+        receivedBytes,
+        apiLatencyMs: null,
+        totalLatencyMs: Date.now() - startedAt,
+        success: false,
+        errorCode: languageResolution.code,
+        textLength: null,
+        uidSuffix: uidSuffix(uid),
+        sttProviderSetting: provider,
+        requestedLanguage: languageResolution.language || null,
+        providerLanguage: null,
+      });
+      return { ok: false, code: languageResolution.code };
+    }
+    const language = languageResolution.language;
 
     let apiKey = null;
     if (provider === STT_PROVIDER_OPENAI) {
@@ -372,6 +404,7 @@ exports.transcribeExperiment = onCall(
       provider,
       audioBuffer: buf,
       mimeType,
+      language,
       receivedBytes,
       apiKey,
       googleOptions: {
@@ -396,6 +429,8 @@ exports.transcribeExperiment = onCall(
         textLength: null,
         uidSuffix: uidSuffix(uid),
         sttProviderSetting: provider,
+        requestedLanguage: language,
+        providerLanguage: providerResult.providerLanguage || null,
       });
       return { ok: false, code: providerResult.code };
     }
@@ -407,6 +442,8 @@ exports.transcribeExperiment = onCall(
       location: providerResult.location || null,
       apiLatencyMs: providerResult.apiLatencyMs,
       uidSuffix: uidSuffix(uid),
+      requestedLanguage: language,
+      providerLanguage: providerResult.providerLanguage || null,
     });
     logSttEvent({
       event: "transcribe_succeeded",
@@ -421,6 +458,8 @@ exports.transcribeExperiment = onCall(
       textLength: providerResult.text.length,
       uidSuffix: uidSuffix(uid),
       sttProviderSetting: provider,
+      requestedLanguage: language,
+      providerLanguage: providerResult.providerLanguage || null,
     });
 
     return {
@@ -433,6 +472,7 @@ exports.transcribeExperiment = onCall(
 module.exports.getJstDateKey = getJstDateKey;
 module.exports.reserveDailyTranscribeQuota = reserveDailyTranscribeQuota;
 module.exports.resolveSttProvider = resolveSttProvider;
+module.exports.resolveSttLanguage = resolveSttLanguage;
 module.exports.invokeSttProvider = invokeSttProvider;
 module.exports.logSttEvent = logSttEvent;
 module.exports.uidSuffix = uidSuffix;

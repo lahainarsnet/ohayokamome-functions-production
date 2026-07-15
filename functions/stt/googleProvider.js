@@ -2,9 +2,9 @@ const {
   STT_PROVIDER_GOOGLE,
   GOOGLE_STT_DEFAULT_MODEL,
   GOOGLE_STT_DEFAULT_LOCATION,
-  GOOGLE_STT_DEFAULT_LANGUAGE,
   GOOGLE_STT_API_TIMEOUT_MS,
 } = require("./constants");
+const { toGoogleLanguageCode } = require("./language");
 
 const GOOGLE_ERROR_MESSAGE_MAX_LEN = 300;
 const GOOGLE_ERROR_DETAIL_MAX_LEN = 200;
@@ -204,16 +204,17 @@ function resolveProjectId(projectId) {
 async function transcribeWithGoogle({
   audioBuffer,
   mimeType,
+  language,
   receivedBytes,
   projectId,
   location = GOOGLE_STT_DEFAULT_LOCATION,
   model = GOOGLE_STT_DEFAULT_MODEL,
-  languageCode = GOOGLE_STT_DEFAULT_LANGUAGE,
   speechClientFactory,
   logger,
   timeoutMs = GOOGLE_STT_API_TIMEOUT_MS,
 }) {
   const apiStartedAt = Date.now();
+  const googleLanguageCode = toGoogleLanguageCode(language);
   const resolvedProjectId = resolveProjectId(projectId);
   if (!resolvedProjectId) {
     if (typeof logger?.warn === "function") {
@@ -266,7 +267,7 @@ async function transcribeWithGoogle({
     recognizer: buildRecognizerName(resolvedProjectId, location),
     config: {
       autoDecodingConfig: {},
-      languageCodes: [languageCode],
+      languageCodes: [googleLanguageCode],
       model,
       features: {
         enableAutomaticPunctuation: true,
@@ -296,6 +297,7 @@ async function transcribeWithGoogle({
       provider: STT_PROVIDER_GOOGLE,
       model,
       location,
+      providerLanguage: googleLanguageCode,
       apiLatencyMs: Date.now() - apiStartedAt,
     };
   } catch (error) {
@@ -322,6 +324,7 @@ async function transcribeWithGoogle({
       provider: STT_PROVIDER_GOOGLE,
       model,
       location,
+      providerLanguage: googleLanguageCode,
       apiLatencyMs: Date.now() - apiStartedAt,
     };
   } finally {

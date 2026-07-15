@@ -44,6 +44,7 @@ function runTests() {
     const result = await transcribeWithOpenAI({
       audioBuffer,
       mimeType,
+      language: "ja",
       apiKey,
       receivedBytes,
       fetchImpl: successFetch,
@@ -65,6 +66,41 @@ function runTests() {
       ["file", "blob:audio/mp4"],
       ["model", OPENAI_TRANSCRIBE_MODEL],
       ["response_format", "json"],
+      ["language", "ja"],
+    ]);
+
+    const enFetch = createFetchMock(async (url, options) => {
+      capturedBodyEntries = [];
+      if (options.body && typeof options.body.entries === "function") {
+        for (const [key, value] of options.body.entries()) {
+          if (value instanceof Blob) {
+            capturedBodyEntries.push([key, `blob:${value.type}`]);
+          } else {
+            capturedBodyEntries.push([key, value]);
+          }
+        }
+      }
+      return {
+        ok: true,
+        status: 200,
+        text: async () => JSON.stringify({ text: "hello" }),
+      };
+    });
+    const enResult = await transcribeWithOpenAI({
+      audioBuffer,
+      mimeType,
+      language: "en",
+      apiKey,
+      receivedBytes,
+      fetchImpl: enFetch,
+    });
+    assert.strictEqual(enResult.ok, true);
+    assert.strictEqual(enResult.providerLanguage, "en");
+    assert.deepStrictEqual(capturedBodyEntries, [
+      ["file", "blob:audio/mp4"],
+      ["model", OPENAI_TRANSCRIBE_MODEL],
+      ["response_format", "json"],
+      ["language", "en"],
     ]);
 
     const m4aFetch = createFetchMock(async () => ({
@@ -75,6 +111,7 @@ function runTests() {
     await transcribeWithOpenAI({
       audioBuffer,
       mimeType: "audio/m4a",
+      language: "ja",
       apiKey,
       receivedBytes,
       fetchImpl: m4aFetch,
@@ -89,6 +126,7 @@ function runTests() {
     const httpError = await transcribeWithOpenAI({
       audioBuffer,
       mimeType,
+      language: "ja",
       apiKey,
       receivedBytes,
       fetchImpl: httpErrorFetch,
@@ -102,6 +140,7 @@ function runTests() {
     const requestFailed = await transcribeWithOpenAI({
       audioBuffer,
       mimeType,
+      language: "ja",
       apiKey,
       receivedBytes,
       fetchImpl: requestFailedFetch,
@@ -117,6 +156,7 @@ function runTests() {
     const badJson = await transcribeWithOpenAI({
       audioBuffer,
       mimeType,
+      language: "ja",
       apiKey,
       receivedBytes,
       fetchImpl: badJsonFetch,
@@ -132,6 +172,7 @@ function runTests() {
     const noText = await transcribeWithOpenAI({
       audioBuffer,
       mimeType,
+      language: "ja",
       apiKey,
       receivedBytes,
       fetchImpl: noTextFetch,

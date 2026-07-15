@@ -6,6 +6,7 @@ const {
 } = require("./stt/constants");
 const {
   resolveSttProvider,
+  resolveSttLanguage,
   invokeSttProvider,
   uidSuffix,
   getJstDateKey,
@@ -75,6 +76,26 @@ async function runTests() {
   assert.strictEqual(typoProvider.ok, false);
   assert.strictEqual(typoProvider.code, "STT_PROVIDER_INVALID");
 
+  const jaLanguage = resolveSttLanguage("ja");
+  assert.strictEqual(jaLanguage.ok, true);
+  assert.strictEqual(jaLanguage.language, "ja");
+
+  const enLanguage = resolveSttLanguage("en");
+  assert.strictEqual(enLanguage.ok, true);
+  assert.strictEqual(enLanguage.language, "en");
+
+  const defaultLanguage = resolveSttLanguage(undefined);
+  assert.strictEqual(defaultLanguage.ok, true);
+  assert.strictEqual(defaultLanguage.language, "ja");
+
+  const emptyLanguage = resolveSttLanguage("");
+  assert.strictEqual(emptyLanguage.ok, true);
+  assert.strictEqual(emptyLanguage.language, "ja");
+
+  const invalidLanguage = resolveSttLanguage("fr");
+  assert.strictEqual(invalidLanguage.ok, false);
+  assert.strictEqual(invalidLanguage.code, "STT_LANGUAGE_INVALID");
+
   const unauth = validateAuth({ auth: null });
   assert.deepStrictEqual(unauth, { ok: false, code: "UNAUTHENTICATED" });
 
@@ -142,6 +163,7 @@ async function runTests() {
     provider: STT_PROVIDER_GOOGLE,
     audioBuffer: Buffer.from("audio"),
     mimeType: "audio/mp4",
+    language: "ja",
     receivedBytes: 5,
     googleOptions: {
       projectId: "lahainarsnet-ohayokamome-live",
@@ -157,6 +179,7 @@ async function runTests() {
   assert.strictEqual(googleInvoke.ok, true);
   assert.strictEqual(googleInvoke.text, "google text");
   assert.strictEqual(googleInvoke.provider, STT_PROVIDER_GOOGLE);
+  assert.strictEqual(googleInvoke.providerLanguage, "ja-JP");
   assert.deepStrictEqual(mapProviderResultToClient(googleInvoke), {
     ok: true,
     text: "google text",
@@ -166,6 +189,7 @@ async function runTests() {
     provider: "unknown",
     audioBuffer: Buffer.from("audio"),
     mimeType: "audio/mp4",
+    language: "ja",
     receivedBytes: 5,
     apiKey: "test-key",
   });

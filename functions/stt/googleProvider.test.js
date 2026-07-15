@@ -117,6 +117,7 @@ async function runAsyncTests() {
   const successResult = await transcribeWithGoogle({
     audioBuffer,
     mimeType,
+    language: "ja",
     receivedBytes,
     projectId,
     speechClientFactory: () => successClient,
@@ -127,7 +128,7 @@ async function runAsyncTests() {
   assert.strictEqual(successResult.provider, STT_PROVIDER_GOOGLE);
   assert.strictEqual(successResult.model, GOOGLE_STT_DEFAULT_MODEL);
   assert.strictEqual(successResult.location, GOOGLE_STT_DEFAULT_LOCATION);
-  assert.strictEqual(typeof successResult.apiLatencyMs, "number");
+  assert.strictEqual(successResult.providerLanguage, "ja-JP");
   assert.strictEqual(
     capturedRequest.recognizer,
     buildRecognizerName(projectId, GOOGLE_STT_DEFAULT_LOCATION),
@@ -140,9 +141,30 @@ async function runAsyncTests() {
   });
   assert.ok(Buffer.isBuffer(capturedRequest.content));
 
+  const enResult = await transcribeWithGoogle({
+    audioBuffer,
+    mimeType,
+    receivedBytes: audioBuffer.length,
+    language: "en",
+    projectId,
+    speechClientFactory: () =>
+      createMockClient(async (request) => {
+        capturedRequest = request;
+        return [
+          {
+            results: [{ alternatives: [{ transcript: "hello" }] }],
+          },
+        ];
+      }),
+  });
+  assert.strictEqual(enResult.ok, true);
+  assert.strictEqual(enResult.providerLanguage, "en-US");
+  assert.deepStrictEqual(capturedRequest.config.languageCodes, ["en-US"]);
+
   const emptyResult = await transcribeWithGoogle({
     audioBuffer,
     mimeType,
+    language: "ja",
     receivedBytes,
     projectId,
     speechClientFactory: () =>
@@ -154,6 +176,7 @@ async function runAsyncTests() {
   const permissionError = await transcribeWithGoogle({
     audioBuffer,
     mimeType,
+    language: "ja",
     receivedBytes,
     projectId,
     speechClientFactory: () =>
@@ -169,6 +192,7 @@ async function runAsyncTests() {
   const quotaError = await transcribeWithGoogle({
     audioBuffer,
     mimeType,
+    language: "ja",
     receivedBytes,
     projectId,
     speechClientFactory: () =>
@@ -184,6 +208,7 @@ async function runAsyncTests() {
   const timeoutError = await transcribeWithGoogle({
     audioBuffer,
     mimeType,
+    language: "ja",
     receivedBytes,
     projectId,
     speechClientFactory: () =>
@@ -199,6 +224,7 @@ async function runAsyncTests() {
   const invalidAudioError = await transcribeWithGoogle({
     audioBuffer,
     mimeType,
+    language: "ja",
     receivedBytes,
     projectId,
     speechClientFactory: () =>
@@ -214,6 +240,7 @@ async function runAsyncTests() {
   const sdkInitError = await transcribeWithGoogle({
     audioBuffer,
     mimeType,
+    language: "ja",
     receivedBytes,
     projectId,
     speechClientFactory: () => {
@@ -226,6 +253,7 @@ async function runAsyncTests() {
   const missingProject = await transcribeWithGoogle({
     audioBuffer,
     mimeType,
+    language: "ja",
     receivedBytes,
     projectId: "",
     speechClientFactory: () => successClient,
@@ -245,6 +273,7 @@ async function runAsyncTests() {
   await transcribeWithGoogle({
     audioBuffer,
     mimeType,
+    language: "ja",
     receivedBytes,
     projectId,
     logger,
@@ -270,6 +299,7 @@ async function runAsyncTests() {
   await transcribeWithGoogle({
     audioBuffer,
     mimeType,
+    language: "ja",
     receivedBytes,
     projectId,
     logger: diagnosticLogger,
@@ -314,6 +344,7 @@ async function runAsyncTests() {
   const timedOut = await transcribeWithGoogle({
     audioBuffer,
     mimeType,
+    language: "ja",
     receivedBytes,
     projectId,
     timeoutMs: 20,

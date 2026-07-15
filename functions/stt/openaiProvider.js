@@ -3,10 +3,12 @@ const {
   OPENAI_TRANSCRIBE_MODEL,
   STT_PROVIDER_OPENAI,
 } = require("./constants");
+const { toOpenAiLanguage } = require("./language");
 
 async function transcribeWithOpenAI({
   audioBuffer,
   mimeType,
+  language,
   apiKey,
   receivedBytes,
   fetchImpl = fetch,
@@ -16,12 +18,14 @@ async function transcribeWithOpenAI({
   const filename = trimmedMime.toLowerCase().includes("mp4")
     ? "audio.mp4"
     : "audio.m4a";
+  const openAiLanguage = toOpenAiLanguage(language);
 
   const blob = new Blob([audioBuffer], { type: trimmedMime });
   const formData = new FormData();
   formData.append("file", blob, filename);
   formData.append("model", OPENAI_TRANSCRIBE_MODEL);
   formData.append("response_format", "json");
+  formData.append("language", openAiLanguage);
 
   const apiStartedAt = Date.now();
   let res;
@@ -130,6 +134,7 @@ async function transcribeWithOpenAI({
     text: data.text,
     provider: STT_PROVIDER_OPENAI,
     model: OPENAI_TRANSCRIBE_MODEL,
+    providerLanguage: openAiLanguage,
     apiLatencyMs,
   };
 }
