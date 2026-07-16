@@ -38,6 +38,10 @@ const {
   payloadKeys,
   summarizeHttpsError,
 } = require("./billingFinalTrace");
+const {
+  RECIPIENT_SUBSCRIPTION_UNAVAILABLE,
+  SENDER_SUBSCRIPTION_UNAVAILABLE,
+} = require("./sendMessageGuardCodes");
 const { onMessagePublished } = require("firebase-functions/v2/pubsub");
 
 const { randomUUID } = crypto;
@@ -1179,7 +1183,12 @@ exports.sendMessageWithLimit = onCall(async (request) => {
       ...guardLogBase,
       action: "blockSend",
     });
-    return { success: false, code: "SEND_UNAVAILABLE" };
+    logger.info(
+      `[sendMessageWithLimit] subscriptionGuardBlocked senderUidTail=${uidTailForLog(senderId)} ` +
+        `recipientUidTail=${uidTailForLog(recipientId)} guardType=RecipientSubscriptionGuard ` +
+        `returnedCode=${RECIPIENT_SUBSCRIPTION_UNAVAILABLE} action=blockSend`,
+    );
+    return { success: false, code: RECIPIENT_SUBSCRIPTION_UNAVAILABLE };
   }
 
   const today = getJstDateKey(new Date());
@@ -1213,7 +1222,7 @@ exports.sendMessageWithLimit = onCall(async (request) => {
             subscriptionStatus: senderSubscriptionStatus,
             expiryMillis: senderExpiryMillis,
             action: "blockSend",
-            code: "SEND_UNAVAILABLE",
+            code: SENDER_SUBSCRIPTION_UNAVAILABLE,
           });
           senderSubscriptionBlocked = true;
           return;
@@ -1271,7 +1280,12 @@ exports.sendMessageWithLimit = onCall(async (request) => {
     });
 
     if (senderSubscriptionBlocked) {
-      return { success: false, code: "SEND_UNAVAILABLE" };
+      logger.info(
+        `[sendMessageWithLimit] subscriptionGuardBlocked senderUidTail=${uidTailForLog(senderId)} ` +
+          `recipientUidTail=${uidTailForLog(recipientId)} guardType=SenderSubscriptionGuard ` +
+          `returnedCode=${SENDER_SUBSCRIPTION_UNAVAILABLE} action=blockSend`,
+      );
+      return { success: false, code: SENDER_SUBSCRIPTION_UNAVAILABLE };
     }
 
     return { success: true };
