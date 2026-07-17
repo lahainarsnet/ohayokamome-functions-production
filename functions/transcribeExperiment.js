@@ -14,8 +14,9 @@ const logger = require("firebase-functions/logger");
 const { onCall } = require("firebase-functions/v2/https");
 const { defineSecret, defineString } = require("firebase-functions/params");
 const admin = require("./firebaseAdmin");
+const { loadAppConfig } = require("./appConfig");
 const {
-  DAILY_TRANSCRIBE_LIMIT,
+  DEFAULT_DAILY_TRANSCRIBE_LIMIT,
   MAX_AUDIO_BYTES,
   STT_PROVIDER_OPENAI,
   STT_PROVIDER_GOOGLE,
@@ -49,7 +50,41 @@ function logSttEvent(fields) {
   logger.info("STT_TRACE", fields);
 }
 
-async function reserveDailyTranscribeQuota(uid) {
+function evaluateTranscribeQuotaReservation({
+  count,
+  lastDate,
+  todayKey,
+  limit,
+}) {
+  let effectiveCount =
+    typeof count === "number" && Number.isFinite(count) ? count : 0;
+  if (lastDate !== todayKey) {
+    effectiveCount = 0;
+  }
+
+  if (effectiveCount >= limit) {
+    return {
+      allowed: false,
+      count: effectiveCount,
+      limit,
+      usedCount: effectiveCount,
+      remainingCount: 0,
+      dateKey: todayKey,
+    };
+  }
+
+  const newCount = effectiveCount + 1;
+  return {
+    allowed: true,
+    count: newCount,
+    limit,
+    usedCount: newCount,
+    remainingCount: Math.max(0, limit - newCount),
+    dateKey: todayKey,
+  };
+}
+
+async function reserveDailyTranscribeQuota(uid, limit) {
   const todayKey = getJstDateKey(new Date());
   const userRef = admin.getDb().collection("users").doc(uid);
 
@@ -57,52 +92,80 @@ async function reserveDailyTranscribeQuota(uid) {
     const now = admin.FieldValue.serverTimestamp();
     const snap = await tx.get(userRef);
     const lastDate = snap.exists ? snap.get("transcribeLastDate") : null;
-    let count =
+    const count =
       snap.exists && typeof snap.get("transcribeDailyCount") === "number"
         ? snap.get("transcribeDailyCount")
         : 0;
 
-    if (lastDate !== todayKey) {
-      count = 0;
-    }
+    const reservation = evaluateTranscribeQuotaReservation({
+      count,
+      lastDate,
+      todayKey,
+      limit,
+    });
 
-    if (count >= DAILY_TRANSCRIBE_LIMIT) {
+    logger.info("transcribeExperiment: quota reservation evaluated", {
+      uidSuffix: uidSuffix(uid),
+      jstDateKey: todayKey,
+      transcribeDailyCount: count,
+      transcribeLastDate: lastDate,
+      dailyTranscribeLimit: limit,
+      allowed: reservation.allowed,
+      usedCount: reservation.usedCount,
+      remainingCount: reservation.remainingCount,
+    });
+
+    if (!reservation.allowed) {
       const exceededCount =
-        snap.exists && typeof snap.get("transcribeLimitExceededCount") === "number"
+        snap.exists &&
+        typeof snap.get("transcribeLimitExceededCount") === "number"
           ? snap.get("transcribeLimitExceededCount") + 1
           : 1;
       tx.set(
         userRef,
         {
           transcribeLastDate: todayKey,
-          transcribeDailyCount: count,
+          transcribeDailyCount: reservation.count,
           transcribeUpdatedAt: now,
           transcribeLastAttemptAt: now,
           transcribeLastLimitExceededAt: now,
           transcribeLimitExceededCount: exceededCount,
-          transcribeLimit: DAILY_TRANSCRIBE_LIMIT,
+          transcribeLimit: limit,
           transcribeLastResultCode: "DAILY_TRANSCRIBE_LIMIT_EXCEEDED",
         },
         { merge: true },
       );
-      return { allowed: false, count, dateKey: todayKey };
+      logger.warn("transcribeExperiment: quota limit reached in transaction", {
+        uidSuffix: uidSuffix(uid),
+        jstDateKey: todayKey,
+        dailyTranscribeLimit: limit,
+        usedCount: reservation.usedCount,
+        remainingCount: reservation.remainingCount,
+      });
+      return reservation;
     }
 
-    const newCount = count + 1;
     tx.set(
       userRef,
       {
         transcribeLastDate: todayKey,
-        transcribeDailyCount: newCount,
+        transcribeDailyCount: reservation.count,
         transcribeUpdatedAt: now,
         transcribeLastAttemptAt: now,
         transcribeLastSuccessAt: now,
-        transcribeLimit: DAILY_TRANSCRIBE_LIMIT,
+        transcribeLimit: limit,
         transcribeLastResultCode: "OK",
       },
       { merge: true },
     );
-    return { allowed: true, count: newCount, dateKey: todayKey };
+    logger.info("transcribeExperiment: quota reserved", {
+      uidSuffix: uidSuffix(uid),
+      jstDateKey: todayKey,
+      dailyTranscribeLimit: limit,
+      usedCount: reservation.usedCount,
+      remainingCount: reservation.remainingCount,
+    });
+    return reservation;
   });
 }
 
@@ -349,13 +412,34 @@ exports.transcribeExperiment = onCall(
       }
     }
 
+    let dailyTranscribeLimit = DEFAULT_DAILY_TRANSCRIBE_LIMIT;
+    let dailyTranscribeLimitUsedDefault = true;
+    try {
+      const appConfig = await loadAppConfig();
+      dailyTranscribeLimit = appConfig.dailyTranscribeLimit;
+      dailyTranscribeLimitUsedDefault = appConfig.dailyTranscribeLimitUsedDefault;
+      logger.info("transcribeExperiment: loaded app config", {
+        uidSuffix: uidSuffix(uid),
+        dailyTranscribeLimit,
+        dailyTranscribeLimitUsedDefault,
+        dailyTranscribeLimitFromDoc: appConfig.dailyTranscribeLimitFromDoc,
+      });
+    } catch (e) {
+      logger.warn("transcribeExperiment: loadAppConfig failed; using default limit", {
+        uidSuffix: uidSuffix(uid),
+        dailyTranscribeLimit: DEFAULT_DAILY_TRANSCRIBE_LIMIT,
+        error: String(e?.message || e),
+      });
+    }
+
     let quota;
     try {
-      quota = await reserveDailyTranscribeQuota(uid);
+      quota = await reserveDailyTranscribeQuota(uid, dailyTranscribeLimit);
     } catch (e) {
       logger.error("transcribeExperiment: QUOTA_CHECK_FAILED", {
-        uid,
+        uidSuffix: uidSuffix(uid),
         receivedBytes,
+        dailyTranscribeLimit,
       });
       logSttEvent({
         event: "transcribe_failed",
@@ -374,11 +458,13 @@ exports.transcribeExperiment = onCall(
     }
     if (!quota.allowed) {
       logger.warn("transcribeExperiment: DAILY_TRANSCRIBE_LIMIT_EXCEEDED", {
-        uid,
-        count: quota.count,
-        limit: DAILY_TRANSCRIBE_LIMIT,
+        uidSuffix: uidSuffix(uid),
+        usedCount: quota.usedCount,
+        remainingCount: quota.remainingCount,
+        limit: quota.limit,
         dateKey: quota.dateKey,
         receivedBytes,
+        dailyTranscribeLimitUsedDefault,
       });
       logSttEvent({
         event: "transcribe_failed",
@@ -393,11 +479,22 @@ exports.transcribeExperiment = onCall(
         uidSuffix: uidSuffix(uid),
         sttProviderSetting: provider,
       });
-      return {
+      const limitExceededResponse = {
         ok: false,
         code: "DAILY_TRANSCRIBE_LIMIT_EXCEEDED",
-        limit: DAILY_TRANSCRIBE_LIMIT,
+        limit: quota.limit,
+        usedCount: quota.usedCount,
+        remainingCount: quota.remainingCount,
       };
+      logger.info("transcribeExperiment: callable result", {
+        uidSuffix: uidSuffix(uid),
+        ok: false,
+        code: limitExceededResponse.code,
+        limit: limitExceededResponse.limit,
+        usedCount: limitExceededResponse.usedCount,
+        remainingCount: limitExceededResponse.remainingCount,
+      });
+      return limitExceededResponse;
     }
 
     const providerResult = await invokeSttProvider({
@@ -462,6 +559,15 @@ exports.transcribeExperiment = onCall(
       providerLanguage: providerResult.providerLanguage || null,
     });
 
+    logger.info("transcribeExperiment: callable result", {
+      uidSuffix: uidSuffix(uid),
+      ok: true,
+      textLength: providerResult.text.length,
+      dailyTranscribeLimit,
+      quotaUsedCount: quota.usedCount,
+      quotaRemainingCount: quota.remainingCount,
+    });
+
     return {
       ok: true,
       text: providerResult.text,
@@ -470,6 +576,7 @@ exports.transcribeExperiment = onCall(
 );
 
 module.exports.getJstDateKey = getJstDateKey;
+module.exports.evaluateTranscribeQuotaReservation = evaluateTranscribeQuotaReservation;
 module.exports.reserveDailyTranscribeQuota = reserveDailyTranscribeQuota;
 module.exports.resolveSttProvider = resolveSttProvider;
 module.exports.resolveSttLanguage = resolveSttLanguage;

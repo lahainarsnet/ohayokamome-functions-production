@@ -79,7 +79,7 @@ function getJstDateKey(baseDate = new Date()) {
 
 /* =========================================================
  * 共通：config/app を読み込み
- *  - dailyLimit: 1日の送信上限（デフォルト200）
+ *  - dailyLimit: 1日の送信上限（デフォルト120）
  *  - accessMode: "normal" | "block_all"
  * =======================================================*/
 /**
@@ -147,27 +147,7 @@ async function fetchLatestFcmTokenForRecipient(recipientId, fallbackToken = "") 
   }
 }
 
-async function loadAppConfig() {
-  const defaults = { dailyLimit: 200, accessMode: "normal" };
-  try {
-    const doc = await admin.getDb().collection("config").doc("app").get();
-    const dailySendLimit = doc?.get("dailySendLimit");
-    const appAccessMode = doc?.get("app_access_mode");
-    const dailyLimit =
-      typeof dailySendLimit === "number" && dailySendLimit > 0
-        ? (dailySendLimit | 0)
-        : defaults.dailyLimit;
-    const accessMode =
-      typeof appAccessMode === "string" && appAccessMode.length > 0
-        ? appAccessMode
-        : defaults.accessMode;
-
-    return { dailyLimit, accessMode };
-  } catch (e) {
-    logger.warn("Failed to read config/app; using defaults.", e);
-    return defaults;
-  }
-}
+const { loadAppConfig } = require("./appConfig");
 
 function uidTailForLog(uid) {
   if (typeof uid !== "string" || uid.length === 0) {
@@ -1239,6 +1219,12 @@ exports.sendMessageWithLimit = onCall(async (request) => {
       }
 
       if (dailyCount >= LIMIT) {
+        logger.warn("sendMessageWithLimit: DAILY_LIMIT_EXCEEDED", {
+          senderUidTail: uidTailForLog(senderId),
+          dailyCount,
+          limit: LIMIT,
+          dateKey: today,
+        });
         const err = new Error("DAILY_LIMIT_EXCEEDED");
         err.limit = LIMIT;
         throw err;
