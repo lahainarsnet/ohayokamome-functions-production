@@ -7,8 +7,8 @@
   },
   "scripts": {
     "deploy": "firebase deploy --only functions",
-    "test": "node subscriptionOwnership.test.js && node googlePlayRevocationSafety.test.js && node sendMessageGuardCodes.test.js && node appConfig.test.js && node stt/registry.test.js && node stt/language.test.js && node stt/openaiProvider.test.js && node stt/googleProvider.test.js && node transcribeExperiment.test.js",
-    "lint": "node --check index.js && node --check appConfig.js && node --check sendMessageGuardCodes.js && node --check transcribeExperiment.js && node --check stt/constants.js && node --check stt/registry.js && node --check stt/language.js && node --check stt/openaiProvider.js && node --check stt/googleProvider.js"
+    "test": "node subscriptionOwnership.test.js && node googlePlayRevocationSafety.test.js && node subscriptionEntitlement.test.js && node sendMessageGuardCodes.test.js && node appConfig.test.js && node stt/registry.test.js && node stt/language.test.js && node stt/openaiProvider.test.js && node stt/googleProvider.test.js && node transcribeExperiment.test.js",
+    "lint": "node --check index.js && node --check appConfig.js && node --check sendMessageGuardCodes.js && node --check transcribeExperiment.js && node --check subscriptionEntitlement.js && node --check appStoreSubscriptionNotifications.js && node --check googlePlaySubscriptionNotifications.js && node --check stt/constants.js && node --check stt/registry.js && node --check stt/language.js && node --check stt/openaiProvider.js && node --check stt/googleProvider.js"
   },
   "dependencies": {
     "@apple/app-store-server-library": "^3.1.0",

@@ -2,6 +2,11 @@
  * Google Play Real-time Developer Notifications (RTDN) handler (phase 1).
  */
 const { google } = require("googleapis");
+const {
+  buildAndroidStoreState,
+  commitUserSubscriptionDualWrite,
+  inferAndroidAutoRenewing,
+} = require("./subscriptionEntitlement");
 
 const GOOGLE_PLAY_PACKAGE_NAME = "com.lahainarsnet.ohayokamome.live";
 const GOOGLE_PLAY_MONTHLY_PRODUCT_ID = "ohayo_kamome_monthly";
@@ -641,18 +646,55 @@ async function applyGoogleSubscriptionUpdateToUser(
     update.activePurchaseTokens = admin.FieldValue.arrayUnion(purchaseToken);
   }
 
+  let primaryPurchaseToken = "";
   if (derived.status === "active") {
-    const primaryToken = String(
+    primaryPurchaseToken = String(
       options.primaryPurchaseToken || purchaseToken || "",
     ).trim();
-    if (primaryToken) {
-      update.googlePlayPrimaryPurchaseToken = primaryToken;
+    if (primaryPurchaseToken) {
+      update.googlePlayPrimaryPurchaseToken = primaryPurchaseToken;
     }
   } else if (options.clearPrimaryPurchaseToken === true) {
     update.googlePlayPrimaryPurchaseToken = "";
+    primaryPurchaseToken = "";
+  } else {
+    primaryPurchaseToken = String(
+      existingData.googlePlayPrimaryPurchaseToken ||
+        existingData.subscriptions?.android?.primaryPurchaseToken ||
+        "",
+    ).trim();
   }
 
-  await userRef.set(update, { merge: true });
+  const autoRenewing = inferAndroidAutoRenewing({
+    status: derived.status,
+    subscriptionState: derived.subscriptionState,
+  });
+
+  const storeState = buildAndroidStoreState({
+    status: derived.status,
+    expiryTime: derived.expiryTime || null,
+    autoRenewing,
+    primaryPurchaseToken,
+    // activePurchaseTokens resolved inside dual-write transaction
+    subscriptionState: derived.subscriptionState || "",
+    source: "google_play_rtdn",
+    updatedAt: admin.FieldValue.serverTimestamp(),
+  });
+
+  await commitUserSubscriptionDualWrite({
+    db,
+    admin,
+    uid,
+    source: "google_rtdn",
+    platform: "android",
+    storeState,
+    legacyUpdate: update,
+    log: options.logger || console,
+    meta: {
+      eventId: options.eventId || "",
+      purchaseToken: purchaseToken || "",
+    },
+  });
   return { applied: true };
 }
 
@@ -1026,6 +1068,8 @@ function createGooglePlayRtdnHandler({ getDb, admin, logger }) {
           primaryPurchaseToken: revocationResolution.primaryPurchaseToken,
           clearPrimaryPurchaseToken:
             revocationResolution.action === "expire",
+          eventId,
+          logger,
         };
 
         logger.info(`${NOTIFICATION_TRACE} revocation resolved`, {
@@ -1040,6 +1084,14 @@ function createGooglePlayRtdnHandler({ getDb, admin, logger }) {
           uncertainApiFailures: revocationResolution.uncertainApiFailures || [],
           finalSubscriptionStatus: finalDerived.status,
         });
+      }
+
+      if (!isRevocation) {
+        applyOptions = {
+          ...applyOptions,
+          eventId,
+          logger,
+        };
       }
 
       const applyResult = await applyGoogleSubscriptionUpdateToUser(

@@ -14,6 +14,10 @@ const {
   deriveSubscriptionState,
   pickLatestTransactionEntry,
 } = require("./appStoreServerCommon");
+const {
+  buildIosStoreState,
+  commitUserSubscriptionDualWrite,
+} = require("./subscriptionEntitlement");
 
 const NOTIFICATION_TRACE = "APP_STORE_NOTIFICATION_TRACE";
 const PROCESSING_STALE_MS = 10 * 60 * 1000;
@@ -244,7 +248,25 @@ async function findTargetUser(db, originalTransactionId, transactionId) {
   return { kind: "unlinked" };
 }
 
-async function applyUserSubscriptionUpdate(db, admin, uid, derived, source) {
+function autoRenewingFromRenewalInfo(renewalInfo) {
+  if (
+    renewalInfo == null ||
+    renewalInfo.autoRenewStatus === undefined ||
+    renewalInfo.autoRenewStatus === null
+  ) {
+    return null;
+  }
+  return Number(renewalInfo.autoRenewStatus) === 1;
+}
+
+async function applyUserSubscriptionUpdate(
+  db,
+  admin,
+  uid,
+  derived,
+  source,
+  options = {}
+) {
   const update = {
     subscriptionStatus: derived.status,
     subscriptionProductId: APP_STORE_PRODUCT_ID,
@@ -261,13 +283,39 @@ async function applyUserSubscriptionUpdate(db, admin, uid, derived, source) {
     updatedAt: admin.FieldValue.serverTimestamp(),
   };
 
+  let expiryTime = null;
   if (derived.expiresDate > 0) {
-    update.subscriptionExpiryTime = admin.Timestamp.fromMillis(
-      derived.expiresDate
-    );
+    expiryTime = admin.Timestamp.fromMillis(derived.expiresDate);
+    update.subscriptionExpiryTime = expiryTime;
   }
 
-  await db.collection("users").doc(uid).set(update, { merge: true });
+  const storeState = buildIosStoreState({
+    status: derived.status,
+    expiryTime,
+    autoRenewing:
+      typeof options.autoRenewing === "boolean" ? options.autoRenewing : null,
+    originalTransactionId: derived.originalTransactionId || "",
+    transactionId: derived.latestTransactionId || "",
+    environment: derived.environment || "",
+    source,
+    updatedAt: admin.FieldValue.serverTimestamp(),
+  });
+
+  await commitUserSubscriptionDualWrite({
+    db,
+    admin,
+    uid,
+    source: "apple_notification",
+    platform: "ios",
+    storeState,
+    legacyUpdate: update,
+    log: options.logger || console,
+    meta: {
+      eventId: options.notificationUUID || "",
+      transactionId: derived.latestTransactionId || "",
+      originalTransactionId: derived.originalTransactionId || "",
+    },
+  });
 }
 
 function isTestNotification(decodedNotification) {
@@ -485,12 +533,33 @@ function createAppStoreNotificationHandler({
         apiResult.environment ||
         notificationEnvironment;
 
+      let latestRenewalInfo = renewalInfo;
+      if (!latestRenewalInfo && latestEntry.renewalInfoSigned) {
+        try {
+          latestRenewalInfo = await decodeSignedRenewal(
+            verifier,
+            latestEntry.renewalInfoSigned
+          );
+        } catch (renewalError) {
+          logger.warn(`${NOTIFICATION_TRACE} renewal decode failed`, {
+            uid: userLookup.uid,
+            notificationUUID,
+            message: renewalError?.message || String(renewalError),
+          });
+        }
+      }
+
       await applyUserSubscriptionUpdate(
         db,
         admin,
         userLookup.uid,
         derived,
-        "app_store_notification_v2"
+        "app_store_notification_v2",
+        {
+          autoRenewing: autoRenewingFromRenewalInfo(latestRenewalInfo),
+          notificationUUID,
+          logger,
+        }
       );
 
       await writeSubscriptionEvent(db, notificationUUID, {

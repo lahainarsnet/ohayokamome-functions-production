@@ -39,6 +39,13 @@ const {
   summarizeHttpsError,
 } = require("./billingFinalTrace");
 const {
+  buildIosStoreState,
+  buildAndroidStoreState,
+  commitUserSubscriptionDualWrite,
+  inferAndroidAutoRenewing,
+  recomputeEntitlementFromStoredStores,
+} = require("./subscriptionEntitlement");
+const {
   RECIPIENT_SUBSCRIPTION_UNAVAILABLE,
   SENDER_SUBSCRIPTION_UNAVAILABLE,
 } = require("./sendMessageGuardCodes");
@@ -717,6 +724,40 @@ function buildAppStoreVerifyActiveUpdate({
     appStoreWebOrderLineItemId: transactionInfo?.webOrderLineItemId || "",
     appStoreValidationCode: derived.validationCode || "ACTIVE",
   };
+}
+
+async function writeAppStoreVerifyUserUpdate({
+  uid,
+  update,
+  autoRenewing = null,
+  log = console,
+  traceId = null,
+}) {
+  const storeState = buildIosStoreState({
+    status: update.subscriptionStatus,
+    expiryTime: update.subscriptionExpiryTime || null,
+    autoRenewing,
+    originalTransactionId: update.appStoreOriginalTransactionId || "",
+    transactionId: update.appStoreTransactionId || "",
+    environment: update.appStoreEnvironment || "",
+    source: "app_store_server_api",
+    updatedAt: admin.FieldValue.serverTimestamp(),
+  });
+  await commitUserSubscriptionDualWrite({
+    db: admin.getDb(),
+    admin,
+    uid,
+    source: "apple_verify",
+    platform: "ios",
+    storeState,
+    legacyUpdate: update,
+    log,
+    meta: {
+      eventId: traceId || "",
+      transactionId: update.appStoreTransactionId || "",
+      originalTransactionId: update.appStoreOriginalTransactionId || "",
+    },
+  });
 }
 
 function buildAppStoreVerifyInactiveUpdate({
@@ -1598,22 +1639,43 @@ exports.verifyGooglePlaySubscriptionPurchase = onCall(
         tokenSuffix: tokenSuffix(purchaseToken),
         expiryTime,
       });
-      await admin.getDb().collection("users").doc(uid).set(
-        {
-          subscriptionStatus: "active",
-          subscriptionProductId: GOOGLE_PLAY_MONTHLY_PRODUCT_ID,
-          subscriptionExpiryTime: expiryTime,
-          subscriptionPlatform: "android",
-          activePurchaseTokens: admin.FieldValue.arrayUnion(
-            purchaseToken,
-          ),
-          googlePlayPrimaryPurchaseToken: purchaseToken,
-          lastSubscriptionSource: source,
-          lastSubscriptionCheckedAt: now,
-          updatedAt: now,
+      const legacyUpdate = {
+        subscriptionStatus: "active",
+        subscriptionProductId: GOOGLE_PLAY_MONTHLY_PRODUCT_ID,
+        subscriptionExpiryTime: expiryTime,
+        subscriptionPlatform: "android",
+        activePurchaseTokens: admin.FieldValue.arrayUnion(purchaseToken),
+        googlePlayPrimaryPurchaseToken: purchaseToken,
+        lastSubscriptionSource: source,
+        lastSubscriptionCheckedAt: now,
+        updatedAt: now,
+        googlePlaySubscriptionState: subscriptionState,
+      };
+      const storeState = buildAndroidStoreState({
+        status: "active",
+        expiryTime,
+        autoRenewing: inferAndroidAutoRenewing({
+          status: "active",
+          subscriptionState,
+        }),
+        primaryPurchaseToken: purchaseToken,
+        subscriptionState,
+        source: source || "google_play_purchase",
+        updatedAt: now,
+      });
+      await commitUserSubscriptionDualWrite({
+        db: admin.getDb(),
+        admin,
+        uid,
+        source: "google_verify",
+        platform: "android",
+        storeState,
+        legacyUpdate,
+        log: console,
+        meta: {
+          purchaseToken,
         },
-        { merge: true },
-      );
+      });
       console.info(`${GOOGLE_PLAY_BILLING_TRACE} firestore users update success`, {
         uid,
         productId,
@@ -1807,8 +1869,12 @@ exports.verifyAppStoreSubscriptionPurchase = onCall(
                 appStoreOriginalTransactionId:
                   update.appStoreOriginalTransactionId || null,
               });
-              await admin.getDb().collection("users").doc(uid).set(update, {
-                merge: true,
+              await writeAppStoreVerifyUserUpdate({
+                uid,
+                update,
+                autoRenewing: null,
+                log: logger,
+                traceId,
               });
               finalLog.success("verify.exit", {
                 path: "latest_fallback_active",
@@ -1904,10 +1970,13 @@ exports.verifyAppStoreSubscriptionPurchase = onCall(
           validationCode: validation.code,
         });
 
-        await admin.getDb().collection("users").doc(uid).set(
-          inactiveUpdate,
-          { merge: true }
-        );
+        await writeAppStoreVerifyUserUpdate({
+          uid,
+          update: inactiveUpdate,
+          autoRenewing: false,
+          log: logger,
+          traceId,
+        });
 
         throw new HttpsError(
           "failed-precondition",
@@ -1951,7 +2020,13 @@ exports.verifyAppStoreSubscriptionPurchase = onCall(
         appStoreTransactionId: update.appStoreTransactionId || null,
         appStoreOriginalTransactionId: update.appStoreOriginalTransactionId || null,
       });
-      await admin.getDb().collection("users").doc(uid).set(update, { merge: true });
+      await writeAppStoreVerifyUserUpdate({
+        uid,
+        update,
+        autoRenewing: null,
+        log: logger,
+        traceId,
+      });
       finalLog.success("verify.exit", {
         path: "active_transaction",
         transactionId,
@@ -2118,13 +2193,26 @@ exports.adminUpsertUserSubscription = onCall(async (request) => {
   }
 
   await userRef.set(update, { merge: true });
+  try {
+    await recomputeEntitlementFromStoredStores({
+      db: admin.getDb(),
+      admin,
+      uid,
+      source: "admin_upsert",
+      log: logger,
+    });
+  } catch (recomputeError) {
+    logger.warn("adminUpsertUserSubscription entitlement recompute failed", {
+      uid,
+      message: recomputeError?.message || String(recomputeError),
+    });
+  }
   return { success: true };
 });
 
 /* =========================================================
  * Subscription: App Store Server Notifications V2 (phase 1)
  *  - 自動更新・解約・期限切れ・返金などを受信し Firestore を同期
- *  - verifyAppStoreSubscriptionPurchase は変更しない
  * =======================================================*/
 exports.handleAppStoreServerNotification = onRequest(
   {
