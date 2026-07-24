@@ -49,6 +49,7 @@ const {
   RECIPIENT_SUBSCRIPTION_UNAVAILABLE,
   SENDER_SUBSCRIPTION_UNAVAILABLE,
 } = require("./sendMessageGuardCodes");
+const { describeAccountAccessUsability } = require("./accountAccessUsability");
 const { onMessagePublished } = require("firebase-functions/v2/pubsub");
 
 const { randomUUID } = crypto;
@@ -361,6 +362,9 @@ async function assertPurchasingPlatformAllowed(
 
 function logRecipientSubscriptionGuard({
   recipientUidTail,
+  decisionSource,
+  entitlementUsable,
+  entitlementExpiryIsFuture,
   subscriptionStatus,
   subscriptionPlatform,
   rawExpiryType,
@@ -373,6 +377,7 @@ function logRecipientSubscriptionGuard({
   statusAllowsAccess,
   expiryIsFuture,
   isSubscriptionUsable: subscriptionUsable,
+  denyReason,
   action,
 }) {
   const statusForLog =
@@ -385,18 +390,26 @@ function logRecipientSubscriptionGuard({
       : (subscriptionPlatform || "").trim().toLowerCase();
   logger.info(
     `[RecipientSubscriptionGuard] recipientUidTail=${recipientUidTail} ` +
+      `decisionSource=${decisionSource} entitlementUsable=${entitlementUsable ?? "null"} ` +
+      `entitlementExpiryIsFuture=${entitlementExpiryIsFuture} ` +
       `subscriptionStatus=${statusForLog} recipientPlatform=${platformForLog} ` +
       `rawExpiryType=${rawExpiryType} rawExpiryPreview=${rawExpiryPreview} parsePath=${parsePath} ` +
       `parsedExpiryISO=${parsedExpiryISO} nowISO=${nowISO} deltaMs=${deltaMs} ` +
       `statusAllowsAccess=${statusAllowsAccess} expiryIsFuture=${expiryIsFuture} ` +
-      `subscriptionUsable=${subscriptionUsable} action=${action}`,
+      `subscriptionUsable=${subscriptionUsable} denyReason=${denyReason ?? "none"} action=${action}`,
   );
 }
 
 function logSenderSubscriptionGuard({
   senderUidTail,
+  decisionSource,
+  entitlementUsable,
+  entitlementExpiryIsFuture,
   subscriptionStatus,
-  expiryMillis,
+  legacyStatusAllowsAccess,
+  legacyExpiryIsFuture,
+  subscriptionUsable,
+  denyReason,
   action,
   code,
 }) {
@@ -406,8 +419,11 @@ function logSenderSubscriptionGuard({
       : (subscriptionStatus || "").trim().toLowerCase();
   logger.info(
     `[SenderSubscriptionGuard] senderUidTail=${senderUidTail} ` +
-      `subscriptionStatus=${statusForLog} expiryMillis=${expiryMillis} ` +
-      `action=${action} code=${code}`,
+      `decisionSource=${decisionSource} entitlementUsable=${entitlementUsable ?? "null"} ` +
+      `entitlementExpiryIsFuture=${entitlementExpiryIsFuture} ` +
+      `subscriptionStatus=${statusForLog} legacyStatusAllowsAccess=${legacyStatusAllowsAccess} ` +
+      `legacyExpiryIsFuture=${legacyExpiryIsFuture} subscriptionUsable=${subscriptionUsable} ` +
+      `denyReason=${denyReason ?? "none"} action=${action} code=${code}`,
   );
 }
 
@@ -1164,11 +1180,9 @@ exports.sendMessageWithLimit = onCall(async (request) => {
   const rawExpiry = recipientData.subscriptionExpiryTime;
   const { expiry, parsePath } = parseSubscriptionExpiryTimeWithMeta(rawExpiry);
   const now = new Date();
-  const usability = describeSubscriptionUsability(
-    subscriptionStatus,
-    expiry,
-    now,
-  );
+  const usability = describeAccountAccessUsability(recipientData, now, {
+    parseExpiryWithMeta: parseSubscriptionExpiryTimeWithMeta,
+  });
   const parsedExpiryISO =
     expiry instanceof Date && !Number.isNaN(expiry.getTime())
       ? expiry.toISOString()
@@ -1180,6 +1194,9 @@ exports.sendMessageWithLimit = onCall(async (request) => {
       : "null";
   const guardLogBase = {
     recipientUidTail: uidTailForLog(recipientId),
+    decisionSource: usability.decisionSource,
+    entitlementUsable: usability.entitlementUsable,
+    entitlementExpiryIsFuture: usability.entitlementExpiryIsFuture,
     subscriptionStatus,
     subscriptionPlatform,
     rawExpiryType: rawExpiryTypeForLog(rawExpiry),
@@ -1189,9 +1206,10 @@ exports.sendMessageWithLimit = onCall(async (request) => {
     parsedExpiryISO,
     nowISO,
     deltaMs,
-    statusAllowsAccess: usability.statusAllowsAccess,
-    expiryIsFuture: usability.expiryIsFuture,
+    statusAllowsAccess: usability.legacyStatusAllowsAccess,
+    expiryIsFuture: usability.legacyExpiryIsFuture,
     isSubscriptionUsable: usability.subscriptionUsable,
+    denyReason: usability.denyReason,
   };
 
   if (usability.subscriptionUsable) {
@@ -1225,23 +1243,20 @@ exports.sendMessageWithLimit = onCall(async (request) => {
       if (userDoc.exists) {
         const senderData = userDoc.data() || {};
         const senderSubscriptionStatus = senderData.subscriptionStatus;
-        const senderRawExpiry = senderData.subscriptionExpiryTime;
-        const { expiry: senderExpiry } =
-          parseSubscriptionExpiryTimeWithMeta(senderRawExpiry);
-        const senderUsability = describeSubscriptionUsability(
-          senderSubscriptionStatus,
-          senderExpiry,
-        );
+        const senderUsability = describeAccountAccessUsability(senderData, new Date(), {
+          parseExpiryWithMeta: parseSubscriptionExpiryTimeWithMeta,
+        });
         if (!senderUsability.subscriptionUsable) {
-          const senderExpiryMillis =
-            senderExpiry instanceof Date &&
-            !Number.isNaN(senderExpiry.getTime())
-              ? senderExpiry.getTime()
-              : "null";
           logSenderSubscriptionGuard({
             senderUidTail: uidTailForLog(senderId),
+            decisionSource: senderUsability.decisionSource,
+            entitlementUsable: senderUsability.entitlementUsable,
+            entitlementExpiryIsFuture: senderUsability.entitlementExpiryIsFuture,
             subscriptionStatus: senderSubscriptionStatus,
-            expiryMillis: senderExpiryMillis,
+            legacyStatusAllowsAccess: senderUsability.legacyStatusAllowsAccess,
+            legacyExpiryIsFuture: senderUsability.legacyExpiryIsFuture,
+            subscriptionUsable: senderUsability.subscriptionUsable,
+            denyReason: senderUsability.denyReason,
             action: "blockSend",
             code: SENDER_SUBSCRIPTION_UNAVAILABLE,
           });
