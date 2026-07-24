@@ -1,5 +1,9 @@
 "use strict";
 
+function normalizeSubscriptionPlatform(value) {
+  return (value || "").trim().toLowerCase();
+}
+
 function parseOptionalBool(value) {
   if (value === null || value === undefined) {
     return null;
@@ -169,8 +173,141 @@ function describeAccountAccessUsability(userData, now = new Date(), options = {}
   };
 }
 
+function isActiveSubscriptionOnOtherPlatform({
+  subscriptionStatus,
+  subscriptionExpiryTime,
+  subscriptionPlatform,
+  expectedPlatform,
+  now = new Date(),
+}) {
+  const legacyUsability = describeLegacySubscriptionUsability(
+    subscriptionStatus,
+    subscriptionExpiryTime,
+    now
+  );
+  if (!legacyUsability.subscriptionUsable) {
+    return false;
+  }
+  const normalizedPlatform = normalizeSubscriptionPlatform(subscriptionPlatform);
+  const normalizedExpected = normalizeSubscriptionPlatform(expectedPlatform);
+  if (!normalizedExpected) {
+    return false;
+  }
+  return normalizedPlatform !== normalizedExpected;
+}
+
+function evaluateCrossPlatformPurchaseGuard({
+  userData,
+  purchasingPlatform,
+  now = new Date(),
+  parseExpiryWithMeta = defaultParseSubscriptionExpiryTimeWithMeta,
+}) {
+  const data = userData || {};
+  const normalizedPurchasing = normalizeSubscriptionPlatform(purchasingPlatform);
+  const entitlementUsable = parseOptionalBool(data.entitlementUsable);
+  const { expiry: entitlementExpiry } = parseExpiryWithMeta(data.entitlementExpiryTime);
+  const source = normalizeSubscriptionPlatform(data.entitlementSource);
+  const entitlementExpiryIsFuture =
+    entitlementExpiry instanceof Date &&
+    !Number.isNaN(entitlementExpiry.getTime()) &&
+    entitlementExpiry.getTime() > now.getTime();
+  const accessUsability = describeAccountAccessUsability(data, now, {
+    parseExpiryWithMeta,
+  });
+  const legacyPlatform = normalizeSubscriptionPlatform(data.subscriptionPlatform);
+
+  const baseResult = {
+    entitlementUsable,
+    entitlementExpiryIsFuture,
+    entitlementSource: source,
+    legacyStatusAllowsAccess: accessUsability.legacyStatusAllowsAccess,
+    legacyExpiryIsFuture: accessUsability.legacyExpiryIsFuture,
+    legacyPlatform,
+    otherPlatformActive: false,
+    denyReason: null,
+  };
+
+  if (entitlementUsable !== null) {
+    if (entitlementUsable !== true) {
+      return {
+        ...baseResult,
+        block: false,
+        reason: "allow_entitlement_false",
+        decisionSource: "entitlement",
+      };
+    }
+    if (entitlementExpiry == null || !entitlementExpiryIsFuture) {
+      return {
+        ...baseResult,
+        reason: "allow_entitlement_expired",
+        decisionSource: "entitlement",
+        block: false,
+      };
+    }
+    if (source === "") {
+      // source unknown → fall through to legacy for conservative check
+    } else if (source === "both") {
+      return {
+        ...baseResult,
+        block: true,
+        reason: "block_entitlement_both",
+        decisionSource: "entitlement",
+        otherPlatformActive: true,
+        denyReason: "block_entitlement_both",
+      };
+    } else if (source === normalizedPurchasing) {
+      return {
+        ...baseResult,
+        block: false,
+        reason: "allow_same_platform",
+        decisionSource: "entitlement",
+      };
+    } else if (source === "ios" || source === "android") {
+      return {
+        ...baseResult,
+        block: true,
+        reason: "block_other_platform_entitlement",
+        decisionSource: "entitlement",
+        otherPlatformActive: true,
+        denyReason: "block_other_platform_entitlement",
+      };
+    }
+  }
+
+  const legacyOther = isActiveSubscriptionOnOtherPlatform({
+    subscriptionStatus: data.subscriptionStatus,
+    subscriptionExpiryTime: accessUsability.legacyExpiry,
+    subscriptionPlatform: data.subscriptionPlatform,
+    expectedPlatform: normalizedPurchasing,
+    now,
+  });
+  if (legacyOther) {
+    return {
+      ...baseResult,
+      block: true,
+      reason: "block_legacy_other_platform",
+      decisionSource: "legacyFallback",
+      otherPlatformActive: true,
+      denyReason: "block_legacy_other_platform",
+    };
+  }
+
+  return {
+    ...baseResult,
+    block: false,
+    reason:
+      entitlementUsable === null
+        ? "allow_legacy_or_missing"
+        : "allow_entitlement_source_unknown",
+    decisionSource: entitlementUsable === null ? "legacyFallback" : "entitlement",
+  };
+}
+
 module.exports = {
   parseOptionalBool,
+  normalizeSubscriptionPlatform,
   describeLegacySubscriptionUsability,
   describeAccountAccessUsability,
+  isActiveSubscriptionOnOtherPlatform,
+  evaluateCrossPlatformPurchaseGuard,
 };

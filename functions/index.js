@@ -49,7 +49,10 @@ const {
   RECIPIENT_SUBSCRIPTION_UNAVAILABLE,
   SENDER_SUBSCRIPTION_UNAVAILABLE,
 } = require("./sendMessageGuardCodes");
-const { describeAccountAccessUsability } = require("./accountAccessUsability");
+const {
+  describeAccountAccessUsability,
+  evaluateCrossPlatformPurchaseGuard,
+} = require("./accountAccessUsability");
 const { onMessagePublished } = require("firebase-functions/v2/pubsub");
 
 const { randomUUID } = crypto;
@@ -283,6 +286,57 @@ function normalizeSubscriptionPlatform(value) {
 
 const SUBSCRIPTION_PLATFORM_MISMATCH_MESSAGE = "SUBSCRIPTION_PLATFORM_MISMATCH";
 
+function logCrossPlatformPurchaseGuardTrace({
+  uidTail,
+  traceId,
+  purchasingPlatform,
+  guard,
+}) {
+  const tracePayload = {
+    step: guard.block ? "platform_mismatch.reject" : "platform_mismatch.allow",
+    billingTraceId: traceId,
+    uidTail,
+    purchasingPlatform,
+    decisionSource: guard.decisionSource,
+    entitlementUsable: guard.entitlementUsable,
+    entitlementExpiryIsFuture: guard.entitlementExpiryIsFuture,
+    entitlementSource: guard.entitlementSource || "(empty)",
+    legacyStatusAllowsAccess: guard.legacyStatusAllowsAccess,
+    legacyExpiryIsFuture: guard.legacyExpiryIsFuture,
+    legacyPlatform: guard.legacyPlatform || "(empty)",
+    otherPlatformActive: guard.otherPlatformActive,
+    denyReason: guard.denyReason || guard.reason || "none",
+    rejectCode: guard.block ? SUBSCRIPTION_PLATFORM_MISMATCH_MESSAGE : null,
+  };
+  if (guard.block) {
+    logger.warn("KAMOME_BILLING_FINAL_TRACE", tracePayload);
+    logger.warn(
+      `[CrossPlatformPurchaseGuard] uidTail=${uidTail} purchasingPlatform=${purchasingPlatform} ` +
+        `decisionSource=${guard.decisionSource} entitlementUsable=${guard.entitlementUsable ?? "null"} ` +
+        `entitlementExpiryIsFuture=${guard.entitlementExpiryIsFuture} ` +
+        `entitlementSource=${guard.entitlementSource || "(empty)"} ` +
+        `legacyStatusAllowsAccess=${guard.legacyStatusAllowsAccess} ` +
+        `legacyExpiryIsFuture=${guard.legacyExpiryIsFuture} ` +
+        `legacyPlatform=${guard.legacyPlatform || "(empty)"} ` +
+        `otherPlatformActive=${guard.otherPlatformActive} denyReason=${guard.denyReason ?? guard.reason} ` +
+        `code=${SUBSCRIPTION_PLATFORM_MISMATCH_MESSAGE}`,
+    );
+    return;
+  }
+  logger.info("KAMOME_BILLING_FINAL_TRACE", tracePayload);
+  logger.info(
+    `[CrossPlatformPurchaseGuard] uidTail=${uidTail} purchasingPlatform=${purchasingPlatform} ` +
+      `decisionSource=${guard.decisionSource} entitlementUsable=${guard.entitlementUsable ?? "null"} ` +
+      `entitlementExpiryIsFuture=${guard.entitlementExpiryIsFuture} ` +
+      `entitlementSource=${guard.entitlementSource || "(empty)"} ` +
+      `legacyStatusAllowsAccess=${guard.legacyStatusAllowsAccess} ` +
+      `legacyExpiryIsFuture=${guard.legacyExpiryIsFuture} ` +
+      `legacyPlatform=${guard.legacyPlatform || "(empty)"} ` +
+      `otherPlatformActive=${guard.otherPlatformActive} denyReason=${guard.denyReason ?? guard.reason} ` +
+      `action=allowPurchase`,
+  );
+}
+
 async function assertPurchasingPlatformAllowed(
   uid,
   purchasingPlatform,
@@ -293,71 +347,39 @@ async function assertPurchasingPlatformAllowed(
     throw new HttpsError("internal", "Invalid purchasing platform.");
   }
 
+  const uidTail = uidTailForLog(uid);
   const userSnap = await admin.getDb().collection("users").doc(uid).get();
   if (!userSnap.exists) {
     logger.info("KAMOME_BILLING_FINAL_TRACE", {
       step: "platform_mismatch.allow_no_user_doc",
       billingTraceId: traceId,
-      uid,
+      uidTail,
       purchasingPlatform: normalizedPurchasing,
     });
     return;
   }
 
   const userData = userSnap.data() || {};
-  const existingPlatform = normalizeSubscriptionPlatform(userData.subscriptionPlatform);
-  const { expiry } = parseSubscriptionExpiryTimeWithMeta(
-    userData.subscriptionExpiryTime
-  );
-  const usability = describeSubscriptionUsability(
-    userData.subscriptionStatus,
-    expiry
-  );
+  const guard = evaluateCrossPlatformPurchaseGuard({
+    userData,
+    purchasingPlatform: normalizedPurchasing,
+    now: new Date(),
+    parseExpiryWithMeta: parseSubscriptionExpiryTimeWithMeta,
+  });
 
-  if (!usability.subscriptionUsable) {
-    logger.info("KAMOME_BILLING_FINAL_TRACE", {
-      step: "platform_mismatch.allow_inactive_subscription",
-      billingTraceId: traceId,
-      uid,
-      purchasingPlatform: normalizedPurchasing,
-      existingPlatform: existingPlatform || null,
-      subscriptionStatus: userData.subscriptionStatus || null,
-      subscriptionUsable: false,
-    });
-    return;
-  }
+  logCrossPlatformPurchaseGuardTrace({
+    uidTail,
+    traceId,
+    purchasingPlatform: normalizedPurchasing,
+    guard,
+  });
 
-  if (existingPlatform && existingPlatform !== normalizedPurchasing) {
-    logger.warn("KAMOME_BILLING_FINAL_TRACE", {
-      step: "platform_mismatch.reject",
-      billingTraceId: traceId,
-      uid,
-      existingPlatform,
-      purchasingPlatform: normalizedPurchasing,
-      subscriptionStatus: userData.subscriptionStatus,
-      rejectCode: SUBSCRIPTION_PLATFORM_MISMATCH_MESSAGE,
-    });
-    logger.warn("Subscription purchase blocked due to platform mismatch.", {
-      uid,
-      existingPlatform,
-      purchasingPlatform: normalizedPurchasing,
-      subscriptionStatus: userData.subscriptionStatus,
-      code: SUBSCRIPTION_PLATFORM_MISMATCH_MESSAGE,
-    });
+  if (guard.block) {
     throw new HttpsError(
       "failed-precondition",
       SUBSCRIPTION_PLATFORM_MISMATCH_MESSAGE
     );
   }
-
-  logger.info("KAMOME_BILLING_FINAL_TRACE", {
-    step: "platform_mismatch.allow",
-    billingTraceId: traceId,
-    uid,
-    existingPlatform: existingPlatform || null,
-    purchasingPlatform: normalizedPurchasing,
-    subscriptionUsable: true,
-  });
 }
 
 function logRecipientSubscriptionGuard({
