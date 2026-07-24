@@ -27,8 +27,8 @@ function summarizeTransactionInfo(transactionInfo) {
     return null;
   }
   return {
-    transactionId: transactionInfo.transactionId || null,
-    originalTransactionId: transactionInfo.originalTransactionId || null,
+    transactionIdSuffix: tokenSuffix(transactionInfo.transactionId),
+    originalTransactionIdSuffix: tokenSuffix(transactionInfo.originalTransactionId),
     webOrderLineItemId: transactionInfo.webOrderLineItemId || null,
     productId: transactionInfo.productId || null,
     expiresDate: transactionInfo.expiresDate || null,
@@ -52,7 +52,7 @@ function createBillingFinalLogger(baseLogger, { traceId, uid, functionName }) {
     baseLogger[level]("KAMOME_BILLING_FINAL_TRACE", {
       step,
       billingTraceId: traceId || null,
-      uid: uid || null,
+      uidSuffix: tokenSuffix(uid),
       functionName: functionName || null,
       timestamp: new Date().toISOString(),
       elapsedMs: Date.now() - startedAt,

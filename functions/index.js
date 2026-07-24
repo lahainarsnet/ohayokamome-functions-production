@@ -151,7 +151,7 @@ async function fetchLatestFcmTokenForRecipient(recipientId, fallbackToken = "") 
     return latestToken || fallbackToken;
   } catch (e) {
     logger.warn("Failed to fetch recipient FCM token; falling back to embedded token.", {
-      recipientId,
+      recipientIdSuffix: uidTailForLog(recipientId),
       e,
     });
     return fallbackToken;
@@ -883,7 +883,9 @@ exports.postSendIncrementUsage = onCall(async (request) => {
         }
       } else {
         // users/{uid} が未作成でも処理継続（このタイミングで作る）
-        logger.info("User doc did not exist. Creating a new one.", { uid });
+        logger.info("User doc did not exist. Creating a new one.", {
+          uidSuffix: uidTailForLog(uid),
+        });
       }
 
       const newCount = dailyCount + 1;
@@ -902,7 +904,10 @@ exports.postSendIncrementUsage = onCall(async (request) => {
       return { newCount, exceeded, limit: LIMIT, dateKey: todayKey };
     });
 
-    logger.info("postSendIncrementUsage result", { uid, ...result });
+    logger.info("postSendIncrementUsage result", {
+      uidSuffix: uidTailForLog(uid),
+      ...result,
+    });
     return {
       success: true,
       count: result.newCount,
@@ -911,7 +916,10 @@ exports.postSendIncrementUsage = onCall(async (request) => {
       dateKey: result.dateKey,
     };
   } catch (error) {
-    logger.error("postSendIncrementUsage failed:", { uid, error });
+    logger.error("postSendIncrementUsage failed:", {
+      uidSuffix: uidTailForLog(uid),
+      error,
+    });
     throw new HttpsError("internal", "Failed to increment usage.");
   }
 });
@@ -944,15 +952,25 @@ exports.sendPushNotification = onDocumentCreated(
         const latestToken = recipientDoc.get("fcmToken") || "";
         if (latestToken) {
           toToken = latestToken;
-          logger.info("Using latest FCM token from Firestore.", { recipientId });
+          logger.info("Using latest FCM token from Firestore.", {
+            recipientIdSuffix: uidTailForLog(recipientId),
+          });
         } else {
-          logger.warn("Recipient fcmToken is empty in Firestore; falling back to embedded token.", { recipientId });
+          logger.warn("Recipient fcmToken is empty in Firestore; falling back to embedded token.", {
+            recipientIdSuffix: uidTailForLog(recipientId),
+          });
         }
       } catch (e) {
-        logger.warn("Failed to fetch recipient FCM token; falling back to embedded token.", { recipientId, e });
+        logger.warn("Failed to fetch recipient FCM token; falling back to embedded token.", {
+          recipientIdSuffix: uidTailForLog(recipientId),
+          e,
+        });
       }
     } else {
-      logger.warn("Could not determine recipientId from chatId.", { chatId, senderId });
+      logger.warn("Could not determine recipientId from chatId.", {
+        chatId,
+        senderIdSuffix: uidTailForLog(senderId),
+      });
     }
 
     if (!toToken || typeof toToken !== "string") {
@@ -966,7 +984,7 @@ exports.sendPushNotification = onDocumentCreated(
         unreadTotal = await countUnreadMessagesForRecipient(recipientId);
       } catch (e) {
         logger.warn("[KAMOME_BADGE_V3] Failed to calculate unread total; using fallback.", {
-          recipientId,
+          recipientIdSuffix: uidTailForLog(recipientId),
           chatId,
           messageId,
           unreadTotal,
@@ -1035,7 +1053,7 @@ exports.sendPushNotification = onDocumentCreated(
     };
 
     logger.info("[KAMOME_BADGE_V3] Badge payload prepared.", {
-      recipientId,
+      recipientIdSuffix: uidTailForLog(recipientId),
       unreadTotal,
       iosBadge: msg.apns.payload.aps.badge,
       androidNotificationTag: msg.android.notification.tag,
@@ -1058,7 +1076,7 @@ exports.sendPushNotification = onDocumentCreated(
     try {
       const response = await admin.getMessagingClient().send(msg);
       logger.info("[KAMOME_BADGE_V3] Notification send success.", {
-        recipientId,
+        recipientIdSuffix: uidTailForLog(recipientId),
         unreadTotal,
         iosBadge: msg.apns.payload.aps.badge,
         androidNotificationTag: msg.android.notification.tag,
@@ -1071,7 +1089,7 @@ exports.sendPushNotification = onDocumentCreated(
       return { success: true };
     } catch (error) {
       logger.error("[KAMOME_BADGE_V3] Notification send failed.", {
-        recipientId,
+        recipientIdSuffix: uidTailForLog(recipientId),
         unreadTotal,
         iosBadge: msg.apns.payload.aps.badge,
         androidNotificationTag: msg.android.notification.tag,
@@ -1394,10 +1412,13 @@ exports.recordTosConsent = onCall(async (request) => {
 
   try {
     await admin.getDb().collection("tos_consents").add(consentData);
-    logger.info(`Recorded ToS consent for user ${uid}`);
+    logger.info("Recorded ToS consent.", { uidSuffix: uidTailForLog(uid) });
     return { success: true };
   } catch (error) {
-    logger.error(`Failed to write ToS consent for user ${uid}`, error);
+    logger.error("Failed to write ToS consent.", {
+      uidSuffix: uidTailForLog(uid),
+      error,
+    });
     throw new HttpsError("internal", "Failed to save consent record.");
   }
 });
@@ -1439,10 +1460,16 @@ exports.upsertUserEmailAndAccount = onCall(async (request) => {
 
     await userRef.set(update, { merge: true });
 
-    logger.info("upsertUserEmailAndAccount succeeded.", { uid, accountId: accountIdToUse });
+    logger.info("upsertUserEmailAndAccount succeeded.", {
+      uidSuffix: uidTailForLog(uid),
+      accountIdSuffix: billingTokenSuffix(accountIdToUse),
+    });
     return { success: true, accountId: accountIdToUse };
   } catch (error) {
-    logger.error("upsertUserEmailAndAccount failed.", { uid, error });
+    logger.error("upsertUserEmailAndAccount failed.", {
+      uidSuffix: uidTailForLog(uid),
+      error,
+    });
     throw new HttpsError("internal", "Failed to upsert user email/accountId.");
   }
 });
@@ -1461,7 +1488,7 @@ exports.getUserInfoByAccountId = onCall(async (request) => {
         callerUid = decoded.uid || null;
         logger.warn(
           "getUserInfoByAccountId: request.auth missing; verified fallback idToken.",
-          { uid: callerUid }
+          { uidSuffix: uidTailForLog(callerUid || "") }
         );
       } catch (error) {
         logger.warn("getUserInfoByAccountId: fallback idToken verification failed.", { error });
@@ -1491,23 +1518,25 @@ exports.getUserInfoByAccountId = onCall(async (request) => {
       .get();
 
     if (querySnapshot.empty) {
-      logger.warn("User not found for accountId:", { accountId });
-      return { uid: null, fcmToken: null };
+      logger.warn("User not found for accountId:", {
+        accountIdSuffix: billingTokenSuffix(accountId),
+      });
+      return { uid: null };
     }
 
     const userDoc = querySnapshot.docs[0];
     const uid = userDoc.id;
 
-    const tokens = Array.isArray(userDoc.get("fcmTokens")) ? userDoc.get("fcmTokens") : [];
-    let fcmToken = tokens.length > 0 ? tokens[0] : null;
-    if (!fcmToken) {
-      fcmToken = userDoc.get("fcmToken") || null;
-    }
-
-    logger.info("Successfully retrieved user info for accountId:", { accountId, uid });
-    return { uid: uid, fcmToken: fcmToken };
+    logger.info("Successfully retrieved user info for accountId:", {
+      accountIdSuffix: billingTokenSuffix(accountId),
+      uidSuffix: uidTailForLog(uid),
+    });
+    return { uid: uid };
   } catch (error) {
-    logger.error("Error retrieving user info by accountId:", { accountId, error });
+    logger.error("Error retrieving user info by accountId:", {
+      accountIdSuffix: billingTokenSuffix(accountId),
+      error,
+    });
     throw new HttpsError("internal", "Failed to retrieve user information.");
   }
 });
@@ -1520,9 +1549,10 @@ exports.verifyGooglePlaySubscriptionPurchase = onCall(
   { region: "us-central1" },
   async (request) => {
     const uid = request.auth && request.auth.uid;
+    const logUidSuffix = uidTailForLog(uid || "");
     console.info(`${GOOGLE_PLAY_BILLING_TRACE} function called`, {
       hasAuth: Boolean(request.auth),
-      uid: uid || null,
+      uidSuffix: logUidSuffix,
     });
     if (!uid) {
       console.warn(`${GOOGLE_PLAY_BILLING_TRACE} function unauthenticated`, {
@@ -1539,7 +1569,7 @@ exports.verifyGooglePlaySubscriptionPurchase = onCall(
     const packageName = String(data.packageName || GOOGLE_PLAY_PACKAGE_NAME).trim();
     const source = String(data.source || "google_play_purchase").trim();
     console.info(`${GOOGLE_PLAY_BILLING_TRACE} function payload`, {
-      uid,
+      uidSuffix: logUidSuffix,
       productId,
       packageName,
       source,
@@ -1549,7 +1579,7 @@ exports.verifyGooglePlaySubscriptionPurchase = onCall(
 
     if (packageName !== GOOGLE_PLAY_PACKAGE_NAME) {
       console.warn(`${GOOGLE_PLAY_BILLING_TRACE} function invalid packageName`, {
-        uid,
+        uidSuffix: logUidSuffix,
         packageName,
         expectedPackageName: GOOGLE_PLAY_PACKAGE_NAME,
       });
@@ -1557,7 +1587,7 @@ exports.verifyGooglePlaySubscriptionPurchase = onCall(
     }
     if (productId !== GOOGLE_PLAY_MONTHLY_PRODUCT_ID) {
       console.warn(`${GOOGLE_PLAY_BILLING_TRACE} function invalid productId`, {
-        uid,
+        uidSuffix: logUidSuffix,
         productId,
         expectedProductId: GOOGLE_PLAY_MONTHLY_PRODUCT_ID,
       });
@@ -1565,7 +1595,7 @@ exports.verifyGooglePlaySubscriptionPurchase = onCall(
     }
     if (!purchaseToken) {
       console.warn(`${GOOGLE_PLAY_BILLING_TRACE} function missing purchaseToken`, {
-        uid,
+        uidSuffix: logUidSuffix,
         productId,
         packageName,
       });
@@ -1573,7 +1603,7 @@ exports.verifyGooglePlaySubscriptionPurchase = onCall(
     }
 
     console.info(`${GOOGLE_PLAY_BILLING_TRACE} google play api auth start`, {
-      uid,
+      uidSuffix: logUidSuffix,
       productId,
       packageName,
       tokenSuffix: tokenSuffix(purchaseToken),
@@ -1589,7 +1619,7 @@ exports.verifyGooglePlaySubscriptionPurchase = onCall(
     let subscription;
     try {
       console.info(`${GOOGLE_PLAY_BILLING_TRACE} google play api call start`, {
-        uid,
+        uidSuffix: logUidSuffix,
         productId,
         packageName,
         tokenSuffix: tokenSuffix(purchaseToken),
@@ -1600,7 +1630,7 @@ exports.verifyGooglePlaySubscriptionPurchase = onCall(
       });
       subscription = response.data;
       console.info(`${GOOGLE_PLAY_BILLING_TRACE} google play api call success`, {
-        uid,
+        uidSuffix: logUidSuffix,
         productId,
         packageName,
         tokenSuffix: tokenSuffix(purchaseToken),
@@ -1608,7 +1638,7 @@ exports.verifyGooglePlaySubscriptionPurchase = onCall(
       });
     } catch (error) {
       console.error(`${GOOGLE_PLAY_BILLING_TRACE} google play api call failed`, {
-        uid,
+        uidSuffix: logUidSuffix,
         productId,
         packageName,
         tokenSuffix: tokenSuffix(purchaseToken),
@@ -1631,7 +1661,7 @@ exports.verifyGooglePlaySubscriptionPurchase = onCall(
       GOOGLE_PLAY_ACTIVE_STATES.has(subscriptionState) &&
       matchedLineItem !== undefined;
     console.info(`${GOOGLE_PLAY_BILLING_TRACE} google play verification result`, {
-      uid,
+      uidSuffix: logUidSuffix,
       productId,
       packageName,
       tokenSuffix: tokenSuffix(purchaseToken),
@@ -1670,7 +1700,7 @@ exports.verifyGooglePlaySubscriptionPurchase = onCall(
       });
 
       console.info(`${GOOGLE_PLAY_BILLING_TRACE} firestore users update start`, {
-        uid,
+        uidSuffix: logUidSuffix,
         productId,
         packageName,
         tokenSuffix: tokenSuffix(purchaseToken),
@@ -1714,7 +1744,7 @@ exports.verifyGooglePlaySubscriptionPurchase = onCall(
         },
       });
       console.info(`${GOOGLE_PLAY_BILLING_TRACE} firestore users update success`, {
-        uid,
+        uidSuffix: logUidSuffix,
         productId,
         packageName,
         tokenSuffix: tokenSuffix(purchaseToken),
@@ -1724,7 +1754,7 @@ exports.verifyGooglePlaySubscriptionPurchase = onCall(
         throw error;
       }
       console.error(`${GOOGLE_PLAY_BILLING_TRACE} firestore users update failed`, {
-        uid,
+        uidSuffix: logUidSuffix,
         productId,
         packageName,
         tokenSuffix: tokenSuffix(purchaseToken),
@@ -1737,7 +1767,7 @@ exports.verifyGooglePlaySubscriptionPurchase = onCall(
     }
 
     console.info(`${GOOGLE_PLAY_BILLING_TRACE} function success`, {
-      uid,
+      uidSuffix: logUidSuffix,
       productId,
       packageName,
       tokenSuffix: tokenSuffix(purchaseToken),
@@ -1772,6 +1802,7 @@ exports.verifyAppStoreSubscriptionPurchase = onCall(
     }
 
     const uid = request.auth.uid;
+    const logUidSuffix = uidTailForLog(uid);
     const data = request.data || {};
     const traceId = extractBillingTraceId(data);
     const finalLog = createBillingFinalLogger(logger, {
@@ -1792,8 +1823,8 @@ exports.verifyAppStoreSubscriptionPurchase = onCall(
       hasServerVerificationData: serverVerificationData.length > 0,
       serverVerificationDataLength: serverVerificationData.length,
       serverVerificationDataSuffix: billingTokenSuffix(serverVerificationData),
-      dataTransactionId: data.transactionId || null,
-      extractedTransactionId: transactionId || null,
+      dataTransactionIdSuffix: billingTokenSuffix(data.transactionId),
+      extractedTransactionIdSuffix: billingTokenSuffix(transactionId),
       environmentHint: environmentHint || null,
     });
 
@@ -1804,7 +1835,7 @@ exports.verifyAppStoreSubscriptionPurchase = onCall(
         hasServerVerificationData: serverVerificationData.length > 0,
       });
       logger.warn("verifyAppStoreSubscriptionPurchase: missing transaction id.", {
-        uid,
+        uidSuffix: logUidSuffix,
         billingTraceId: traceId,
         hasServerVerificationData: serverVerificationData.length > 0,
       });
@@ -1816,7 +1847,7 @@ exports.verifyAppStoreSubscriptionPurchase = onCall(
 
     try {
       finalLog.info("verify.apple_api.start", {
-        lookupTransactionId: transactionId,
+        lookupTransactionIdSuffix: billingTokenSuffix(transactionId),
         environmentHint: environmentHint || null,
       });
       const result = await fetchAppStoreTransactionInfo(
@@ -1831,30 +1862,31 @@ exports.verifyAppStoreSubscriptionPurchase = onCall(
 
       if (!validation.active) {
         finalLog.warn("verify.inactive_transaction", {
-          transactionId,
+          transactionIdSuffix: billingTokenSuffix(transactionId),
           environment: result.environment,
           validationCode: validation.code,
           transactionInfo: summarizeTransactionInfo(result.transactionInfo),
         });
         logger.warn("verifyAppStoreSubscriptionPurchase: inactive transaction.", {
-          uid,
+          uidSuffix: logUidSuffix,
           billingTraceId: traceId,
-          transactionId,
+          transactionIdSuffix: billingTokenSuffix(transactionId),
           environment: result.environment,
           code: validation.code,
           productId: result.transactionInfo?.productId || null,
           bundleId: result.transactionInfo?.bundleId || null,
           expiresDate: result.transactionInfo?.expiresDate || null,
           revocationDate: result.transactionInfo?.revocationDate || null,
-          originalTransactionId:
-            result.transactionInfo?.originalTransactionId || null,
+          originalTransactionIdSuffix: billingTokenSuffix(
+            result.transactionInfo?.originalTransactionId
+          ),
         });
 
         if (validation.code === "SUBSCRIPTION_EXPIRED") {
           const lookupTransactionId =
             result.transactionInfo?.originalTransactionId || transactionId;
           finalLog.info("verify.latest_fallback.start", {
-            lookupTransactionId,
+            lookupTransactionIdSuffix: billingTokenSuffix(lookupTransactionId),
             reason: validation.code,
           });
           try {
@@ -1863,16 +1895,21 @@ exports.verifyAppStoreSubscriptionPurchase = onCall(
               environmentHint: environmentHint || result.environment,
             });
             finalLog.info("verify.latest_fallback.result", {
-              lookupTransactionId,
+              lookupTransactionIdSuffix: billingTokenSuffix(lookupTransactionId),
               latestStatus: latest?.derived?.status || null,
-              latestTransactionId: latest?.derived?.latestTransactionId || null,
-              latestOriginalTransactionId:
-                latest?.derived?.originalTransactionId || null,
+              latestTransactionIdSuffix: billingTokenSuffix(
+                latest?.derived?.latestTransactionId
+              ),
+              latestOriginalTransactionIdSuffix: billingTokenSuffix(
+                latest?.derived?.originalTransactionId
+              ),
               latestExpiresDate: latest?.derived?.expiresDate || null,
               latestValidationCode: latest?.derived?.validationCode || null,
               latestCandidateCount: latest?.meta?.latestCandidateCount ?? 0,
               activeCandidateCount: latest?.meta?.activeCandidateCount ?? 0,
-              adoptedTransactionId: latest?.meta?.adoptedTransactionId || null,
+              adoptedTransactionIdSuffix: billingTokenSuffix(
+                latest?.meta?.adoptedTransactionId
+              ),
               latestTransactionInfo: summarizeTransactionInfo(
                 latest?.transactionInfo
               ),
@@ -1902,9 +1939,12 @@ exports.verifyAppStoreSubscriptionPurchase = onCall(
               finalLog.info("verify.users_update.start", {
                 updateKeys: Object.keys(update).sort(),
                 subscriptionStatus: update.subscriptionStatus || null,
-                appStoreTransactionId: update.appStoreTransactionId || null,
-                appStoreOriginalTransactionId:
-                  update.appStoreOriginalTransactionId || null,
+                appStoreTransactionIdSuffix: billingTokenSuffix(
+                  update.appStoreTransactionId
+                ),
+                appStoreOriginalTransactionIdSuffix: billingTokenSuffix(
+                  update.appStoreOriginalTransactionId
+                ),
               });
               await writeAppStoreVerifyUserUpdate({
                 uid,
@@ -1915,20 +1955,26 @@ exports.verifyAppStoreSubscriptionPurchase = onCall(
               });
               finalLog.success("verify.exit", {
                 path: "latest_fallback_active",
-                transactionId,
-                lookupTransactionId,
-                latestTransactionId: update.appStoreTransactionId,
-                originalTransactionId: update.appStoreOriginalTransactionId,
+                transactionIdSuffix: billingTokenSuffix(transactionId),
+                lookupTransactionIdSuffix: billingTokenSuffix(lookupTransactionId),
+                latestTransactionIdSuffix: billingTokenSuffix(
+                  update.appStoreTransactionId
+                ),
+                originalTransactionIdSuffix: billingTokenSuffix(
+                  update.appStoreOriginalTransactionId
+                ),
                 environment: update.appStoreEnvironment,
                 expiresDate: latest.derived.expiresDate,
               });
               logger.info(
                 "verifyAppStoreSubscriptionPurchase succeeded via latest subscription status.",
                 {
-                  uid,
-                  transactionId,
-                  lookupTransactionId,
-                  latestTransactionId: update.appStoreTransactionId,
+                  uidSuffix: logUidSuffix,
+                  transactionIdSuffix: billingTokenSuffix(transactionId),
+                  lookupTransactionIdSuffix: billingTokenSuffix(lookupTransactionId),
+                  latestTransactionIdSuffix: billingTokenSuffix(
+                    update.appStoreTransactionId
+                  ),
                   environment: update.appStoreEnvironment,
                   expiresDate: latest.derived.expiresDate,
                 }
@@ -1946,23 +1992,26 @@ exports.verifyAppStoreSubscriptionPurchase = onCall(
               result.transactionInfo?.expiresDate ||
               null;
             finalLog.reject("verify.latest_fallback.no_active_entitlement", {
-              transactionId,
-              originalTransactionId:
-                result.transactionInfo?.originalTransactionId || lookupTransactionId,
+              transactionIdSuffix: billingTokenSuffix(transactionId),
+              originalTransactionIdSuffix: billingTokenSuffix(
+                result.transactionInfo?.originalTransactionId || lookupTransactionId
+              ),
               expiresDate: fallbackExpiresDate,
               latestCandidateCount: latest?.meta?.latestCandidateCount ?? 0,
               activeCandidateCount: latest?.meta?.activeCandidateCount ?? 0,
-              adoptedTransactionId: latest?.meta?.adoptedTransactionId || null,
+              adoptedTransactionIdSuffix: billingTokenSuffix(
+                latest?.meta?.adoptedTransactionId
+              ),
               rejectCode: "NO_ACTIVE_ENTITLEMENT",
               billingTraceId: traceId || null,
             });
             logger.warn(
               "verifyAppStoreSubscriptionPurchase: no active entitlement in latest subscription status.",
               {
-                uid,
+                uidSuffix: logUidSuffix,
                 billingTraceId: traceId,
-                transactionId,
-                lookupTransactionId,
+                transactionIdSuffix: billingTokenSuffix(transactionId),
+                lookupTransactionIdSuffix: billingTokenSuffix(lookupTransactionId),
                 latestCandidateCount: latest?.meta?.latestCandidateCount ?? 0,
                 activeCandidateCount: latest?.meta?.activeCandidateCount ?? 0,
                 expiresDate: fallbackExpiresDate,
@@ -1990,9 +2039,9 @@ exports.verifyAppStoreSubscriptionPurchase = onCall(
             logger.warn(
               "verifyAppStoreSubscriptionPurchase: latest subscription fallback failed.",
               {
-                uid,
-                transactionId,
-                lookupTransactionId,
+                uidSuffix: logUidSuffix,
+                transactionIdSuffix: billingTokenSuffix(transactionId),
+                lookupTransactionIdSuffix: billingTokenSuffix(lookupTransactionId),
                 message: fallbackError?.message || null,
               }
             );
@@ -2054,8 +2103,10 @@ exports.verifyAppStoreSubscriptionPurchase = onCall(
       finalLog.info("verify.users_update.start", {
         updateKeys: Object.keys(update).sort(),
         subscriptionStatus: update.subscriptionStatus || null,
-        appStoreTransactionId: update.appStoreTransactionId || null,
-        appStoreOriginalTransactionId: update.appStoreOriginalTransactionId || null,
+        appStoreTransactionIdSuffix: billingTokenSuffix(update.appStoreTransactionId),
+        appStoreOriginalTransactionIdSuffix: billingTokenSuffix(
+          update.appStoreOriginalTransactionId
+        ),
       });
       await writeAppStoreVerifyUserUpdate({
         uid,
@@ -2066,17 +2117,21 @@ exports.verifyAppStoreSubscriptionPurchase = onCall(
       });
       finalLog.success("verify.exit", {
         path: "active_transaction",
-        transactionId,
-        originalTransactionId: update.appStoreOriginalTransactionId,
+        transactionIdSuffix: billingTokenSuffix(transactionId),
+        originalTransactionIdSuffix: billingTokenSuffix(
+          update.appStoreOriginalTransactionId
+        ),
         environment: update.appStoreEnvironment,
         expiresDate: validation.expiresDate,
       });
 
       logger.info("verifyAppStoreSubscriptionPurchase succeeded.", {
-        uid,
+        uidSuffix: logUidSuffix,
         billingTraceId: traceId,
-        transactionId,
-        originalTransactionId: update.appStoreOriginalTransactionId,
+        transactionIdSuffix: billingTokenSuffix(transactionId),
+        originalTransactionIdSuffix: billingTokenSuffix(
+          update.appStoreOriginalTransactionId
+        ),
         environment: update.appStoreEnvironment,
         expiresDate: validation.expiresDate,
       });
@@ -2092,21 +2147,21 @@ exports.verifyAppStoreSubscriptionPurchase = onCall(
       if (error instanceof HttpsError) {
         finalLog.reject("verify.exit", {
           ...summarizeHttpsError(error),
-          transactionId,
+          transactionIdSuffix: billingTokenSuffix(transactionId),
         });
         throw error;
       }
 
       finalLog.error("verify.unexpected_error", {
-        transactionId,
+        transactionIdSuffix: billingTokenSuffix(transactionId),
         credentialsRejected: error.credentialsRejected || false,
         lookupErrors: error.lookupErrors || null,
         message: error.message,
       });
       logger.error("verifyAppStoreSubscriptionPurchase failed.", {
-        uid,
+        uidSuffix: logUidSuffix,
         billingTraceId: traceId,
-        transactionId,
+        transactionIdSuffix: billingTokenSuffix(transactionId),
         environmentHint: environmentHint || null,
         credentialsRejected: error.credentialsRejected || false,
         lookupErrors: error.lookupErrors || null,
