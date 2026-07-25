@@ -211,7 +211,10 @@ async function invokeSttProvider({
 }
 
 exports.transcribeExperiment = onCall(
-  { secrets: [OPENAI_API_KEY] },
+  {
+    secrets: [OPENAI_API_KEY],
+    enforceAppCheck: true,
+  },
   async (request) => {
     const startedAt = Date.now();
     const uid = request.auth?.uid || null;
