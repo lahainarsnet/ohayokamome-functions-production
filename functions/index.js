@@ -846,7 +846,7 @@ function tokenSuffix(token) {
  *  - 返り値で exceeded を通知（newCount > LIMIT）
  *  - 端末時計に依存せず、Cloud Functions のサーバ時刻から JST 日付キーを生成
  * =======================================================*/
-exports.postSendIncrementUsage = onCall(async (request) => {
+exports.postSendIncrementUsage = onCall({ enforceAppCheck: true }, async (request) => {
   if (!request.auth) {
     throw new HttpsError("unauthenticated", "Authentication required.");
   }
@@ -1168,7 +1168,7 @@ exports.deleteOldMessages = onDocumentCreated(
  * - 今回のUX方針（送信は即時）と異なるため未使用推奨
  * - 必要なら accessMode 等で分岐して使い分け可
  * =======================================================*/
-exports.sendMessageWithLimit = onCall(async (request) => {
+exports.sendMessageWithLimit = onCall({ enforceAppCheck: true }, async (request) => {
   const { senderId, recipientId, text, userName, token } = request.data || {};
   if (!senderId || !recipientId || !text) {
     return { success: false, code: "INVALID_REQUEST" };
@@ -1386,7 +1386,7 @@ exports.sendMessageWithLimit = onCall(async (request) => {
 /* =========================================================
  * 既存機能：利用規約同意の保存
  * =======================================================*/
-exports.recordTosConsent = onCall(async (request) => {
+exports.recordTosConsent = onCall({ enforceAppCheck: true }, async (request) => {
   if (!request.auth) {
     throw new HttpsError("unauthenticated", "Authentication required.");
   }
@@ -1426,7 +1426,7 @@ exports.recordTosConsent = onCall(async (request) => {
 /* =========================================================
  * 既存機能：メール保存 + accountId の補完
  * =======================================================*/
-exports.upsertUserEmailAndAccount = onCall(async (request) => {
+exports.upsertUserEmailAndAccount = onCall({ enforceAppCheck: true }, async (request) => {
   if (!request.auth) {
     throw new HttpsError("unauthenticated", "Authentication required.");
   }
@@ -1477,7 +1477,7 @@ exports.upsertUserEmailAndAccount = onCall(async (request) => {
 /* =========================================================
  * 既存機能：accountIdからユーザー情報を安全に取得する
  * =======================================================*/
-exports.getUserInfoByAccountId = onCall(async (request) => {
+exports.getUserInfoByAccountId = onCall({ enforceAppCheck: true }, async (request) => {
   let callerUid = request.auth?.uid || null;
   if (!callerUid) {
     const fallbackIdToken =
@@ -1546,7 +1546,7 @@ exports.getUserInfoByAccountId = onCall(async (request) => {
  *  - 本番Firebaseに存在するAndroid課金関数を正本リポジトリへ復元。
  * =======================================================*/
 exports.verifyGooglePlaySubscriptionPurchase = onCall(
-  { region: "us-central1" },
+  { region: "us-central1", enforceAppCheck: true },
   async (request) => {
     const uid = request.auth && request.auth.uid;
     const logUidSuffix = uidTailForLog(uid || "");
@@ -1790,6 +1790,7 @@ exports.verifyGooglePlaySubscriptionPurchase = onCall(
  * =======================================================*/
 exports.verifyAppStoreSubscriptionPurchase = onCall(
   {
+    enforceAppCheck: true,
     secrets: [
       APP_STORE_CONNECT_ISSUER_ID,
       APP_STORE_CONNECT_KEY_ID,
@@ -2180,7 +2181,7 @@ exports.verifyAppStoreSubscriptionPurchase = onCall(
  * Subscription: ensure App Store appAccountToken (UUID)
  *  - users/{uid}.appStoreAppAccountToken を1ユーザー1UUIDで固定
  * =======================================================*/
-exports.ensureAppStoreAppAccountToken = onCall(async (request) => {
+exports.ensureAppStoreAppAccountToken = onCall({ enforceAppCheck: true }, async (request) => {
   if (!request.auth) {
     throw new HttpsError("unauthenticated", "Authentication required.");
   }
@@ -2229,7 +2230,7 @@ exports.ensureAppStoreAppAccountToken = onCall(async (request) => {
  *  - 管理者のみが users/{uid} のサブスク状態を更新するための簡易関数
  *  - カスタムクレーム（admin: true）を前提
  * =======================================================*/
-exports.adminUpsertUserSubscription = onCall(async (request) => {
+exports.adminUpsertUserSubscription = onCall({ enforceAppCheck: true }, async (request) => {
   // 要: 管理者のみ（またはデプロイ者のみ）使えるように制限
   if (!request.auth || request.auth.token.admin !== true) {
     throw new HttpsError("permission-denied", "Admin privileges required.");
