@@ -18,6 +18,7 @@ const { loadAppConfig } = require("./appConfig");
 const {
   DEFAULT_DAILY_TRANSCRIBE_LIMIT,
   MAX_AUDIO_BYTES,
+  MAX_STT_PROMPT_CHARS,
   STT_PROVIDER_OPENAI,
   STT_PROVIDER_GOOGLE,
   GOOGLE_STT_DEFAULT_MODEL,
@@ -48,6 +49,20 @@ function uidSuffix(uid) {
 
 function logSttEvent(fields) {
   logger.info("STT_TRACE", fields);
+}
+
+function normalizeSttPrompt(rawPrompt) {
+  if (typeof rawPrompt !== "string") {
+    return { ok: true, prompt: null };
+  }
+  const prompt = rawPrompt.trim();
+  if (prompt === "") {
+    return { ok: true, prompt: null };
+  }
+  if (prompt.length > MAX_STT_PROMPT_CHARS) {
+    return { ok: false, code: "STT_PROMPT_TOO_LONG", maxChars: MAX_STT_PROMPT_CHARS };
+  }
+  return { ok: true, prompt };
 }
 
 function evaluateTranscribeQuotaReservation({
@@ -174,8 +189,10 @@ async function invokeSttProvider({
   audioBuffer,
   mimeType,
   language,
+  prompt,
   receivedBytes,
   apiKey,
+  openaiOptions = {},
   googleOptions = {},
 }) {
   if (provider === STT_PROVIDER_OPENAI) {
@@ -183,8 +200,10 @@ async function invokeSttProvider({
       audioBuffer,
       mimeType,
       language,
+      prompt,
       apiKey,
       receivedBytes,
+      fetchImpl: openaiOptions.fetchImpl,
       logger,
     });
   }
@@ -260,7 +279,12 @@ exports.transcribeExperiment = onCall(
     }
     const provider = providerResolution.provider;
 
-    const { audioBase64, mimeType, language: rawLanguage } = request.data || {};
+    const {
+      audioBase64,
+      mimeType,
+      language: rawLanguage,
+      prompt: rawPrompt,
+    } = request.data || {};
 
     if (typeof audioBase64 !== "string" || audioBase64.length === 0) {
       logSttEvent({
@@ -366,6 +390,28 @@ exports.transcribeExperiment = onCall(
       return { ok: false, code: languageResolution.code };
     }
     const language = languageResolution.language;
+
+    const promptResolution = normalizeSttPrompt(rawPrompt);
+    if (!promptResolution.ok) {
+      logSttEvent({
+        event: "transcribe_failed",
+        provider,
+        model: null,
+        location: null,
+        receivedBytes,
+        apiLatencyMs: null,
+        totalLatencyMs: Date.now() - startedAt,
+        success: false,
+        errorCode: promptResolution.code,
+        textLength: null,
+        uidSuffix: uidSuffix(uid),
+        sttProviderSetting: provider,
+        requestedLanguage: language,
+        providerLanguage: null,
+      });
+      return { ok: false, code: promptResolution.code };
+    }
+    const prompt = promptResolution.prompt;
 
     let apiKey = null;
     if (provider === STT_PROVIDER_OPENAI) {
@@ -505,6 +551,7 @@ exports.transcribeExperiment = onCall(
       audioBuffer: buf,
       mimeType,
       language,
+      prompt,
       receivedBytes,
       apiKey,
       googleOptions: {
@@ -583,6 +630,7 @@ module.exports.evaluateTranscribeQuotaReservation = evaluateTranscribeQuotaReser
 module.exports.reserveDailyTranscribeQuota = reserveDailyTranscribeQuota;
 module.exports.resolveSttProvider = resolveSttProvider;
 module.exports.resolveSttLanguage = resolveSttLanguage;
+module.exports.normalizeSttPrompt = normalizeSttPrompt;
 module.exports.invokeSttProvider = invokeSttProvider;
 module.exports.logSttEvent = logSttEvent;
 module.exports.uidSuffix = uidSuffix;

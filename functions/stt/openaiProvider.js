@@ -9,6 +9,7 @@ async function transcribeWithOpenAI({
   audioBuffer,
   mimeType,
   language,
+  prompt,
   apiKey,
   receivedBytes,
   fetchImpl = fetch,
@@ -26,6 +27,9 @@ async function transcribeWithOpenAI({
   formData.append("model", OPENAI_TRANSCRIBE_MODEL);
   formData.append("response_format", "json");
   formData.append("language", openAiLanguage);
+  if (typeof prompt === "string" && prompt.trim() !== "") {
+    formData.append("prompt", prompt);
+  }
 
   const apiStartedAt = Date.now();
   let res;

@@ -1,12 +1,14 @@
 const assert = require("assert");
 const {
   MAX_AUDIO_BYTES,
+  MAX_STT_PROMPT_CHARS,
   STT_PROVIDER_OPENAI,
   STT_PROVIDER_GOOGLE,
 } = require("./stt/constants");
 const {
   resolveSttProvider,
   resolveSttLanguage,
+  normalizeSttPrompt,
   invokeSttProvider,
   uidSuffix,
   getJstDateKey,
@@ -95,6 +97,26 @@ async function runTests() {
   const invalidLanguage = resolveSttLanguage("fr");
   assert.strictEqual(invalidLanguage.ok, false);
   assert.strictEqual(invalidLanguage.code, "STT_LANGUAGE_INVALID");
+
+  assert.deepStrictEqual(normalizeSttPrompt(undefined), {
+    ok: true,
+    prompt: null,
+  });
+  assert.deepStrictEqual(normalizeSttPrompt(123), { ok: true, prompt: null });
+  assert.deepStrictEqual(normalizeSttPrompt(" \n\t "), {
+    ok: true,
+    prompt: null,
+  });
+  assert.deepStrictEqual(normalizeSttPrompt("  product names: カモメ  "), {
+    ok: true,
+    prompt: "product names: カモメ",
+  });
+  const longPrompt = "x".repeat(MAX_STT_PROMPT_CHARS + 1);
+  assert.deepStrictEqual(normalizeSttPrompt(longPrompt), {
+    ok: false,
+    code: "STT_PROMPT_TOO_LONG",
+    maxChars: MAX_STT_PROMPT_CHARS,
+  });
 
   const unauth = validateAuth({ auth: null });
   assert.deepStrictEqual(unauth, { ok: false, code: "UNAUTHENTICATED" });

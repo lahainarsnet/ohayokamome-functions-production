@@ -69,6 +69,70 @@ function runTests() {
       ["language", "ja"],
     ]);
 
+    const promptFetch = createFetchMock(async (url, options) => {
+      capturedBodyEntries = [];
+      if (options.body && typeof options.body.entries === "function") {
+        for (const [key, value] of options.body.entries()) {
+          if (value instanceof Blob) {
+            capturedBodyEntries.push([key, `blob:${value.type}`]);
+          } else {
+            capturedBodyEntries.push([key, value]);
+          }
+        }
+      }
+      return {
+        ok: true,
+        status: 200,
+        text: async () => JSON.stringify({ text: "prompted" }),
+      };
+    });
+    const promptResult = await transcribeWithOpenAI({
+      audioBuffer,
+      mimeType,
+      language: "ja",
+      prompt: "proper nouns: Kamome",
+      apiKey,
+      receivedBytes,
+      fetchImpl: promptFetch,
+    });
+    assert.strictEqual(promptResult.ok, true);
+    assert.deepStrictEqual(capturedBodyEntries, [
+      ["file", "blob:audio/mp4"],
+      ["model", OPENAI_TRANSCRIBE_MODEL],
+      ["response_format", "json"],
+      ["language", "ja"],
+      ["prompt", "proper nouns: Kamome"],
+    ]);
+
+    const blankPromptFetch = createFetchMock(async (url, options) => {
+      capturedBodyEntries = [];
+      if (options.body && typeof options.body.entries === "function") {
+        for (const [key, value] of options.body.entries()) {
+          if (value instanceof Blob) {
+            capturedBodyEntries.push([key, `blob:${value.type}`]);
+          } else {
+            capturedBodyEntries.push([key, value]);
+          }
+        }
+      }
+      return {
+        ok: true,
+        status: 200,
+        text: async () => JSON.stringify({ text: "blank prompt" }),
+      };
+    });
+    const blankPromptResult = await transcribeWithOpenAI({
+      audioBuffer,
+      mimeType,
+      language: "ja",
+      prompt: "   ",
+      apiKey,
+      receivedBytes,
+      fetchImpl: blankPromptFetch,
+    });
+    assert.strictEqual(blankPromptResult.ok, true);
+    assert.ok(!capturedBodyEntries.some(([key]) => key === "prompt"));
+
     const enFetch = createFetchMock(async (url, options) => {
       capturedBodyEntries = [];
       if (options.body && typeof options.body.entries === "function") {
