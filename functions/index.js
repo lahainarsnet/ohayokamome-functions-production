@@ -1424,6 +1424,126 @@ exports.recordTosConsent = onCall({ enforceAppCheck: true }, async (request) => 
 });
 
 /* =========================================================
+ * アカウント削除
+ *
+ * - 本人の Auth UID だけを対象にする。
+ * - 利用規約同意記録は、紛争対応等に必要な期間の証跡として残す。
+ * - 課金サーバー通知を安全に受け続けるため、購入識別子だけを持つ匿名 tombstone を残す。
+ * - 相手のメッセージは消さず、削除する本人が送った本文だけを消す。
+ * =======================================================*/
+const ACCOUNT_DELETION_BATCH_SIZE = 400;
+
+async function deleteDocumentsInBatches(queryFactory) {
+  const db = admin.getDb();
+  let deletedCount = 0;
+
+  while (true) {
+    const snapshot = await queryFactory()
+      .limit(ACCOUNT_DELETION_BATCH_SIZE)
+      .get();
+    if (snapshot.empty) {
+      return deletedCount;
+    }
+
+    const batch = db.batch();
+    for (const doc of snapshot.docs) {
+      batch.delete(doc.ref);
+    }
+    await batch.commit();
+    deletedCount += snapshot.size;
+  }
+}
+
+async function assertAccountDeletionPrerequisites({ db, userRef, uid, accountId }) {
+  await userRef.collection("contacts").limit(1).get();
+  await db.collectionGroup("contacts").where("stableId", "==", uid).limit(1).get();
+  if (accountId) {
+    await db.collectionGroup("contacts").where("partnerId", "==", accountId).limit(1).get();
+  }
+  await db.collectionGroup("messages").where("senderId", "==", uid).limit(1).get();
+  await admin.getAuthClient().getUser(uid);
+}
+
+function accountDeletionBillingTombstone(userData) {
+  const tombstone = {
+    accountDeletionState: "deleted",
+    accountDeletedAt: admin.FieldValue.serverTimestamp(),
+  };
+  const retainedBillingFields = [
+    "activePurchaseTokens",
+    "appStoreAppAccountToken",
+    "appStoreOriginalTransactionId",
+    "appStoreTransactionId",
+    "googlePlayPrimaryPurchaseToken",
+    "subscriptions",
+  ];
+
+  for (const field of retainedBillingFields) {
+    if (userData[field] !== undefined) {
+      tombstone[field] = userData[field];
+    }
+  }
+  return tombstone;
+}
+
+exports.deleteMyAccount = onCall(
+  { region: "us-central1", enforceAppCheck: true },
+  async (request) => {
+    if (!request.auth) {
+      throw new HttpsError("unauthenticated", "Authentication required.");
+    }
+
+    const uid = request.auth.uid;
+    const db = admin.getDb();
+    const userRef = db.collection("users").doc(uid);
+
+    try {
+      const userSnapshot = await userRef.get();
+      const userData = userSnapshot.data() || {};
+      const accountId =
+        typeof userData.accountId === "string" ? userData.accountId.trim() : "";
+
+      await assertAccountDeletionPrerequisites({ db, userRef, uid, accountId });
+
+      const ownContactsDeleted = await deleteDocumentsInBatches(() =>
+        userRef.collection("contacts")
+      );
+      const linkedContactsDeleted = await deleteDocumentsInBatches(() =>
+        db.collectionGroup("contacts").where("stableId", "==", uid)
+      );
+      const legacyLinkedContactsDeleted = accountId
+        ? await deleteDocumentsInBatches(() =>
+            db.collectionGroup("contacts").where("partnerId", "==", accountId)
+          )
+        : 0;
+      const sentMessagesDeleted = await deleteDocumentsInBatches(() =>
+        db.collectionGroup("messages").where("senderId", "==", uid)
+      );
+
+      // set() を merge なしで行い、メール・カモメID・通知トークン・利用状況など
+      // 既存の個人データをまとめて落とす。購入識別子だけは外部課金通知の照合用に残す。
+      await userRef.set(accountDeletionBillingTombstone(userData));
+      await admin.getAuthClient().deleteUser(uid);
+
+      logger.info("Account deletion completed.", {
+        uidSuffix: uidTailForLog(uid),
+        ownContactsDeleted,
+        linkedContactsDeleted,
+        legacyLinkedContactsDeleted,
+        sentMessagesDeleted,
+      });
+      return { success: true };
+    } catch (error) {
+      logger.error("Account deletion failed.", {
+        uidSuffix: uidTailForLog(uid),
+        error,
+      });
+      throw new HttpsError("internal", "Failed to delete account.");
+    }
+  }
+);
+
+/* =========================================================
  * 既存機能：メール保存 + accountId の補完
  * =======================================================*/
 exports.upsertUserEmailAndAccount = onCall({ enforceAppCheck: true }, async (request) => {
