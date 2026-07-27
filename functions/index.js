@@ -53,6 +53,10 @@ const {
   describeAccountAccessUsability,
   evaluateCrossPlatformPurchaseGuard,
 } = require("./accountAccessUsability");
+const {
+  resolveAccountIdForUpsert,
+  resolveGetUserInfoByAccountIdLookup,
+} = require("./accountIdGuard");
 const { onMessagePublished } = require("firebase-functions/v2/pubsub");
 
 const { randomUUID } = crypto;
@@ -1427,7 +1431,7 @@ exports.upsertUserEmailAndAccount = onCall({ enforceAppCheck: true }, async (req
   }
 
   const uid = request.auth.uid;
-  const { email, accountId: accountIdFromClient } = request.data || {};
+  const { email } = request.data || {};
 
   if (typeof email !== "string" || email.length === 0) {
     throw new HttpsError("invalid-argument", "Parameter 'email' is required.");
@@ -1437,16 +1441,21 @@ exports.upsertUserEmailAndAccount = onCall({ enforceAppCheck: true }, async (req
 
   try {
     const snap = await userRef.get();
-    let accountIdToUse = null;
-
-    if (snap.exists && typeof snap.get("accountId") === "string" && snap.get("accountId")) {
-      accountIdToUse = snap.get("accountId");
-    } else if (typeof accountIdFromClient === "string" && accountIdFromClient.length > 0) {
-      accountIdToUse = accountIdFromClient;
-    } else {
-      accountIdToUse = randomUUID();
+    const resolved = await resolveAccountIdForUpsert({
+      db: admin.getDb(),
+      excludeUid: uid,
+      userSnap: snap,
+      randomUUID,
+    });
+    if (!resolved.accountId) {
+      logger.error("upsertUserEmailAndAccount: unique accountId generation failed.", {
+        uidSuffix: uidTailForLog(uid),
+        attempts: resolved.attempts,
+      });
+      throw new HttpsError("internal", "Failed to assign accountId.");
     }
 
+    const accountIdToUse = resolved.accountId;
     const update = {
       email,
       accountId: accountIdToUse,
@@ -1458,6 +1467,8 @@ exports.upsertUserEmailAndAccount = onCall({ enforceAppCheck: true }, async (req
     logger.info("upsertUserEmailAndAccount succeeded.", {
       uidSuffix: uidTailForLog(uid),
       accountIdSuffix: billingTokenSuffix(accountIdToUse),
+      accountIdSource: resolved.source,
+      generationAttempts: resolved.attempts,
     });
     return { success: true, accountId: accountIdToUse };
   } catch (error) {
@@ -1505,31 +1516,47 @@ exports.getUserInfoByAccountId = onCall({ enforceAppCheck: true }, async (reques
     throw new HttpsError("invalid-argument", "Parameter 'accountId' is required.");
   }
 
+  const normalizedAccountId = accountId.trim();
+
   try {
     const querySnapshot = await admin.getDb()
       .collection("users")
-      .where("accountId", "==", accountId)
-      .limit(1)
+      .where("accountId", "==", normalizedAccountId)
+      .limit(2)
       .get();
 
-    if (querySnapshot.empty) {
-      logger.warn("User not found for accountId:", {
-        accountIdSuffix: billingTokenSuffix(accountId),
+    const lookup = resolveGetUserInfoByAccountIdLookup(querySnapshot.docs);
+
+    if (lookup.status === "not_found") {
+      logger.warn("getUserInfoByAccountId: user not found.", {
+        accountIdSuffix: billingTokenSuffix(normalizedAccountId),
+        callerUidSuffix: uidTailForLog(callerUid),
       });
       return { uid: null };
     }
 
-    const userDoc = querySnapshot.docs[0];
-    const uid = userDoc.id;
+    if (lookup.status === "duplicate") {
+      logger.error("getUserInfoByAccountId: ACCOUNT_ID_DUPLICATE.", {
+        accountIdSuffix: billingTokenSuffix(normalizedAccountId),
+        callerUidSuffix: uidTailForLog(callerUid),
+        matchCount: lookup.matchCount,
+      });
+      throw new HttpsError("failed-precondition", "ACCOUNT_ID_DUPLICATE");
+    }
 
-    logger.info("Successfully retrieved user info for accountId:", {
-      accountIdSuffix: billingTokenSuffix(accountId),
-      uidSuffix: uidTailForLog(uid),
+    logger.info("getUserInfoByAccountId: user found.", {
+      accountIdSuffix: billingTokenSuffix(normalizedAccountId),
+      callerUidSuffix: uidTailForLog(callerUid),
+      matchedUidSuffix: uidTailForLog(lookup.uid),
     });
-    return { uid: uid };
+    return { uid: lookup.uid };
   } catch (error) {
-    logger.error("Error retrieving user info by accountId:", {
-      accountIdSuffix: billingTokenSuffix(accountId),
+    if (error instanceof HttpsError) {
+      throw error;
+    }
+    logger.error("getUserInfoByAccountId failed.", {
+      accountIdSuffix: billingTokenSuffix(normalizedAccountId),
+      callerUidSuffix: uidTailForLog(callerUid),
       error,
     });
     throw new HttpsError("internal", "Failed to retrieve user information.");
