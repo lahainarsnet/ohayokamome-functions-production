@@ -164,11 +164,44 @@ async function fetchLatestFcmTokenForRecipient(recipientId, fallbackToken = "") 
 
 const { loadAppConfig } = require("./appConfig");
 
+function logIdentifierSuffix(value) {
+  const normalized = String(value || "").trim();
+  if (!normalized) return "empty";
+  if (normalized.length <= 4) {
+    return `(short-id len=${normalized.length})`;
+  }
+  if (normalized.length <= 11) {
+    const tailLen = normalized.length <= 7 ? 3 : 4;
+    return normalized.slice(-tailLen);
+  }
+  return normalized.slice(-6);
+}
+
 function uidTailForLog(uid) {
   if (typeof uid !== "string" || uid.length === 0) {
     return "(empty)";
   }
-  return uid.length <= 6 ? uid : uid.slice(-6);
+  return logIdentifierSuffix(uid);
+}
+
+function tokenSuffix(token) {
+  return logIdentifierSuffix(token);
+}
+
+function fcmTokenMetaForLog(token) {
+  const normalized = String(token || "").trim();
+  if (!normalized) {
+    return { hasToken: false, tokenLength: 0 };
+  }
+  return {
+    hasToken: true,
+    tokenLength: normalized.length,
+    tokenTail: tokenSuffix(normalized),
+  };
+}
+
+function logIdTailForLog(value) {
+  return logIdentifierSuffix(String(value || ""));
 }
 
 function previewExpiryRawForLog(value) {
@@ -838,11 +871,6 @@ function buildAppStoreVerifyInactiveUpdate({
   return inactiveUpdate;
 }
 
-function tokenSuffix(token) {
-  if (!token) return "empty";
-  return token.length <= 6 ? token : token.slice(-6);
-}
-
 /* =========================================================
  * プッシュ通知（Android 8+ は channelId 必須。未設定だと Miscellaneous＝サイレントになりやすい）
  * - chats/{chatId}/messages 作成をトリガに
@@ -882,18 +910,21 @@ exports.sendPushNotification = onDocumentCreated(
       } catch (e) {
         logger.warn("Failed to fetch recipient FCM token; falling back to embedded token.", {
           recipientIdSuffix: uidTailForLog(recipientId),
-          e,
+          errorType: e?.constructor?.name || typeof e,
         });
       }
     } else {
       logger.warn("Could not determine recipientId from chatId.", {
-        chatId,
+        chatIdTail: logIdTailForLog(chatId),
         senderIdSuffix: uidTailForLog(senderId),
       });
     }
 
     if (!toToken || typeof toToken !== "string") {
-      logger.warn("FCM token missing; skip send.", { chatId, messageId });
+      logger.warn("FCM token missing; skip send.", {
+        chatIdTail: logIdTailForLog(chatId),
+        messageIdTail: logIdTailForLog(messageId),
+      });
       return { success: false, reason: "MISSING_TOKEN" };
     }
 
@@ -904,10 +935,10 @@ exports.sendPushNotification = onDocumentCreated(
       } catch (e) {
         logger.warn("[KAMOME_BADGE_V3] Failed to calculate unread total; using fallback.", {
           recipientIdSuffix: uidTailForLog(recipientId),
-          chatId,
-          messageId,
+          chatIdTail: logIdTailForLog(chatId),
+          messageIdTail: logIdTailForLog(messageId),
           unreadTotal,
-          e,
+          errorType: e?.constructor?.name || typeof e,
         });
       }
     }
@@ -977,14 +1008,15 @@ exports.sendPushNotification = onDocumentCreated(
       iosBadge: msg.apns.payload.aps.badge,
       androidNotificationTag: msg.android.notification.tag,
       androidNotificationCount: msg.android.notification.notificationCount,
-      chatId,
-      messageId,
+      chatIdTail: logIdTailForLog(chatId),
+      messageIdTail: logIdTailForLog(messageId),
     });
 
     logger.info("Attempting to send notification message", {
-      chatId,
-      messageId,
-      toToken: toToken.slice(0, 12) + "...",
+      chatIdTail: logIdTailForLog(chatId),
+      messageIdTail: logIdTailForLog(messageId),
+      recipientIdSuffix: uidTailForLog(recipientId),
+      ...fcmTokenMetaForLog(toToken),
       collapseKey: msg.android.collapseKey,
       ttlMs: msg.android.ttl,
       priority: msg.android.priority,
@@ -1000,11 +1032,9 @@ exports.sendPushNotification = onDocumentCreated(
         iosBadge: msg.apns.payload.aps.badge,
         androidNotificationTag: msg.android.notification.tag,
         androidNotificationCount: msg.android.notification.notificationCount,
-        chatId,
-        messageId,
-        response,
+        chatIdTail: logIdTailForLog(chatId),
+        messageIdTail: logIdTailForLog(messageId),
       });
-      logger.info("Successfully sent message:", response);
       return { success: true };
     } catch (error) {
       logger.error("[KAMOME_BADGE_V3] Notification send failed.", {
@@ -1013,11 +1043,10 @@ exports.sendPushNotification = onDocumentCreated(
         iosBadge: msg.apns.payload.aps.badge,
         androidNotificationTag: msg.android.notification.tag,
         androidNotificationCount: msg.android.notification.notificationCount,
-        chatId,
-        messageId,
-        error,
+        chatIdTail: logIdTailForLog(chatId),
+        messageIdTail: logIdTailForLog(messageId),
+        errorType: error?.constructor?.name || typeof error,
       });
-      logger.error("Error sending message:", error);
       return { success: false };
     }
   }
@@ -1038,7 +1067,7 @@ exports.deleteOldMessages = onDocumentCreated(
   async (event) => {
     const chatId = event.params.chatId;
     logger.info(
-      `[Auto-Delete] New message in chat: ${chatId}. Checking message count.`
+      `[Auto-Delete] New message in chatTail=${logIdTailForLog(chatId)}. Checking message count.`
     );
 
     const MESSAGE_LIMIT = 300;
@@ -1049,7 +1078,7 @@ exports.deleteOldMessages = onDocumentCreated(
       const currentMessageCount = snapshot.size;
 
       logger.info(
-        `[Auto-Delete] Current message count in ${chatId} is ${currentMessageCount}. Limit is ${MESSAGE_LIMIT}.`
+        `[Auto-Delete] Current message count in chatTail=${logIdTailForLog(chatId)} is ${currentMessageCount}. Limit is ${MESSAGE_LIMIT}.`
       );
 
       if (currentMessageCount > MESSAGE_LIMIT) {
@@ -1068,7 +1097,7 @@ exports.deleteOldMessages = onDocumentCreated(
 
         await batch.commit();
         logger.info(
-          `[Auto-Delete] Deleted ${messagesToDeleteSnapshot.size} old message(s) from chat ${chatId}.`
+          `[Auto-Delete] Deleted ${messagesToDeleteSnapshot.size} old message(s) from chatTail=${logIdTailForLog(chatId)}.`
         );
       } else {
         logger.info(`[Auto-Delete] No action needed.`);
@@ -1076,7 +1105,10 @@ exports.deleteOldMessages = onDocumentCreated(
 
       return { success: true };
     } catch (error) {
-      logger.error(`[Auto-Delete] Error deleting old messages in chat ${chatId}:`, error);
+      logger.error("[Auto-Delete] Error deleting old messages.", {
+        chatIdTail: logIdTailForLog(chatId),
+        errorType: error?.constructor?.name || typeof error,
+      });
       return { success: false };
     }
   }
@@ -1094,8 +1126,8 @@ exports.sendMessageWithLimit = onCall({ enforceAppCheck: true }, async (request)
   }
   if (!request.auth || request.auth.uid !== senderId) {
     logger.warn("sendMessageWithLimit: SENDER_AUTH_MISMATCH", {
-      authUid: request.auth?.uid || null,
-      senderId,
+      authUidTail: uidTailForLog(request.auth?.uid || ""),
+      senderUidTail: uidTailForLog(senderId),
     });
     return { success: false, code: "SENDER_AUTH_MISMATCH" };
   }
@@ -1121,10 +1153,10 @@ exports.sendMessageWithLimit = onCall({ enforceAppCheck: true }, async (request)
     }
   }
   if (!recipientAllowsSender) {
-    logger.warn(
-      "sendMessageWithLimit: RECIPIENT_CONTACT_MISSING",
-      { recipientId, senderId },
-    );
+    logger.warn("sendMessageWithLimit: RECIPIENT_CONTACT_MISSING", {
+      recipientUidTail: uidTailForLog(recipientId),
+      senderUidTail: uidTailForLog(senderId),
+    });
     return { success: false, code: "RECIPIENT_CONTACT_MISSING" };
   }
 
@@ -1297,7 +1329,11 @@ exports.sendMessageWithLimit = onCall({ enforceAppCheck: true }, async (request)
     if (code === "DAILY_LIMIT_EXCEEDED" && typeof error.limit === "number") {
       extra.limit = error.limit;
     }
-    logger.error("sendMessageWithLimit failed:", { code, ...extra, error });
+    logger.error("sendMessageWithLimit failed:", {
+      code,
+      ...extra,
+      errorType: error?.constructor?.name || typeof error,
+    });
     return { success: false, code, ...extra };
   }
 });
@@ -1415,7 +1451,7 @@ exports.deleteMyAccount = onCall(
     } catch (error) {
       logger.error("Account deletion failed.", {
         uidSuffix: uidTailForLog(uid),
-        error,
+        errorType: error?.constructor?.name || typeof error,
       });
       throw new HttpsError("internal", "Failed to delete account.");
     }
@@ -1474,7 +1510,7 @@ exports.upsertUserEmailAndAccount = onCall({ enforceAppCheck: true }, async (req
   } catch (error) {
     logger.error("upsertUserEmailAndAccount failed.", {
       uidSuffix: uidTailForLog(uid),
-      error,
+      errorType: error?.constructor?.name || typeof error,
     });
     throw new HttpsError("internal", "Failed to upsert user email/accountId.");
   }
@@ -1497,7 +1533,9 @@ exports.getUserInfoByAccountId = onCall({ enforceAppCheck: true }, async (reques
           { uidSuffix: uidTailForLog(callerUid || "") }
         );
       } catch (error) {
-        logger.warn("getUserInfoByAccountId: fallback idToken verification failed.", { error });
+        logger.warn("getUserInfoByAccountId: fallback idToken verification failed.", {
+          errorType: error?.constructor?.name || typeof error,
+        });
       }
     }
   }
@@ -1557,7 +1595,7 @@ exports.getUserInfoByAccountId = onCall({ enforceAppCheck: true }, async (reques
     logger.error("getUserInfoByAccountId failed.", {
       accountIdSuffix: billingTokenSuffix(normalizedAccountId),
       callerUidSuffix: uidTailForLog(callerUid),
-      error,
+      errorType: error?.constructor?.name || typeof error,
     });
     throw new HttpsError("internal", "Failed to retrieve user information.");
   }
@@ -1664,7 +1702,7 @@ exports.verifyGooglePlaySubscriptionPurchase = onCall(
         productId,
         packageName,
         tokenSuffix: tokenSuffix(purchaseToken),
-        message: error && error.message,
+        errorType: error?.constructor?.name || typeof error,
       });
       throw new HttpsError(
         "failed-precondition",
@@ -1780,7 +1818,7 @@ exports.verifyGooglePlaySubscriptionPurchase = onCall(
         productId,
         packageName,
         tokenSuffix: tokenSuffix(purchaseToken),
-        message: error && error.message,
+        errorType: error?.constructor?.name || typeof error,
       });
       throw new HttpsError(
         "internal",
@@ -2179,7 +2217,7 @@ exports.verifyAppStoreSubscriptionPurchase = onCall(
         transactionIdSuffix: billingTokenSuffix(transactionId),
         credentialsRejected: error.credentialsRejected || false,
         lookupErrors: error.lookupErrors || null,
-        message: error.message,
+        errorType: error?.constructor?.name || typeof error,
       });
       logger.error("verifyAppStoreSubscriptionPurchase failed.", {
         uidSuffix: logUidSuffix,
@@ -2188,8 +2226,7 @@ exports.verifyAppStoreSubscriptionPurchase = onCall(
         environmentHint: environmentHint || null,
         credentialsRejected: error.credentialsRejected || false,
         lookupErrors: error.lookupErrors || null,
-        message: error.message,
-        error,
+        errorType: error?.constructor?.name || typeof error,
       });
       throw new HttpsError(
         "internal",
@@ -2318,8 +2355,8 @@ exports.adminUpsertUserSubscription = onCall({ enforceAppCheck: true }, async (r
     });
   } catch (recomputeError) {
     logger.warn("adminUpsertUserSubscription entitlement recompute failed", {
-      uid,
-      message: recomputeError?.message || String(recomputeError),
+      uidSuffix: uidTailForLog(uid),
+      errorType: recomputeError?.constructor?.name || typeof recomputeError,
     });
   }
   return { success: true };
