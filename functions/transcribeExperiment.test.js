@@ -12,7 +12,10 @@ const {
   invokeSttProvider,
   uidSuffix,
   getJstDateKey,
+  evaluateCallerSubscriptionAccess,
+  assertCallerSubscriptionUsable,
 } = require("./transcribeExperiment");
+const { SENDER_SUBSCRIPTION_UNAVAILABLE } = require("./sendMessageGuardCodes");
 
 function mapProviderResultToClient(providerResult) {
   if (!providerResult.ok) {
@@ -222,6 +225,84 @@ async function runTests() {
     model: "",
     apiLatencyMs: 0,
   });
+
+  const now = new Date("2026-07-18T12:00:00.000Z");
+  const future = new Date("2026-08-01T00:00:00.000Z");
+  const past = new Date("2026-06-01T00:00:00.000Z");
+
+  const activeLegacy = evaluateCallerSubscriptionAccess(
+    {
+      subscriptionStatus: "active",
+      subscriptionExpiryTime: future,
+    },
+    now,
+  );
+  assert.strictEqual(activeLegacy.subscriptionUsable, true);
+
+  const cancelledEntitlement = evaluateCallerSubscriptionAccess(
+    {
+      entitlementUsable: true,
+      entitlementExpiryTime: future,
+      subscriptionStatus: "cancelled",
+      subscriptionExpiryTime: past,
+    },
+    now,
+  );
+  assert.strictEqual(cancelledEntitlement.subscriptionUsable, true);
+
+  const expired = evaluateCallerSubscriptionAccess(
+    {
+      subscriptionStatus: "active",
+      subscriptionExpiryTime: past,
+    },
+    now,
+  );
+  assert.strictEqual(expired.subscriptionUsable, false);
+
+  const entitlementFalse = evaluateCallerSubscriptionAccess(
+    {
+      entitlementUsable: false,
+      subscriptionStatus: "active",
+      subscriptionExpiryTime: future,
+    },
+    now,
+  );
+  assert.strictEqual(entitlementFalse.subscriptionUsable, false);
+
+  const allowed = await assertCallerSubscriptionUsable("user-active", {
+    getDb: () => ({
+      collection: () => ({
+        doc: () => ({
+          get: async () => ({
+            exists: true,
+            data: () => ({
+              subscriptionStatus: "active",
+              subscriptionExpiryTime: future,
+            }),
+          }),
+        }),
+      }),
+    }),
+  });
+  assert.strictEqual(allowed.ok, true);
+
+  const denied = await assertCallerSubscriptionUsable("user-expired", {
+    getDb: () => ({
+      collection: () => ({
+        doc: () => ({
+          get: async () => ({
+            exists: true,
+            data: () => ({
+              subscriptionStatus: "active",
+              subscriptionExpiryTime: past,
+            }),
+          }),
+        }),
+      }),
+    }),
+  });
+  assert.strictEqual(denied.ok, false);
+  assert.strictEqual(denied.code, SENDER_SUBSCRIPTION_UNAVAILABLE);
 
   console.log("transcribeExperiment.test.js: all tests passed");
 }

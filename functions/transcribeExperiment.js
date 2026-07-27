@@ -15,6 +15,8 @@ const { onCall } = require("firebase-functions/v2/https");
 const { defineSecret, defineString } = require("firebase-functions/params");
 const admin = require("./firebaseAdmin");
 const { loadAppConfig } = require("./appConfig");
+const { describeAccountAccessUsability } = require("./accountAccessUsability");
+const { SENDER_SUBSCRIPTION_UNAVAILABLE } = require("./sendMessageGuardCodes");
 const {
   DEFAULT_DAILY_TRANSCRIBE_LIMIT,
   MAX_AUDIO_BYTES,
@@ -49,6 +51,39 @@ function uidSuffix(uid) {
 
 function logSttEvent(fields) {
   logger.info("STT_TRACE", fields);
+}
+
+function evaluateCallerSubscriptionAccess(userData, now = new Date(), options = {}) {
+  return describeAccountAccessUsability(userData, now, options);
+}
+
+async function assertCallerSubscriptionUsable(uid, options = {}) {
+  const getDb = options.getDb || (() => admin.getDb());
+  const parseExpiryWithMeta = options.parseExpiryWithMeta;
+  const userDoc = await getDb().collection("users").doc(uid).get();
+  const userData = userDoc.exists ? userDoc.data() || {} : {};
+  const usability = evaluateCallerSubscriptionAccess(userData, new Date(), {
+    ...(parseExpiryWithMeta ? { parseExpiryWithMeta } : {}),
+  });
+
+  if (!usability.subscriptionUsable) {
+    logger.warn("transcribeExperiment: SENDER_SUBSCRIPTION_UNAVAILABLE", {
+      uidSuffix: uidSuffix(uid),
+      decisionSource: usability.decisionSource,
+      entitlementUsable: usability.entitlementUsable,
+      entitlementExpiryIsFuture: usability.entitlementExpiryIsFuture,
+      denyReason: usability.denyReason,
+    });
+    return { ok: false, code: SENDER_SUBSCRIPTION_UNAVAILABLE, usability };
+  }
+
+  logger.info("transcribeExperiment: subscription guard passed", {
+    uidSuffix: uidSuffix(uid),
+    decisionSource: usability.decisionSource,
+    entitlementUsable: usability.entitlementUsable,
+    entitlementExpiryIsFuture: usability.entitlementExpiryIsFuture,
+  });
+  return { ok: true, usability };
 }
 
 function normalizeSttPrompt(rawPrompt) {
@@ -253,6 +288,46 @@ exports.transcribeExperiment = onCall(
         sttProviderSetting: null,
       });
       return { ok: false, code: "UNAUTHENTICATED" };
+    }
+
+    let subscriptionCheck;
+    try {
+      subscriptionCheck = await assertCallerSubscriptionUsable(uid);
+    } catch (e) {
+      logger.error("transcribeExperiment: SUBSCRIPTION_CHECK_FAILED", {
+        uidSuffix: uidSuffix(uid),
+        error: String(e?.message || e),
+      });
+      logSttEvent({
+        event: "transcribe_failed",
+        provider: null,
+        model: null,
+        receivedBytes: null,
+        apiLatencyMs: null,
+        totalLatencyMs: Date.now() - startedAt,
+        success: false,
+        errorCode: "SUBSCRIPTION_CHECK_FAILED",
+        textLength: null,
+        uidSuffix: uidSuffix(uid),
+        sttProviderSetting: null,
+      });
+      return { ok: false, code: "SUBSCRIPTION_CHECK_FAILED" };
+    }
+    if (!subscriptionCheck.ok) {
+      logSttEvent({
+        event: "transcribe_failed",
+        provider: null,
+        model: null,
+        receivedBytes: null,
+        apiLatencyMs: null,
+        totalLatencyMs: Date.now() - startedAt,
+        success: false,
+        errorCode: subscriptionCheck.code,
+        textLength: null,
+        uidSuffix: uidSuffix(uid),
+        sttProviderSetting: null,
+      });
+      return { ok: false, code: subscriptionCheck.code };
     }
 
     const providerResolution = resolveSttProvider(STT_PROVIDER.value());
@@ -628,6 +703,8 @@ exports.transcribeExperiment = onCall(
 module.exports.getJstDateKey = getJstDateKey;
 module.exports.evaluateTranscribeQuotaReservation = evaluateTranscribeQuotaReservation;
 module.exports.reserveDailyTranscribeQuota = reserveDailyTranscribeQuota;
+module.exports.evaluateCallerSubscriptionAccess = evaluateCallerSubscriptionAccess;
+module.exports.assertCallerSubscriptionUsable = assertCallerSubscriptionUsable;
 module.exports.resolveSttProvider = resolveSttProvider;
 module.exports.resolveSttLanguage = resolveSttLanguage;
 module.exports.normalizeSttPrompt = normalizeSttPrompt;
