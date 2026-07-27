@@ -840,91 +840,6 @@ function tokenSuffix(token) {
 }
 
 /* =========================================================
- * ★新規：送信後インクリメント（当日送信数の+1と上限判定）
- *  - クライアントは「メッセージ送信」直後に本関数を呼ぶ
- *  - users/{uid} に dailyCount / lastSentDate を保持
- *  - 返り値で exceeded を通知（newCount > LIMIT）
- *  - 端末時計に依存せず、Cloud Functions のサーバ時刻から JST 日付キーを生成
- * =======================================================*/
-exports.postSendIncrementUsage = onCall({ enforceAppCheck: true }, async (request) => {
-  if (!request.auth) {
-    throw new HttpsError("unauthenticated", "Authentication required.");
-  }
-
-  const uid = request.auth.uid;
-  const { dailyLimit: LIMIT, accessMode } = await loadAppConfig();
-
-  // 管理者が全ブロック設定中なら、送信自体は既に終わっている前提だが通知は返す
-  if (accessMode === "block_all") {
-    logger.warn("Access mode is block_all; returning BLOCKED_BY_ADMIN info.");
-    return { success: true, code: "BLOCKED_BY_ADMIN", exceeded: true, limit: LIMIT };
-  }
-
-  const userRef = admin.getDb().collection("users").doc(uid);
-
-  try {
-    const result = await admin.getDb().runTransaction(async (tx) => {
-      const snap = await tx.get(userRef);
-
-      // JST 今日の日付キー（サーバ時刻基準）
-      const todayKey = getJstDateKey(new Date());
-
-      let dailyCount = 0;
-      let lastSentDate = todayKey;
-
-      if (snap.exists) {
-        dailyCount = snap.get("dailyCount") || 0;
-        lastSentDate = snap.get("lastSentDate") || todayKey;
-
-        // 日付が変わっていたらカウントをリセット
-        if (lastSentDate !== todayKey) {
-          dailyCount = 0;
-          lastSentDate = todayKey;
-        }
-      } else {
-        // users/{uid} が未作成でも処理継続（このタイミングで作る）
-        logger.info("User doc did not exist. Creating a new one.", {
-          uidSuffix: uidTailForLog(uid),
-        });
-      }
-
-      const newCount = dailyCount + 1;
-      const exceeded = newCount > LIMIT;
-
-      tx.set(
-        userRef,
-        {
-          dailyCount: newCount,
-          lastSentDate: todayKey,
-          updatedAt: admin.FieldValue.serverTimestamp(),
-        },
-        { merge: true }
-      );
-
-      return { newCount, exceeded, limit: LIMIT, dateKey: todayKey };
-    });
-
-    logger.info("postSendIncrementUsage result", {
-      uidSuffix: uidTailForLog(uid),
-      ...result,
-    });
-    return {
-      success: true,
-      count: result.newCount,
-      exceeded: result.exceeded,
-      limit: result.limit,
-      dateKey: result.dateKey,
-    };
-  } catch (error) {
-    logger.error("postSendIncrementUsage failed:", {
-      uidSuffix: uidTailForLog(uid),
-      error,
-    });
-    throw new HttpsError("internal", "Failed to increment usage.");
-  }
-});
-
-/* =========================================================
  * プッシュ通知（Android 8+ は channelId 必須。未設定だと Miscellaneous＝サイレントになりやすい）
  * - chats/{chatId}/messages 作成をトリガに
  * - HIGH優先度 + notificationペイロード + android.notification.channelId
@@ -1380,46 +1295,6 @@ exports.sendMessageWithLimit = onCall({ enforceAppCheck: true }, async (request)
     }
     logger.error("sendMessageWithLimit failed:", { code, ...extra, error });
     return { success: false, code, ...extra };
-  }
-});
-
-/* =========================================================
- * 既存機能：利用規約同意の保存
- * =======================================================*/
-exports.recordTosConsent = onCall({ enforceAppCheck: true }, async (request) => {
-  if (!request.auth) {
-    throw new HttpsError("unauthenticated", "Authentication required.");
-  }
-
-  const { tosHash, appVersionCode } = request.data || {};
-  if (typeof tosHash !== "string" || tosHash.length === 0) {
-    throw new HttpsError("invalid-argument", "Parameter 'tosHash' required.");
-  }
-  if (typeof appVersionCode !== "number") {
-    throw new HttpsError("invalid-argument", "Parameter 'appVersionCode' must be number.");
-  }
-
-  const uid = request.auth.uid;
-  const email = request.auth.token.email || null;
-
-  const consentData = {
-    uid,
-    email,
-    tosHash,
-    appVersionCode,
-    consentTimestamp: admin.FieldValue.serverTimestamp(),
-  };
-
-  try {
-    await admin.getDb().collection("tos_consents").add(consentData);
-    logger.info("Recorded ToS consent.", { uidSuffix: uidTailForLog(uid) });
-    return { success: true };
-  } catch (error) {
-    logger.error("Failed to write ToS consent.", {
-      uidSuffix: uidTailForLog(uid),
-      error,
-    });
-    throw new HttpsError("internal", "Failed to save consent record.");
   }
 });
 
