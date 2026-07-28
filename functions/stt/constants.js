@@ -1,7 +1,7 @@
 const OPENAI_TRANSCRIBE_URL = "https://api.openai.com/v1/audio/transcriptions";
 const OPENAI_TRANSCRIBE_MODEL = "gpt-4o-mini-transcribe";
 const DEFAULT_DAILY_TRANSCRIBE_LIMIT = 120;
-const MAX_AUDIO_BYTES = 25 * 1024 * 1024;
+const MAX_AUDIO_BYTES = 2 * 1024 * 1024;
 const MAX_STT_PROMPT_CHARS = 1000;
 const STT_PROVIDER_OPENAI = "openai";
 const STT_PROVIDER_GOOGLE = "google";
