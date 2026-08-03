@@ -270,6 +270,7 @@ async function runTests() {
   assert.strictEqual(entitlementFalse.subscriptionUsable, false);
 
   const allowed = await assertCallerSubscriptionUsable("user-active", {
+    now,
     getDb: () => ({
       collection: () => ({
         doc: () => ({
@@ -287,6 +288,7 @@ async function runTests() {
   assert.strictEqual(allowed.ok, true);
 
   const denied = await assertCallerSubscriptionUsable("user-expired", {
+    now,
     getDb: () => ({
       collection: () => ({
         doc: () => ({

@@ -60,9 +60,10 @@ function evaluateCallerSubscriptionAccess(userData, now = new Date(), options = 
 async function assertCallerSubscriptionUsable(uid, options = {}) {
   const getDb = options.getDb || (() => admin.getDb());
   const parseExpiryWithMeta = options.parseExpiryWithMeta;
+  const now = options.now instanceof Date ? options.now : new Date();
   const userDoc = await getDb().collection("users").doc(uid).get();
   const userData = userDoc.exists ? userDoc.data() || {} : {};
-  const usability = evaluateCallerSubscriptionAccess(userData, new Date(), {
+  const usability = evaluateCallerSubscriptionAccess(userData, now, {
     ...(parseExpiryWithMeta ? { parseExpiryWithMeta } : {}),
   });
 
