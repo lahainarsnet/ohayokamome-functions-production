@@ -58,6 +58,10 @@ const {
   resolveGetUserInfoByAccountIdLookup,
 } = require("./accountIdGuard");
 const { onMessagePublished } = require("firebase-functions/v2/pubsub");
+const {
+  CHAT_MESSAGE_LIMIT,
+  computeMessagesToDeleteCount,
+} = require("./deleteOldMessagesLib");
 
 const { randomUUID } = crypto;
 
@@ -1070,19 +1074,22 @@ exports.deleteOldMessages = onDocumentCreated(
       `[Auto-Delete] New message in chatTail=${logIdTailForLog(chatId)}. Checking message count.`
     );
 
-    const MESSAGE_LIMIT = 300;
+    const MESSAGE_LIMIT = CHAT_MESSAGE_LIMIT;
     const messagesRef = admin.getDb().collection("chats").doc(chatId).collection("messages");
 
     try {
-      const snapshot = await messagesRef.get();
-      const currentMessageCount = snapshot.size;
+      const currentMessageCount = await getQueryCount(messagesRef);
 
       logger.info(
         `[Auto-Delete] Current message count in chatTail=${logIdTailForLog(chatId)} is ${currentMessageCount}. Limit is ${MESSAGE_LIMIT}.`
       );
 
-      if (currentMessageCount > MESSAGE_LIMIT) {
-        const messagesToDeleteCount = currentMessageCount - MESSAGE_LIMIT;
+      const messagesToDeleteCount = computeMessagesToDeleteCount(
+        currentMessageCount,
+        MESSAGE_LIMIT
+      );
+
+      if (messagesToDeleteCount > 0) {
         logger.info(
           `[Auto-Delete] Deleting ${messagesToDeleteCount} oldest message(s).`
         );
