@@ -1,5 +1,5 @@
 /**
- * Phase 3: Base64 音声 → STT provider（OpenAI / Google）→ text 返却。
+ * Phase 3: Base64 音声 → STT provider（OpenAI / Google / Gemini）→ text 返却。
  *
  * - 音声内容や変換結果は保存しない。
  *
@@ -23,6 +23,7 @@ const {
   MAX_STT_PROMPT_CHARS,
   STT_PROVIDER_OPENAI,
   STT_PROVIDER_GOOGLE,
+  STT_PROVIDER_GEMINI,
   GOOGLE_STT_DEFAULT_MODEL,
   GOOGLE_STT_DEFAULT_LOCATION,
 } = require("./stt/constants");
@@ -30,8 +31,10 @@ const { resolveSttProvider } = require("./stt/registry");
 const { resolveSttLanguage } = require("./stt/language");
 const { transcribeWithOpenAI } = require("./stt/openaiProvider");
 const { transcribeWithGoogle } = require("./stt/googleProvider");
+const { transcribeWithGemini } = require("./stt/geminiProvider");
 
 const OPENAI_API_KEY = defineSecret("OPENAI_API_KEY");
+const GEMINI_API_KEY = defineSecret("GEMINI_API_KEY");
 const STT_PROVIDER = defineString("STT_PROVIDER", {
   default: STT_PROVIDER_OPENAI,
 });
@@ -135,11 +138,12 @@ function evaluateTranscribeQuotaReservation({
   };
 }
 
-async function reserveDailyTranscribeQuota(uid, limit) {
-  const todayKey = getJstDateKey(new Date());
-  const userRef = admin.getDb().collection("users").doc(uid);
+async function reserveDailyTranscribeQuota(uid, limit, options = {}) {
+  const todayKey = options.todayKey || getJstDateKey(new Date());
+  const getDb = options.getDb || (() => admin.getDb());
+  const userRef = getDb().collection("users").doc(uid);
 
-  return admin.getDb().runTransaction(async (tx) => {
+  return getDb().runTransaction(async (tx) => {
     const now = admin.FieldValue.serverTimestamp();
     const snap = await tx.get(userRef);
     const lastDate = snap.exists ? snap.get("transcribeLastDate") : null;
@@ -203,9 +207,7 @@ async function reserveDailyTranscribeQuota(uid, limit) {
         transcribeDailyCount: reservation.count,
         transcribeUpdatedAt: now,
         transcribeLastAttemptAt: now,
-        transcribeLastSuccessAt: now,
         transcribeLimit: limit,
-        transcribeLastResultCode: "OK",
       },
       { merge: true },
     );
@@ -215,9 +217,196 @@ async function reserveDailyTranscribeQuota(uid, limit) {
       dailyTranscribeLimit: limit,
       usedCount: reservation.usedCount,
       remainingCount: reservation.remainingCount,
+      quotaReserved: true,
     });
     return reservation;
   });
+}
+
+function evaluateTranscribeQuotaRelease({
+  count,
+  lastDate,
+  todayKey,
+  limit,
+  reservationUsedCount = null,
+}) {
+  if (lastDate !== todayKey) {
+    return {
+      released: false,
+      reason: "date_mismatch",
+      count:
+        typeof count === "number" && Number.isFinite(count) ? count : 0,
+      usedCount:
+        lastDate === todayKey && typeof count === "number" && Number.isFinite(count)
+          ? count
+          : 0,
+      remainingCount:
+        lastDate === todayKey && typeof count === "number" && Number.isFinite(count)
+          ? Math.max(0, limit - count)
+          : limit,
+    };
+  }
+
+  const effectiveCount =
+    typeof count === "number" && Number.isFinite(count) ? count : 0;
+  if (effectiveCount <= 0) {
+    return {
+      released: false,
+      reason: "already_zero",
+      count: 0,
+      usedCount: 0,
+      remainingCount: limit,
+    };
+  }
+
+  if (
+    typeof reservationUsedCount === "number" &&
+    Number.isFinite(reservationUsedCount) &&
+    effectiveCount < reservationUsedCount
+  ) {
+    return {
+      released: false,
+      reason: "reservation_already_released",
+      count: effectiveCount,
+      usedCount: effectiveCount,
+      remainingCount: Math.max(0, limit - effectiveCount),
+    };
+  }
+
+  const newCount = effectiveCount - 1;
+  return {
+    released: true,
+    reason: null,
+    count: newCount,
+    usedCount: newCount,
+    remainingCount: Math.max(0, limit - newCount),
+  };
+}
+
+async function releaseDailyTranscribeQuota(
+  uid,
+  limit,
+  reservation,
+  resultCode,
+  options = {},
+) {
+  if (!reservation?.allowed) {
+    return {
+      released: false,
+      reason: "not_reserved",
+      usedCount: reservation?.usedCount ?? null,
+      remainingCount: reservation?.remainingCount ?? null,
+    };
+  }
+
+  const todayKey = options.todayKey || getJstDateKey(new Date());
+  const getDb = options.getDb || (() => admin.getDb());
+  const userRef = getDb().collection("users").doc(uid);
+  const normalizedResultCode =
+    typeof resultCode === "string" && resultCode.trim() !== ""
+      ? resultCode.trim()
+      : "TRANSCRIBE_FAILED";
+
+  return getDb().runTransaction(async (tx) => {
+    const now = admin.FieldValue.serverTimestamp();
+    const snap = await tx.get(userRef);
+    const lastDate = snap.exists ? snap.get("transcribeLastDate") : null;
+    const count =
+      snap.exists && typeof snap.get("transcribeDailyCount") === "number"
+        ? snap.get("transcribeDailyCount")
+        : 0;
+
+    const release = evaluateTranscribeQuotaRelease({
+      count,
+      lastDate,
+      todayKey,
+      limit,
+      reservationUsedCount: reservation?.usedCount ?? null,
+    });
+
+    if (!release.released) {
+      return release;
+    }
+
+    tx.set(
+      userRef,
+      {
+        transcribeLastDate: todayKey,
+        transcribeDailyCount: release.count,
+        transcribeUpdatedAt: now,
+        transcribeLastResultCode: normalizedResultCode,
+      },
+      { merge: true },
+    );
+    return release;
+  });
+}
+
+async function markDailyTranscribeSuccess(uid, options = {}) {
+  const getDb = options.getDb || (() => admin.getDb());
+  const userRef = getDb().collection("users").doc(uid);
+
+  return getDb().runTransaction(async (tx) => {
+    const now = admin.FieldValue.serverTimestamp();
+    tx.set(
+      userRef,
+      {
+        transcribeLastSuccessAt: now,
+        transcribeLastResultCode: "OK",
+        transcribeUpdatedAt: now,
+      },
+      { merge: true },
+    );
+    return { ok: true };
+  });
+}
+
+async function attemptQuotaRelease(uid, limit, quota, resultCode, logFields = {}) {
+  try {
+    const releaseResult = await releaseDailyTranscribeQuota(
+      uid,
+      limit,
+      quota,
+      resultCode,
+      logFields.releaseOptions || {},
+    );
+    if (!releaseResult.released) {
+      logger.warn("transcribeExperiment: quota release skipped", {
+        uidSuffix: uidSuffix(uid),
+        reason: releaseResult.reason || "unknown",
+        resultCode,
+        ...logFields,
+      });
+    } else {
+      logger.info("transcribeExperiment: quota released", {
+        uidSuffix: uidSuffix(uid),
+        resultCode,
+        usedCount: releaseResult.usedCount,
+        remainingCount: releaseResult.remainingCount,
+        quotaReleased: true,
+        ...logFields,
+      });
+    }
+    return {
+      ...releaseResult,
+      quotaReleaseFailed: false,
+    };
+  } catch (error) {
+    logger.warn("transcribeExperiment: quota release failed", {
+      uidSuffix: uidSuffix(uid),
+      resultCode,
+      error: String(error?.message || error),
+      quotaReleaseFailed: true,
+      ...logFields,
+    });
+    return {
+      released: false,
+      reason: "release_transaction_failed",
+      quotaReleaseFailed: true,
+      usedCount: quota?.usedCount ?? null,
+      remainingCount: quota?.remainingCount ?? null,
+    };
+  }
 }
 
 async function invokeSttProvider({
@@ -230,6 +419,7 @@ async function invokeSttProvider({
   apiKey,
   openaiOptions = {},
   googleOptions = {},
+  geminiOptions = {},
 }) {
   if (provider === STT_PROVIDER_OPENAI) {
     return transcribeWithOpenAI({
@@ -256,12 +446,27 @@ async function invokeSttProvider({
       logger,
     });
   }
+  if (provider === STT_PROVIDER_GEMINI) {
+    return transcribeWithGemini({
+      audioBuffer,
+      mimeType,
+      language,
+      prompt,
+      apiKey,
+      receivedBytes,
+      fetchImpl: geminiOptions.fetchImpl,
+      logger,
+    });
+  }
   return {
     ok: false,
     code: "STT_PROVIDER_INVALID",
     provider,
     model: "",
     apiLatencyMs: 0,
+    inputTokens: null,
+    outputTokens: null,
+    thinkingTokens: null,
   };
 }
 
@@ -279,7 +484,7 @@ async function runTranscribeAdminGateAfterAuth(request, options = {}) {
 
 exports.transcribeExperiment = onCall(
   {
-    secrets: [OPENAI_API_KEY],
+    secrets: [OPENAI_API_KEY, GEMINI_API_KEY],
     enforceAppCheck: true,
     maxInstances: 30,
     concurrency: 10,
@@ -547,6 +752,9 @@ exports.transcribeExperiment = onCall(
           textLength: null,
           uidSuffix: uidSuffix(uid),
           sttProviderSetting: provider,
+          inputTokens: null,
+          outputTokens: null,
+          thinkingTokens: null,
         });
         return { ok: false, code: "SECRET_READ_FAILED" };
       }
@@ -568,6 +776,61 @@ exports.transcribeExperiment = onCall(
           textLength: null,
           uidSuffix: uidSuffix(uid),
           sttProviderSetting: provider,
+          inputTokens: null,
+          outputTokens: null,
+          thinkingTokens: null,
+        });
+        return { ok: false, code: "SECRET_EMPTY" };
+      }
+    }
+    if (provider === STT_PROVIDER_GEMINI) {
+      try {
+        apiKey = GEMINI_API_KEY.value();
+      } catch (_) {
+        logger.warn("transcribeExperiment: SECRET_READ_FAILED", {
+          receivedBytes,
+          provider,
+          uidSuffix: uidSuffix(uid),
+        });
+        logSttEvent({
+          event: "transcribe_failed",
+          provider,
+          model: null,
+          receivedBytes,
+          apiLatencyMs: null,
+          totalLatencyMs: Date.now() - startedAt,
+          success: false,
+          errorCode: "SECRET_READ_FAILED",
+          textLength: null,
+          uidSuffix: uidSuffix(uid),
+          sttProviderSetting: provider,
+          inputTokens: null,
+          outputTokens: null,
+          thinkingTokens: null,
+        });
+        return { ok: false, code: "SECRET_READ_FAILED" };
+      }
+      if (typeof apiKey !== "string" || apiKey.length === 0) {
+        logger.warn("transcribeExperiment: SECRET_EMPTY", {
+          receivedBytes,
+          provider,
+          uidSuffix: uidSuffix(uid),
+        });
+        logSttEvent({
+          event: "transcribe_failed",
+          provider,
+          model: null,
+          receivedBytes,
+          apiLatencyMs: null,
+          totalLatencyMs: Date.now() - startedAt,
+          success: false,
+          errorCode: "SECRET_EMPTY",
+          textLength: null,
+          uidSuffix: uidSuffix(uid),
+          sttProviderSetting: provider,
+          inputTokens: null,
+          outputTokens: null,
+          thinkingTokens: null,
         });
         return { ok: false, code: "SECRET_EMPTY" };
       }
@@ -658,23 +921,64 @@ exports.transcribeExperiment = onCall(
       return limitExceededResponse;
     }
 
-    const providerResult = await invokeSttProvider({
-      provider,
-      audioBuffer: buf,
-      mimeType,
-      language,
-      prompt,
-      receivedBytes,
-      apiKey,
-      googleOptions: {
-        projectId:
-          process.env.GCLOUD_PROJECT || process.env.GOOGLE_CLOUD_PROJECT,
-        location: process.env.STT_GOOGLE_LOCATION || GOOGLE_STT_DEFAULT_LOCATION,
-        model: process.env.STT_GOOGLE_MODEL || GOOGLE_STT_DEFAULT_MODEL,
-      },
-    });
+    let providerResult;
+    try {
+      providerResult = await invokeSttProvider({
+        provider,
+        audioBuffer: buf,
+        mimeType,
+        language,
+        prompt,
+        receivedBytes,
+        apiKey,
+        googleOptions: {
+          projectId:
+            process.env.GCLOUD_PROJECT || process.env.GOOGLE_CLOUD_PROJECT,
+          location: process.env.STT_GOOGLE_LOCATION || GOOGLE_STT_DEFAULT_LOCATION,
+          model: process.env.STT_GOOGLE_MODEL || GOOGLE_STT_DEFAULT_MODEL,
+        },
+      });
+    } catch (invokeError) {
+      const releaseResult = await attemptQuotaRelease(
+        uid,
+        dailyTranscribeLimit,
+        quota,
+        "TRANSCRIBE_INTERNAL_ERROR",
+      );
+      logger.error("transcribeExperiment: invokeSttProvider threw", {
+        uidSuffix: uidSuffix(uid),
+        error: String(invokeError?.message || invokeError),
+      });
+      logSttEvent({
+        event: "transcribe_failed",
+        provider,
+        model: null,
+        receivedBytes,
+        apiLatencyMs: null,
+        totalLatencyMs: Date.now() - startedAt,
+        success: false,
+        errorCode: "TRANSCRIBE_INTERNAL_ERROR",
+        textLength: null,
+        uidSuffix: uidSuffix(uid),
+        sttProviderSetting: provider,
+        requestedLanguage: language,
+        providerLanguage: null,
+        quotaReserved: true,
+        quotaReleased: releaseResult.released === true,
+        quotaReleaseFailed: releaseResult.quotaReleaseFailed === true,
+        usedCount: releaseResult.usedCount ?? quota.usedCount,
+        remainingCount: releaseResult.remainingCount ?? quota.remainingCount,
+      });
+      return { ok: false, code: "TRANSCRIBE_INTERNAL_ERROR" };
+    }
 
     if (!providerResult.ok) {
+      const releaseResult = await attemptQuotaRelease(
+        uid,
+        dailyTranscribeLimit,
+        quota,
+        providerResult.code,
+      );
       logSttEvent({
         event: "transcribe_failed",
         provider: providerResult.provider || provider,
@@ -690,8 +994,25 @@ exports.transcribeExperiment = onCall(
         sttProviderSetting: provider,
         requestedLanguage: language,
         providerLanguage: providerResult.providerLanguage || null,
+        inputTokens: providerResult.inputTokens ?? null,
+        outputTokens: providerResult.outputTokens ?? null,
+        thinkingTokens: providerResult.thinkingTokens ?? null,
+        quotaReserved: true,
+        quotaReleased: releaseResult.released === true,
+        quotaReleaseFailed: releaseResult.quotaReleaseFailed === true,
+        usedCount: releaseResult.usedCount ?? quota.usedCount,
+        remainingCount: releaseResult.remainingCount ?? quota.remainingCount,
       });
       return { ok: false, code: providerResult.code };
+    }
+
+    try {
+      await markDailyTranscribeSuccess(uid);
+    } catch (successMarkError) {
+      logger.warn("transcribeExperiment: success metadata update failed", {
+        uidSuffix: uidSuffix(uid),
+        error: String(successMarkError?.message || successMarkError),
+      });
     }
 
     logger.info("transcribeExperiment: transcription ok", {
@@ -703,6 +1024,19 @@ exports.transcribeExperiment = onCall(
       uidSuffix: uidSuffix(uid),
       requestedLanguage: language,
       providerLanguage: providerResult.providerLanguage || null,
+      inputTokens: providerResult.inputTokens ?? null,
+      outputTokens: providerResult.outputTokens ?? null,
+      thinkingTokens: providerResult.thinkingTokens ?? null,
+      promptPresent: prompt != null,
+      promptLength: prompt != null ? prompt.length : 0,
+      geminiPromptForwarded:
+        provider === STT_PROVIDER_GEMINI &&
+        providerResult.promptForwarded === true,
+      quotaReserved: true,
+      quotaReleased: false,
+      quotaReleaseFailed: false,
+      usedCount: quota.usedCount,
+      remainingCount: quota.remainingCount,
     });
     logSttEvent({
       event: "transcribe_succeeded",
@@ -719,6 +1053,19 @@ exports.transcribeExperiment = onCall(
       sttProviderSetting: provider,
       requestedLanguage: language,
       providerLanguage: providerResult.providerLanguage || null,
+      inputTokens: providerResult.inputTokens ?? null,
+      outputTokens: providerResult.outputTokens ?? null,
+      thinkingTokens: providerResult.thinkingTokens ?? null,
+      promptPresent: prompt != null,
+      promptLength: prompt != null ? prompt.length : 0,
+      geminiPromptForwarded:
+        provider === STT_PROVIDER_GEMINI &&
+        providerResult.promptForwarded === true,
+      quotaReserved: true,
+      quotaReleased: false,
+      quotaReleaseFailed: false,
+      usedCount: quota.usedCount,
+      remainingCount: quota.remainingCount,
     });
 
     logger.info("transcribeExperiment: callable result", {
@@ -739,7 +1086,11 @@ exports.transcribeExperiment = onCall(
 
 module.exports.getJstDateKey = getJstDateKey;
 module.exports.evaluateTranscribeQuotaReservation = evaluateTranscribeQuotaReservation;
+module.exports.evaluateTranscribeQuotaRelease = evaluateTranscribeQuotaRelease;
 module.exports.reserveDailyTranscribeQuota = reserveDailyTranscribeQuota;
+module.exports.releaseDailyTranscribeQuota = releaseDailyTranscribeQuota;
+module.exports.markDailyTranscribeSuccess = markDailyTranscribeSuccess;
+module.exports.attemptQuotaRelease = attemptQuotaRelease;
 module.exports.evaluateCallerSubscriptionAccess = evaluateCallerSubscriptionAccess;
 module.exports.assertCallerSubscriptionUsable = assertCallerSubscriptionUsable;
 module.exports.runTranscribeAdminGateAfterAuth = runTranscribeAdminGateAfterAuth;

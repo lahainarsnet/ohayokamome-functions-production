@@ -25,6 +25,10 @@ function runTests() {
   assert.strictEqual(googleResolved.ok, true);
   assert.strictEqual(googleResolved.provider, "google");
 
+  const geminiResolved = resolveSttProvider("gemini");
+  assert.strictEqual(geminiResolved.ok, true);
+  assert.strictEqual(geminiResolved.provider, "gemini");
+
   const typoResolved = resolveSttProvider("openai2");
   assert.strictEqual(typoResolved.ok, false);
   assert.strictEqual(typoResolved.code, "STT_PROVIDER_INVALID");

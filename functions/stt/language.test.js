@@ -8,7 +8,7 @@ const {
   toOpenAiLanguage,
   resolveProviderLanguage,
 } = require("./language");
-const { STT_PROVIDER_OPENAI, STT_PROVIDER_GOOGLE } = require("./constants");
+const { STT_PROVIDER_OPENAI, STT_PROVIDER_GOOGLE, STT_PROVIDER_GEMINI } = require("./constants");
 
 function runTests() {
   assert.strictEqual(normalizeSttLanguageValue(undefined), STT_LANGUAGE_JA);
@@ -57,6 +57,14 @@ function runTests() {
   );
   assert.strictEqual(
     resolveProviderLanguage(STT_PROVIDER_OPENAI, STT_LANGUAGE_EN),
+    "en",
+  );
+  assert.strictEqual(
+    resolveProviderLanguage(STT_PROVIDER_GEMINI, STT_LANGUAGE_JA),
+    "ja",
+  );
+  assert.strictEqual(
+    resolveProviderLanguage(STT_PROVIDER_GEMINI, STT_LANGUAGE_EN),
     "en",
   );
 
