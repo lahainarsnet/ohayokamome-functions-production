@@ -166,7 +166,7 @@ async function fetchLatestFcmTokenForRecipient(recipientId, fallbackToken = "") 
   }
 }
 
-const { loadAppConfig } = require("./appConfig");
+const { loadAppConfig, assertAccessNotBlocked } = require("./appConfig");
 
 function logIdentifierSuffix(value) {
   const normalized = String(value || "").trim();
@@ -1126,7 +1126,9 @@ exports.deleteOldMessages = onDocumentCreated(
  * - 今回のUX方針（送信は即時）と異なるため未使用推奨
  * - 必要なら accessMode 等で分岐して使い分け可
  * =======================================================*/
-exports.sendMessageWithLimit = onCall({ enforceAppCheck: true }, async (request) => {
+exports.sendMessageWithLimit = onCall(
+  { enforceAppCheck: true, maxInstances: 30 },
+  async (request) => {
   const { senderId, recipientId, text, userName, token } = request.data || {};
   if (!senderId || !recipientId || !text) {
     return { success: false, code: "INVALID_REQUEST" };
@@ -1139,10 +1141,12 @@ exports.sendMessageWithLimit = onCall({ enforceAppCheck: true }, async (request)
     return { success: false, code: "SENDER_AUTH_MISMATCH" };
   }
 
-  const { dailyLimit: LIMIT, accessMode } = await loadAppConfig();
-  if (accessMode === "block_all") {
-    return { success: false, code: "BLOCKED_BY_ADMIN" };
+  const accessGate = await assertAccessNotBlocked();
+  if (accessGate.blocked) {
+    return { success: false, code: accessGate.code };
   }
+
+  const { dailyLimit: LIMIT } = await loadAppConfig();
 
   const contactsSnap = await admin
     .getDb()

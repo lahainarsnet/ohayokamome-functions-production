@@ -14,7 +14,7 @@ const logger = require("firebase-functions/logger");
 const { onCall } = require("firebase-functions/v2/https");
 const { defineSecret, defineString } = require("firebase-functions/params");
 const admin = require("./firebaseAdmin");
-const { loadAppConfig } = require("./appConfig");
+const { loadAppConfig, assertAccessNotBlocked } = require("./appConfig");
 const { describeAccountAccessUsability } = require("./accountAccessUsability");
 const { SENDER_SUBSCRIPTION_UNAVAILABLE } = require("./sendMessageGuardCodes");
 const {
@@ -265,10 +265,24 @@ async function invokeSttProvider({
   };
 }
 
+async function runTranscribeAdminGateAfterAuth(request, options = {}) {
+  const uid = request.auth?.uid || null;
+  if (!uid) {
+    return { ok: false, code: "UNAUTHENTICATED", uid: null };
+  }
+  const accessGate = await assertAccessNotBlocked(options);
+  if (accessGate.blocked) {
+    return { ok: false, code: accessGate.code, uid };
+  }
+  return { ok: true, uid };
+}
+
 exports.transcribeExperiment = onCall(
   {
     secrets: [OPENAI_API_KEY],
     enforceAppCheck: true,
+    maxInstances: 30,
+    concurrency: 10,
   },
   async (request) => {
     const startedAt = Date.now();
@@ -289,6 +303,28 @@ exports.transcribeExperiment = onCall(
         sttProviderSetting: null,
       });
       return { ok: false, code: "UNAUTHENTICATED" };
+    }
+
+    const adminGate = await runTranscribeAdminGateAfterAuth(request);
+    if (!adminGate.ok) {
+      logger.warn("transcribeExperiment: admin access gate blocked", {
+        uidSuffix: uidSuffix(uid),
+        errorCode: adminGate.code,
+      });
+      logSttEvent({
+        event: "transcribe_failed",
+        provider: null,
+        model: null,
+        receivedBytes: null,
+        apiLatencyMs: null,
+        totalLatencyMs: Date.now() - startedAt,
+        success: false,
+        errorCode: adminGate.code,
+        textLength: null,
+        uidSuffix: uidSuffix(uid),
+        sttProviderSetting: null,
+      });
+      return { ok: false, code: adminGate.code };
     }
 
     let subscriptionCheck;
@@ -706,6 +742,7 @@ module.exports.evaluateTranscribeQuotaReservation = evaluateTranscribeQuotaReser
 module.exports.reserveDailyTranscribeQuota = reserveDailyTranscribeQuota;
 module.exports.evaluateCallerSubscriptionAccess = evaluateCallerSubscriptionAccess;
 module.exports.assertCallerSubscriptionUsable = assertCallerSubscriptionUsable;
+module.exports.runTranscribeAdminGateAfterAuth = runTranscribeAdminGateAfterAuth;
 module.exports.resolveSttProvider = resolveSttProvider;
 module.exports.resolveSttLanguage = resolveSttLanguage;
 module.exports.normalizeSttPrompt = normalizeSttPrompt;

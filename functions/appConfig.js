@@ -1,6 +1,13 @@
 const logger = require("firebase-functions/logger");
 const admin = require("./firebaseAdmin");
 
+const APP_GATE_COLLECTION = "admin";
+const APP_GATE_DOC_ID = "app_gate";
+const APP_GATE_MODE_FIELD = "mode";
+const ACCESS_MODE_NORMAL = "normal";
+const ACCESS_MODE_BLOCK_ALL = "block_all";
+const BLOCKED_BY_ADMIN_CODE = "BLOCKED_BY_ADMIN";
+
 const DEFAULT_DAILY_SEND_LIMIT = 120;
 const DEFAULT_DAILY_TRANSCRIBE_LIMIT = 120;
 
@@ -83,6 +90,7 @@ async function loadAppConfig() {
       );
     }
 
+    // Legacy field from config/app. Block decisions use admin/app_gate.mode instead.
     const accessMode =
       typeof appAccessMode === "string" && appAccessMode.length > 0
         ? appAccessMode
@@ -114,10 +122,81 @@ async function loadAppConfig() {
   }
 }
 
+/**
+ * Read the canonical admin kill-switch: admin/app_gate.mode.
+ * Fail-open on read errors so transient Firestore issues do not block all users.
+ */
+async function loadAppGateAccessMode(options = {}) {
+  const getDb = options.getDb || (() => admin.getDb());
+  try {
+    const snap = await getDb()
+      .collection(APP_GATE_COLLECTION)
+      .doc(APP_GATE_DOC_ID)
+      .get();
+    if (!snap.exists) {
+      return {
+        accessMode: ACCESS_MODE_NORMAL,
+        source: "admin/app_gate",
+        readFailed: false,
+      };
+    }
+    const mode = snap.get(APP_GATE_MODE_FIELD);
+    if (typeof mode === "string" && mode.trim().length > 0) {
+      return {
+        accessMode: mode.trim(),
+        source: "admin/app_gate",
+        readFailed: false,
+      };
+    }
+    return {
+      accessMode: ACCESS_MODE_NORMAL,
+      source: "admin/app_gate",
+      readFailed: false,
+    };
+  } catch (e) {
+    logger.warn("loadAppGateAccessMode: admin/app_gate read failed; fail-open", {
+      errorType: e?.constructor?.name || typeof e,
+    });
+    return {
+      accessMode: ACCESS_MODE_NORMAL,
+      source: "fail_open",
+      readFailed: true,
+    };
+  }
+}
+
+/**
+ * Returns blocked=true when admin/app_gate.mode is block_all.
+ */
+async function assertAccessNotBlocked(options = {}) {
+  const gate = await loadAppGateAccessMode(options);
+  if (gate.accessMode === ACCESS_MODE_BLOCK_ALL) {
+    return {
+      blocked: true,
+      code: BLOCKED_BY_ADMIN_CODE,
+      accessMode: gate.accessMode,
+      readFailed: gate.readFailed,
+    };
+  }
+  return {
+    blocked: false,
+    accessMode: gate.accessMode,
+    readFailed: gate.readFailed,
+  };
+}
+
 module.exports = {
+  APP_GATE_COLLECTION,
+  APP_GATE_DOC_ID,
+  APP_GATE_MODE_FIELD,
+  ACCESS_MODE_NORMAL,
+  ACCESS_MODE_BLOCK_ALL,
+  BLOCKED_BY_ADMIN_CODE,
   DEFAULT_DAILY_SEND_LIMIT,
   DEFAULT_DAILY_TRANSCRIBE_LIMIT,
   MAX_DAILY_LIMIT,
   parseDailyLimitField,
   loadAppConfig,
+  loadAppGateAccessMode,
+  assertAccessNotBlocked,
 };
