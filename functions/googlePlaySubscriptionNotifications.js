@@ -629,7 +629,8 @@ async function applyGoogleSubscriptionUpdateToUser(
     subscriptionStatus: derived.status,
     subscriptionProductId: GOOGLE_PLAY_MONTHLY_PRODUCT_ID,
     subscriptionPlatform: "android",
-    lastSubscriptionSource: "google_play_rtdn",
+    lastSubscriptionSource:
+      options.subscriptionSource || "google_play_rtdn",
     lastSubscriptionCheckedAt: admin.FieldValue.serverTimestamp(),
     updatedAt: admin.FieldValue.serverTimestamp(),
     googlePlaySubscriptionState: derived.subscriptionState || "",
@@ -685,7 +686,7 @@ async function applyGoogleSubscriptionUpdateToUser(
     db,
     admin,
     uid,
-    source: "google_rtdn",
+    source: options.dualWriteSource || "google_rtdn",
     platform: "android",
     storeState,
     legacyUpdate: update,
@@ -1183,4 +1184,7 @@ module.exports = {
   resolveRevocationUserEntitlement,
   deriveGooglePlayEntitlement,
   parseFirestoreExpiryTime,
+  syncGooglePlaySubscriptionByPurchaseToken,
+  applyGoogleSubscriptionUpdateToUser,
+  tokenSuffix,
 };

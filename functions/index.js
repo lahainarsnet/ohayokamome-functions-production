@@ -19,6 +19,9 @@ const {
   createGooglePlayRtdnHandler,
 } = require("./googlePlaySubscriptionNotifications");
 const {
+  createGooglePlaySubscriptionProbeHandler,
+} = require("./googlePlaySubscriptionProbe");
+const {
   fetchAppStoreAllSubscriptionStatuses,
   pickLatestTransactionEntry,
   deriveSubscriptionState,
@@ -2462,6 +2465,20 @@ exports.handleGooglePlayRtdn = onMessagePublished(
     region: "us-central1",
   },
   createGooglePlayRtdnHandler({
+    getDb: admin.getDb,
+    admin,
+    logger,
+  }),
+);
+
+/* =========================================================
+ * Subscription: Google Play chat-session entitlement probe
+ *  - チャット中60秒確認の50秒救済用（Androidのみ・Flutterから呼ぶ）
+ *  - purchaseToken等はクライアントから受け取らない
+ * =======================================================*/
+exports.probeGooglePlaySubscriptionEntitlement = onCall(
+  { region: "us-central1", enforceAppCheck: true },
+  createGooglePlaySubscriptionProbeHandler({
     getDb: admin.getDb,
     admin,
     logger,
