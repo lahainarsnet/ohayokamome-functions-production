@@ -54,6 +54,10 @@ const {
   evaluateCrossPlatformPurchaseGuard,
 } = require("./accountAccessUsability");
 const {
+  computeEntitlementExpiryDeltaMs,
+  resolveRecipientSubscriptionWithExpiryLagRetry,
+} = require("./recipientSubscriptionGuardRetry");
+const {
   resolveAccountIdForUpsert,
   resolveGetUserInfoByAccountIdLookup,
 } = require("./accountIdGuard");
@@ -437,6 +441,7 @@ function logRecipientSubscriptionGuard({
   parsedExpiryISO,
   nowISO,
   deltaMs,
+  entitlementExpiryDeltaMs,
   statusAllowsAccess,
   expiryIsFuture,
   isSubscriptionUsable: subscriptionUsable,
@@ -458,6 +463,7 @@ function logRecipientSubscriptionGuard({
       `subscriptionStatus=${statusForLog} recipientPlatform=${platformForLog} ` +
       `rawExpiryType=${rawExpiryType} rawExpiryPreview=${rawExpiryPreview} parsePath=${parsePath} ` +
       `parsedExpiryISO=${parsedExpiryISO} nowISO=${nowISO} deltaMs=${deltaMs} ` +
+      `entitlementExpiryDeltaMs=${entitlementExpiryDeltaMs ?? "null"} ` +
       `statusAllowsAccess=${statusAllowsAccess} expiryIsFuture=${expiryIsFuture} ` +
       `subscriptionUsable=${subscriptionUsable} denyReason=${denyReason ?? "none"} action=${action}`,
   );
@@ -1176,15 +1182,58 @@ exports.sendMessageWithLimit = onCall(
     .collection("users")
     .doc(recipientId)
     .get();
-  const recipientData = recipientDoc.exists ? recipientDoc.data() || {} : {};
-  const subscriptionStatus = recipientData.subscriptionStatus;
+  let recipientData = recipientDoc.exists ? recipientDoc.data() || {} : {};
+  let subscriptionStatus = recipientData.subscriptionStatus;
   const subscriptionPlatform = recipientData.subscriptionPlatform;
   const rawExpiry = recipientData.subscriptionExpiryTime;
   const { expiry, parsePath } = parseSubscriptionExpiryTimeWithMeta(rawExpiry);
   const now = new Date();
-  const usability = describeAccountAccessUsability(recipientData, now, {
+  let usability = describeAccountAccessUsability(recipientData, now, {
     parseExpiryWithMeta: parseSubscriptionExpiryTimeWithMeta,
   });
+
+  if (!usability.subscriptionUsable) {
+    const retryResult = await resolveRecipientSubscriptionWithExpiryLagRetry({
+      recipientData,
+      usability,
+      subscriptionStatus,
+      now,
+      fetchRecipientData: async () => {
+        const retryDoc = await admin
+          .getDb()
+          .collection("users")
+          .doc(recipientId)
+          .get();
+        return retryDoc.exists ? retryDoc.data() || {} : {};
+      },
+      describeUsability: describeAccountAccessUsability,
+      parseExpiryWithMeta: parseSubscriptionExpiryTimeWithMeta,
+      log: (entry) => {
+        logger.info(
+          `[RecipientSubscriptionGuardRetry] recipientUidTail=${uidTailForLog(recipientId)} ` +
+            `event=${entry.event} retryCount=${entry.retryCount ?? 0} ` +
+            `entitlementExpiryDeltaMs=${entry.entitlementExpiryDeltaMs ?? "null"} ` +
+            (entry.maxRetries != null ? `maxRetries=${entry.maxRetries} ` : "") +
+            (entry.retryIntervalMs != null ? `retryIntervalMs=${entry.retryIntervalMs} ` : "") +
+            (entry.subscriptionUsable != null
+              ? `subscriptionUsable=${entry.subscriptionUsable} `
+              : "") +
+            (entry.errorType != null ? `errorType=${entry.errorType} ` : ""),
+        );
+      },
+    });
+    if (retryResult.retried) {
+      recipientData = retryResult.recipientData;
+      usability = retryResult.usability;
+      subscriptionStatus = recipientData.subscriptionStatus;
+    }
+  }
+
+  const finalEntitlementExpiryDeltaMs = computeEntitlementExpiryDeltaMs(
+    usability.entitlementExpiry,
+    new Date(),
+  );
+
   const parsedExpiryISO =
     expiry instanceof Date && !Number.isNaN(expiry.getTime())
       ? expiry.toISOString()
@@ -1208,6 +1257,7 @@ exports.sendMessageWithLimit = onCall(
     parsedExpiryISO,
     nowISO,
     deltaMs,
+    entitlementExpiryDeltaMs: finalEntitlementExpiryDeltaMs,
     statusAllowsAccess: usability.legacyStatusAllowsAccess,
     expiryIsFuture: usability.legacyExpiryIsFuture,
     isSubscriptionUsable: usability.subscriptionUsable,
@@ -1227,7 +1277,8 @@ exports.sendMessageWithLimit = onCall(
     logger.info(
       `[sendMessageWithLimit] subscriptionGuardBlocked senderUidTail=${uidTailForLog(senderId)} ` +
         `recipientUidTail=${uidTailForLog(recipientId)} guardType=RecipientSubscriptionGuard ` +
-        `returnedCode=${RECIPIENT_SUBSCRIPTION_UNAVAILABLE} action=blockSend`,
+        `returnedCode=${RECIPIENT_SUBSCRIPTION_UNAVAILABLE} action=blockSend ` +
+        `entitlementExpiryDeltaMs=${finalEntitlementExpiryDeltaMs ?? "null"}`,
     );
     return { success: false, code: RECIPIENT_SUBSCRIPTION_UNAVAILABLE };
   }
