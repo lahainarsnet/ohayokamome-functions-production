@@ -6,42 +6,6 @@ const {
 const GEMINI_GENERATE_CONTENT_BASE_URL =
   "https://generativelanguage.googleapis.com/v1beta/models";
 
-function buildGeminiTranscribeInstruction(language) {
-  if (language === "en") {
-    return [
-      "You are a transcription-only assistant.",
-      "Transcribe the attached audio exactly as spoken.",
-      "Do not summarize, rephrase, polish, or add words.",
-      "Do not add explanations, labels, or quotation marks.",
-      "Output only the transcript text on a single line.",
-    ].join("\n");
-  }
-  return [
-    "あなたは文字起こし専用のアシスタントです。",
-    "添付音声を、聞こえた通りにそのまま文字起こししてください。",
-    "要約、言い換え、敬語化、補完、説明文、引用符を付けないでください。",
-    "音声にない語句を追加しないでください。",
-    "出力は文字起こし本文のみを1行で返してください。",
-  ].join("\n");
-}
-
-function buildGeminiSafetyInstruction(language) {
-  if (language === "en") {
-    return [
-      "Process the attached audio according to the user's instructions.",
-      "Do not invent content that is not grounded in the audio.",
-      "Do not add explanations, labels, metadata, or quotation marks.",
-      "Return only the requested output text on a single line.",
-    ].join("\n");
-  }
-  return [
-    "添付音声を、ユーザーの指示に従って処理してください。",
-    "音声に根拠のない内容を創作しないでください。",
-    "説明文、ラベル、メタデータ、引用符を付けないでください。",
-    "要求された出力本文のみを1行で返してください。",
-  ].join("\n");
-}
-
 function normalizeGeminiUserPrompt(prompt) {
   if (typeof prompt !== "string") {
     return null;
@@ -50,18 +14,18 @@ function normalizeGeminiUserPrompt(prompt) {
   return trimmed === "" ? null : trimmed;
 }
 
-function resolveGeminiInstructionAndUserPrompt(language, prompt) {
-  const userPrompt = normalizeGeminiUserPrompt(prompt);
-  if (!userPrompt) {
+function resolveGeminiInstructionAndUserPrompt(_language, prompt) {
+  const instruction = normalizeGeminiUserPrompt(prompt);
+  if (!instruction) {
     return {
-      instruction: buildGeminiTranscribeInstruction(language),
+      instruction: null,
       userPrompt: null,
       promptForwarded: false,
     };
   }
   return {
-    instruction: buildGeminiSafetyInstruction(language),
-    userPrompt,
+    instruction,
+    userPrompt: null,
     promptForwarded: true,
   };
 }
@@ -151,7 +115,7 @@ function buildGeminiThinkingConfig() {
 }
 
 function buildGenerateContentBody({
-  instruction,
+  instruction = null,
   audioBase64,
   mimeType,
   userPrompt = null,
@@ -167,10 +131,8 @@ function buildGenerateContentBody({
       data: audioBase64,
     },
   });
-  return {
-    systemInstruction: {
-      parts: [{ text: instruction }],
-    },
+
+  const body = {
     contents: [
       {
         role: "user",
@@ -183,6 +145,15 @@ function buildGenerateContentBody({
       thinkingConfig: buildGeminiThinkingConfig(),
     },
   };
+
+  const normalizedInstruction = normalizeGeminiUserPrompt(instruction);
+  if (normalizedInstruction) {
+    body.systemInstruction = {
+      parts: [{ text: normalizedInstruction }],
+    };
+  }
+
+  return body;
 }
 
 function shouldRetryGeminiMime(httpStatus, responseJson) {
@@ -381,8 +352,6 @@ async function transcribeWithGemini({
 }
 
 module.exports = {
-  buildGeminiTranscribeInstruction,
-  buildGeminiSafetyInstruction,
   normalizeGeminiUserPrompt,
   resolveGeminiInstructionAndUserPrompt,
   buildGeminiThinkingConfig,

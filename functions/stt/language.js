@@ -2,6 +2,7 @@ const {
   STT_PROVIDER_OPENAI,
   STT_PROVIDER_GOOGLE,
   STT_PROVIDER_GEMINI,
+  STT_PROVIDER_GROQ,
 } = require("./constants");
 
 const STT_LANGUAGE_JA = "ja";
@@ -51,6 +52,9 @@ function resolveProviderLanguage(provider, language) {
   }
   if (provider === STT_PROVIDER_GEMINI) {
     return language === STT_LANGUAGE_EN ? STT_LANGUAGE_EN : STT_LANGUAGE_JA;
+  }
+  if (provider === STT_PROVIDER_GROQ) {
+    return toOpenAiLanguage(language);
   }
   return null;
 }

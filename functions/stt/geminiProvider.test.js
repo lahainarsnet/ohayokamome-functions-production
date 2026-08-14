@@ -1,7 +1,5 @@
 const assert = require("assert");
 const {
-  buildGeminiTranscribeInstruction,
-  buildGeminiSafetyInstruction,
   normalizeGeminiUserPrompt,
   resolveGeminiInstructionAndUserPrompt,
   resolveGeminiAudioMimeCandidates,
@@ -17,40 +15,30 @@ const {
   STT_PROVIDER_GEMINI,
 } = require("./constants");
 
+const FIRESTORE_CANONICAL_PROMPT =
+  "聞こえた内容をできるだけそのまま文字起こししてください。言い換えや補完はしないでください";
+
 function createFetchMock(handler) {
   return async (url, options) => handler(url, options);
 }
 
 async function runTests() {
-  const jaInstruction = buildGeminiTranscribeInstruction("ja");
-  assert.ok(jaInstruction.includes("文字起こし"));
-  assert.ok(jaInstruction.includes("そのまま"));
-
-  const enInstruction = buildGeminiTranscribeInstruction("en");
-  assert.ok(enInstruction.includes("Transcribe"));
-  assert.ok(enInstruction.includes("exactly"));
-
-  const jaSafety = buildGeminiSafetyInstruction("ja");
-  assert.ok(jaSafety.includes("ユーザーの指示"));
-  assert.ok(!jaSafety.includes("そのまま文字起こし"));
-
   assert.strictEqual(normalizeGeminiUserPrompt(undefined), null);
   assert.strictEqual(normalizeGeminiUserPrompt("   "), null);
   assert.strictEqual(normalizeGeminiUserPrompt("  hello  "), "hello");
 
   const noPromptPlan = resolveGeminiInstructionAndUserPrompt("ja", null);
+  assert.strictEqual(noPromptPlan.instruction, null);
   assert.strictEqual(noPromptPlan.userPrompt, null);
   assert.strictEqual(noPromptPlan.promptForwarded, false);
-  assert.ok(noPromptPlan.instruction.includes("そのまま"));
 
   const withPromptPlan = resolveGeminiInstructionAndUserPrompt(
     "ja",
-    "英語に翻訳して出力して",
+    FIRESTORE_CANONICAL_PROMPT,
   );
-  assert.strictEqual(withPromptPlan.userPrompt, "英語に翻訳して出力して");
+  assert.strictEqual(withPromptPlan.instruction, FIRESTORE_CANONICAL_PROMPT);
+  assert.strictEqual(withPromptPlan.userPrompt, null);
   assert.strictEqual(withPromptPlan.promptForwarded, true);
-  assert.ok(withPromptPlan.instruction.includes("ユーザーの指示"));
-  assert.ok(!withPromptPlan.instruction.includes("言い換え"));
 
   assert.deepStrictEqual(resolveGeminiAudioMimeCandidates("audio/mp4"), [
     "audio/mp4",
@@ -109,25 +97,32 @@ async function runTests() {
   assert.strictEqual(body.contents[0].parts.length, 1);
   assert.ok(body.contents[0].parts[0].inlineData);
 
-  const promptBody = buildGenerateContentBody({
-    instruction: "safety",
+  const noInstructionBody = buildGenerateContentBody({
     audioBase64: "abc",
     mimeType: "audio/mp4",
-    userPrompt: "英語に翻訳して出力して",
   });
-  assert.strictEqual(promptBody.contents[0].parts.length, 2);
+  assert.strictEqual(noInstructionBody.systemInstruction, undefined);
+  assert.strictEqual(noInstructionBody.contents[0].parts.length, 1);
+  assert.ok(noInstructionBody.contents[0].parts[0].inlineData);
+
+  const promptBody = buildGenerateContentBody({
+    instruction: FIRESTORE_CANONICAL_PROMPT,
+    audioBase64: "abc",
+    mimeType: "audio/mp4",
+  });
   assert.strictEqual(
-    promptBody.contents[0].parts[0].text,
-    "英語に翻訳して出力して",
+    promptBody.systemInstruction.parts[0].text,
+    FIRESTORE_CANONICAL_PROMPT,
   );
-  assert.strictEqual(promptBody.contents[0].parts[1].inlineData.mimeType, "audio/mp4");
+  assert.strictEqual(promptBody.contents[0].parts.length, 1);
+  assert.strictEqual(promptBody.contents[0].parts[0].inlineData.mimeType, "audio/mp4");
 
   const emptyPromptBody = buildGenerateContentBody({
-    instruction: "test",
+    instruction: "   ",
     audioBase64: "abc",
     mimeType: "audio/mp4",
-    userPrompt: "   ",
   });
+  assert.strictEqual(emptyPromptBody.systemInstruction, undefined);
   assert.strictEqual(emptyPromptBody.contents[0].parts.length, 1);
   assert.ok(emptyPromptBody.contents[0].parts[0].inlineData);
 
@@ -178,7 +173,7 @@ async function runTests() {
     "minimal",
   );
   assert.strictEqual(capturedBody.contents[0].parts.length, 1);
-  assert.ok(capturedBody.systemInstruction.parts[0].text.includes("そのまま"));
+  assert.strictEqual(capturedBody.systemInstruction, undefined);
   assert.strictEqual(successResult.promptForwarded, false);
 
   let promptCapturedBody;
@@ -202,7 +197,7 @@ async function runTests() {
     audioBuffer,
     mimeType: "audio/mp4",
     language: "ja",
-    prompt: "英語に翻訳して出力して",
+    prompt: FIRESTORE_CANONICAL_PROMPT,
     apiKey: "test-key",
     receivedBytes: audioBuffer.length,
     fetchImpl: promptFetch,
@@ -210,17 +205,12 @@ async function runTests() {
   assert.strictEqual(promptResult.ok, true);
   assert.strictEqual(promptResult.text, "Good morning");
   assert.strictEqual(promptResult.promptForwarded, true);
-  assert.ok(
-    promptCapturedBody.systemInstruction.parts[0].text.includes("ユーザーの指示"),
-  );
-  assert.ok(
-    !promptCapturedBody.systemInstruction.parts[0].text.includes("そのまま"),
-  );
   assert.strictEqual(
-    promptCapturedBody.contents[0].parts[0].text,
-    "英語に翻訳して出力して",
+    promptCapturedBody.systemInstruction.parts[0].text,
+    FIRESTORE_CANONICAL_PROMPT,
   );
-  assert.ok(promptCapturedBody.contents[0].parts[1].inlineData);
+  assert.strictEqual(promptCapturedBody.contents[0].parts.length, 1);
+  assert.ok(promptCapturedBody.contents[0].parts[0].inlineData);
 
   const blankPromptFetch = createFetchMock(async () => ({
     ok: true,
@@ -251,6 +241,7 @@ async function runTests() {
   });
   assert.strictEqual(blankPromptResult.ok, true);
   assert.strictEqual(blankPromptResult.promptForwarded, false);
+  assert.strictEqual(blankCapturedBody.systemInstruction, undefined);
   assert.strictEqual(blankCapturedBody.contents[0].parts.length, 1);
   assert.ok(blankCapturedBody.contents[0].parts[0].inlineData);
 

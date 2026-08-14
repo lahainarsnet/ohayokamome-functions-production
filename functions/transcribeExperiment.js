@@ -1,5 +1,5 @@
 /**
- * Phase 3: Base64 音声 → STT provider（OpenAI / Google / Gemini）→ text 返却。
+ * Phase 3: Base64 音声 → STT provider（OpenAI / Google / Gemini / Groq）→ text 返却。
  *
  * - 音声内容や変換結果は保存しない。
  *
@@ -24,6 +24,7 @@ const {
   STT_PROVIDER_OPENAI,
   STT_PROVIDER_GOOGLE,
   STT_PROVIDER_GEMINI,
+  STT_PROVIDER_GROQ,
   GOOGLE_STT_DEFAULT_MODEL,
   GOOGLE_STT_DEFAULT_LOCATION,
 } = require("./stt/constants");
@@ -32,9 +33,11 @@ const { resolveSttLanguage } = require("./stt/language");
 const { transcribeWithOpenAI } = require("./stt/openaiProvider");
 const { transcribeWithGoogle } = require("./stt/googleProvider");
 const { transcribeWithGemini } = require("./stt/geminiProvider");
+const { transcribeWithGroq } = require("./stt/groqProvider");
 
 const OPENAI_API_KEY = defineSecret("OPENAI_API_KEY");
 const GEMINI_API_KEY = defineSecret("GEMINI_API_KEY");
+const GROQ_API_KEY = defineSecret("GROQ_API_KEY");
 const STT_PROVIDER = defineString("STT_PROVIDER", {
   default: STT_PROVIDER_OPENAI,
 });
@@ -409,6 +412,20 @@ async function attemptQuotaRelease(uid, limit, quota, resultCode, logFields = {}
   }
 }
 
+function buildProviderTraceExtras(providerResult) {
+  const extras = {};
+  if (providerResult?.errorCategory) {
+    extras.errorCategory = providerResult.errorCategory;
+  }
+  if (providerResult?.promptTruncated === true) {
+    extras.groqPromptTruncated = true;
+  }
+  if (typeof providerResult?.promptEstimatedTokens === "number") {
+    extras.groqPromptEstimatedTokens = providerResult.promptEstimatedTokens;
+  }
+  return extras;
+}
+
 async function invokeSttProvider({
   provider,
   audioBuffer,
@@ -420,6 +437,7 @@ async function invokeSttProvider({
   openaiOptions = {},
   googleOptions = {},
   geminiOptions = {},
+  groqOptions = {},
 }) {
   if (provider === STT_PROVIDER_OPENAI) {
     return transcribeWithOpenAI({
@@ -458,6 +476,19 @@ async function invokeSttProvider({
       logger,
     });
   }
+  if (provider === STT_PROVIDER_GROQ) {
+    return transcribeWithGroq({
+      audioBuffer,
+      mimeType,
+      language,
+      prompt,
+      apiKey,
+      receivedBytes,
+      fetchImpl: groqOptions.fetchImpl,
+      timeoutMs: groqOptions.timeoutMs,
+      logger,
+    });
+  }
   return {
     ok: false,
     code: "STT_PROVIDER_INVALID",
@@ -484,7 +515,7 @@ async function runTranscribeAdminGateAfterAuth(request, options = {}) {
 
 exports.transcribeExperiment = onCall(
   {
-    secrets: [OPENAI_API_KEY, GEMINI_API_KEY],
+    secrets: [OPENAI_API_KEY, GEMINI_API_KEY, GROQ_API_KEY],
     enforceAppCheck: true,
     maxInstances: 30,
     concurrency: 10,
@@ -835,6 +866,52 @@ exports.transcribeExperiment = onCall(
         return { ok: false, code: "SECRET_EMPTY" };
       }
     }
+    if (provider === STT_PROVIDER_GROQ) {
+      try {
+        apiKey = GROQ_API_KEY.value();
+      } catch (_) {
+        logger.warn("transcribeExperiment: SECRET_READ_FAILED", {
+          receivedBytes,
+          provider,
+          uidSuffix: uidSuffix(uid),
+        });
+        logSttEvent({
+          event: "transcribe_failed",
+          provider,
+          model: null,
+          receivedBytes,
+          apiLatencyMs: null,
+          totalLatencyMs: Date.now() - startedAt,
+          success: false,
+          errorCode: "SECRET_READ_FAILED",
+          textLength: null,
+          uidSuffix: uidSuffix(uid),
+          sttProviderSetting: provider,
+        });
+        return { ok: false, code: "SECRET_READ_FAILED" };
+      }
+      if (typeof apiKey !== "string" || apiKey.length === 0) {
+        logger.warn("transcribeExperiment: SECRET_EMPTY", {
+          receivedBytes,
+          provider,
+          uidSuffix: uidSuffix(uid),
+        });
+        logSttEvent({
+          event: "transcribe_failed",
+          provider,
+          model: null,
+          receivedBytes,
+          apiLatencyMs: null,
+          totalLatencyMs: Date.now() - startedAt,
+          success: false,
+          errorCode: "SECRET_EMPTY",
+          textLength: null,
+          uidSuffix: uidSuffix(uid),
+          sttProviderSetting: provider,
+        });
+        return { ok: false, code: "SECRET_EMPTY" };
+      }
+    }
 
     let dailyTranscribeLimit = DEFAULT_DAILY_TRANSCRIBE_LIMIT;
     let dailyTranscribeLimitUsedDefault = true;
@@ -1002,6 +1079,7 @@ exports.transcribeExperiment = onCall(
         quotaReleaseFailed: releaseResult.quotaReleaseFailed === true,
         usedCount: releaseResult.usedCount ?? quota.usedCount,
         remainingCount: releaseResult.remainingCount ?? quota.remainingCount,
+        ...buildProviderTraceExtras(providerResult),
       });
       return { ok: false, code: providerResult.code };
     }
@@ -1066,6 +1144,7 @@ exports.transcribeExperiment = onCall(
       quotaReleaseFailed: false,
       usedCount: quota.usedCount,
       remainingCount: quota.remainingCount,
+      ...buildProviderTraceExtras(providerResult),
     });
 
     logger.info("transcribeExperiment: callable result", {

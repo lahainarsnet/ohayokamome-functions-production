@@ -5,7 +5,9 @@ const {
   STT_PROVIDER_OPENAI,
   STT_PROVIDER_GOOGLE,
   STT_PROVIDER_GEMINI,
+  STT_PROVIDER_GROQ,
   GEMINI_TRANSCRIBE_MODEL,
+  GROQ_TRANSCRIBE_MODEL,
 } = require("./stt/constants");
 const {
   resolveSttProvider,
@@ -150,6 +152,10 @@ async function runTests() {
   const geminiProvider = resolveSttProvider("gemini");
   assert.strictEqual(geminiProvider.ok, true);
   assert.strictEqual(geminiProvider.provider, STT_PROVIDER_GEMINI);
+
+  const groqProvider = resolveSttProvider("groq");
+  assert.strictEqual(groqProvider.ok, true);
+  assert.strictEqual(groqProvider.provider, STT_PROVIDER_GROQ);
 
   const typoProvider = resolveSttProvider("openai2");
   assert.strictEqual(typoProvider.ok, false);
@@ -357,13 +363,80 @@ async function runTests() {
   assert.strictEqual(geminiPromptInvoke.text, "Hello");
   assert.strictEqual(geminiPromptInvoke.promptForwarded, true);
   assert.strictEqual(
-    geminiPromptBody.contents[0].parts[0].text,
+    geminiPromptBody.systemInstruction.parts[0].text,
     "英語に翻訳して出力して",
   );
-  assert.ok(geminiPromptBody.contents[0].parts[1].inlineData);
-  assert.ok(
-    geminiPromptBody.systemInstruction.parts[0].text.includes("ユーザーの指示"),
-  );
+  assert.strictEqual(geminiPromptBody.contents[0].parts.length, 1);
+  assert.ok(geminiPromptBody.contents[0].parts[0].inlineData);
+
+  let openaiFetchCalled = false;
+  const openaiInvoke = await invokeSttProvider({
+    provider: STT_PROVIDER_OPENAI,
+    audioBuffer: Buffer.from("audio"),
+    mimeType: "audio/mp4",
+    language: "ja",
+    receivedBytes: 5,
+    apiKey: "openai-key",
+    openaiOptions: {
+      fetchImpl: async () => {
+        openaiFetchCalled = true;
+        return {
+          ok: true,
+          status: 200,
+          text: async () => JSON.stringify({ text: "openai text" }),
+        };
+      },
+    },
+  });
+  assert.strictEqual(openaiFetchCalled, true);
+  assert.strictEqual(openaiInvoke.ok, true);
+  assert.strictEqual(openaiInvoke.text, "openai text");
+  assert.strictEqual(openaiInvoke.provider, STT_PROVIDER_OPENAI);
+
+  let groqFetchCalled = false;
+  let groqCapturedPrompt = null;
+  const groqInvoke = await invokeSttProvider({
+    provider: STT_PROVIDER_GROQ,
+    audioBuffer: Buffer.from("audio"),
+    mimeType: "audio/mp4",
+    language: "ja",
+    prompt:
+      "聞こえた内容をできるだけそのまま文字起こししてください。言い換えや補完はしないでください",
+    receivedBytes: 5,
+    apiKey: "groq-key",
+    groqOptions: {
+      fetchImpl: async (_url, options) => {
+        groqFetchCalled = true;
+        if (options.body && typeof options.body.entries === "function") {
+          for (const [key, value] of options.body.entries()) {
+            if (key === "prompt") {
+              groqCapturedPrompt = value;
+            }
+          }
+        }
+        return {
+          ok: true,
+          status: 200,
+          text: async () => JSON.stringify({ text: "groq text" }),
+        };
+      },
+    },
+  });
+  assert.strictEqual(groqFetchCalled, true);
+  assert.strictEqual(groqInvoke.ok, true);
+  assert.strictEqual(groqInvoke.text, "groq text");
+  assert.strictEqual(groqInvoke.provider, STT_PROVIDER_GROQ);
+  assert.strictEqual(groqInvoke.model, GROQ_TRANSCRIBE_MODEL);
+  assert.ok(typeof groqCapturedPrompt === "string");
+  assert.ok(typeof groqCapturedPrompt === "string");
+  assert.ok(groqCapturedPrompt.includes("そのまま"));
+  assert.ok(groqCapturedPrompt.includes("言い換え"));
+  assert.ok(groqCapturedPrompt.includes("補完"));
+  assert.ok(!groqCapturedPrompt.includes("日本語文字起こし"));
+  assert.deepStrictEqual(mapProviderResultToClient(groqInvoke), {
+    ok: true,
+    text: "groq text",
+  });
 
   const invalidInvoke = await invokeSttProvider({
     provider: "unknown",
@@ -545,6 +618,27 @@ async function runTests() {
             error.code = 4;
             throw error;
           },
+        }),
+      },
+    },
+  });
+
+  await runQuotaRollbackIntegrationTest({
+    provider: STT_PROVIDER_GROQ,
+    failCode: "GROQ_RATE_LIMIT",
+    invokeArgs: {
+      provider: STT_PROVIDER_GROQ,
+      audioBuffer: Buffer.from("audio"),
+      mimeType: "audio/mp4",
+      language: "ja",
+      receivedBytes: 5,
+      apiKey: "groq-key",
+      groqOptions: {
+        fetchImpl: async () => ({
+          ok: false,
+          status: 429,
+          text: async () =>
+            JSON.stringify({ error: { type: "rate_limit_exceeded", code: "rate_limit" } }),
         }),
       },
     },

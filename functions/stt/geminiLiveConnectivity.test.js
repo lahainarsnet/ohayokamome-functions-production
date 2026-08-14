@@ -11,9 +11,11 @@ const {
 } = require("./constants");
 const {
   buildGenerateContentBody,
-  buildGeminiTranscribeInstruction,
   transcribeWithGemini,
 } = require("./geminiProvider");
+
+const FIRESTORE_CANONICAL_PROMPT =
+  "聞こえた内容をできるだけそのまま文字起こししてください。言い換えや補完はしないでください";
 
 function loadGeminiApiKey() {
   if (process.env.GEMINI_API_KEY && process.env.GEMINI_API_KEY.trim() !== "") {
@@ -71,7 +73,7 @@ async function runTests() {
   );
 
   const providerBody = buildGenerateContentBody({
-    instruction: buildGeminiTranscribeInstruction("ja"),
+    instruction: FIRESTORE_CANONICAL_PROMPT,
     audioBase64: Buffer.from("fake-audio").toString("base64"),
     mimeType: "audio/mp4",
   });
