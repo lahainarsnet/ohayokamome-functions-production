@@ -22,6 +22,9 @@ const {
   createGooglePlaySubscriptionProbeHandler,
 } = require("./googlePlaySubscriptionProbe");
 const {
+  createRegisterDeviceUsageHandler,
+} = require("./registerDeviceUsage");
+const {
   fetchAppStoreAllSubscriptionStatuses,
   pickLatestTransactionEntry,
   deriveSubscriptionState,
@@ -2483,6 +2486,14 @@ exports.probeGooglePlaySubscriptionEntitlement = onCall(
     admin,
     logger,
   }),
+);
+
+/* =========================================================
+ * Device usage registry (admin analytics; record-only)
+ * =======================================================*/
+exports.registerDeviceUsage = onCall(
+  { region: "us-central1", enforceAppCheck: true },
+  createRegisterDeviceUsageHandler({ admin, logger }),
 );
 
 exports.transcribeExperiment = transcribeExperiment;
