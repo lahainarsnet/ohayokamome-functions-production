@@ -1,5 +1,10 @@
 const crypto = require("node:crypto");
 const { HttpsError } = require("firebase-functions/v2/https");
+const {
+  describeAccountAccessUsability,
+  normalizeSubscriptionPlatform,
+} = require("./accountAccessUsability");
+const { isStoreEntitlementUsable } = require("./subscriptionEntitlement");
 
 const SUBSCRIPTION_ALREADY_LINKED_CODE = "SUBSCRIPTION_ALREADY_LINKED";
 const SUBSCRIPTION_TOKEN_MISMATCH_CODE = "SUBSCRIPTION_TOKEN_MISMATCH";
@@ -53,6 +58,168 @@ function buildAndroidOwnershipId(purchaseToken) {
     );
   }
   return `android_${hashIdentifier(normalized)}`;
+}
+
+function isSubscriptionOwnerCurrentlyUsable(userData, platform, now = new Date()) {
+  const normalizedPlatform = normalizeSubscriptionPlatform(platform);
+  if (normalizedPlatform !== "ios" && normalizedPlatform !== "android") {
+    return {
+      ownerCurrentlyUsable: false,
+      decisionSource: "unsupported_platform",
+      reason: "unsupported_platform",
+    };
+  }
+
+  const storeState = userData?.subscriptions?.[normalizedPlatform];
+  const storeResult = isStoreEntitlementUsable(storeState, now);
+  if (storeResult.usable) {
+    return {
+      ownerCurrentlyUsable: true,
+      decisionSource: "store",
+      reason: storeResult.reason,
+    };
+  }
+
+  const access = describeAccountAccessUsability(userData, now);
+  if (access.subscriptionUsable) {
+    const entitlementSource = normalizeSubscriptionPlatform(
+      userData?.entitlementSource
+    );
+    const legacyPlatform = normalizeSubscriptionPlatform(
+      userData?.subscriptionPlatform
+    );
+
+    if (access.decisionSource === "entitlement") {
+      if (
+        entitlementSource === normalizedPlatform ||
+        entitlementSource === "both"
+      ) {
+        return {
+          ownerCurrentlyUsable: true,
+          decisionSource: "entitlement",
+          reason: null,
+        };
+      }
+      return {
+        ownerCurrentlyUsable: false,
+        decisionSource: "entitlement",
+        reason: "active_other_platform_only",
+      };
+    }
+
+    if (
+      access.decisionSource === "legacyFallback" &&
+      legacyPlatform === normalizedPlatform
+    ) {
+      return {
+        ownerCurrentlyUsable: true,
+        decisionSource: "legacyFallback",
+        reason: null,
+      };
+    }
+  }
+
+  return {
+    ownerCurrentlyUsable: false,
+    decisionSource: access.decisionSource,
+    reason: access.denyReason || storeResult.reason || "inactive_owner",
+  };
+}
+
+async function loadOwnerUserData(db, ownerUid) {
+  const snap = await db.collection("users").doc(ownerUid).get();
+  if (!snap.exists) {
+    return null;
+  }
+  return snap.data() || null;
+}
+
+async function evaluateOwnerCandidates({
+  db,
+  platform,
+  ownerUids,
+  log,
+  traceId,
+}) {
+  const activeOwners = [];
+  const inactiveOwners = [];
+
+  for (const ownerUid of ownerUids) {
+    let ownerData = null;
+    try {
+      ownerData = await loadOwnerUserData(db, ownerUid);
+    } catch (error) {
+      if (typeof log === "function") {
+        log.warn("subscription_ownership.owner_eval.load_failed", {
+          billingTraceId: traceId || null,
+          platform,
+          ownerUidSuffix: identifierSuffix(ownerUid),
+          message: error?.message || null,
+          decision: "reject_active_owner",
+        });
+      }
+      activeOwners.push({
+        uid: ownerUid,
+        ownerCurrentlyUsable: true,
+        decisionSource: "load_failed",
+        reason: "owner_load_failed",
+      });
+      continue;
+    }
+
+    if (ownerData == null) {
+      inactiveOwners.push({
+        uid: ownerUid,
+        ownerCurrentlyUsable: false,
+        decisionSource: "missing_owner_doc",
+        reason: "owner_doc_missing",
+      });
+      if (typeof log === "function") {
+        log.info("subscription_ownership.ownershipCandidateFound", {
+          billingTraceId: traceId || null,
+          platform,
+          ownerUidSuffix: identifierSuffix(ownerUid),
+          ownerCurrentlyUsable: false,
+          decision: "allow_inactive_history",
+          decisionSource: "missing_owner_doc",
+        });
+      }
+      continue;
+    }
+
+    const usability = isSubscriptionOwnerCurrentlyUsable(
+      ownerData,
+      platform,
+      new Date()
+    );
+    const candidate = {
+      uid: ownerUid,
+      ownerCurrentlyUsable: usability.ownerCurrentlyUsable,
+      decisionSource: usability.decisionSource,
+      reason: usability.reason,
+    };
+    if (usability.ownerCurrentlyUsable) {
+      activeOwners.push(candidate);
+    } else {
+      inactiveOwners.push(candidate);
+    }
+
+    if (typeof log === "function") {
+      log.info("subscription_ownership.ownershipCandidateFound", {
+        billingTraceId: traceId || null,
+        platform,
+        ownerUidSuffix: identifierSuffix(ownerUid),
+        ownerCurrentlyUsable: usability.ownerCurrentlyUsable,
+        decision: usability.ownerCurrentlyUsable
+          ? "reject_active_owner"
+          : "allow_inactive_history",
+        decisionSource: usability.decisionSource,
+        reason: usability.reason,
+      });
+    }
+  }
+
+  return { activeOwners, inactiveOwners };
 }
 
 async function queryOtherOwnerUids(db, { uid, field, op, value, match }) {
@@ -171,47 +338,72 @@ async function claimOwnershipDocument(
       if (linked.snap.exists) {
         const linkedOwnerUid = String(linked.snap.get("ownerUid") || "").trim();
         if (linkedOwnerUid && linkedOwnerUid !== uid) {
-          throwSubscriptionAlreadyLinked({
-            platform,
-            ownerUid: linkedOwnerUid,
-            ownershipId: linkedId,
-            log,
-            traceId,
-            rejectReason: "linked_ownership_conflict",
-          });
-        }
-        if (linkedOwnerUid === uid) {
-          tx.set(
-            ref,
-            {
-              ownerUid: uid,
-              platform,
-              status: "active",
-              claimedAt: now,
-              updatedAt: now,
-              linkedFromOwnershipId: linkedId,
-              ...ownershipFields,
-            },
-            { merge: true }
-          );
-          tx.set(
-            linked.ref,
-            {
-              updatedAt: now,
-              latestOwnershipId: ownershipId,
-            },
-            { merge: true }
-          );
+          const linkedOwnerRef = db.collection("users").doc(linkedOwnerUid);
+          const linkedOwnerSnap = await tx.get(linkedOwnerRef);
+          const linkedOwnerUsability = linkedOwnerSnap.exists
+            ? isSubscriptionOwnerCurrentlyUsable(
+                linkedOwnerSnap.data() || {},
+                platform,
+                new Date()
+              )
+            : {
+                ownerCurrentlyUsable: false,
+                decisionSource: "missing_owner_doc",
+              };
           if (typeof log === "function") {
-            log.info("Subscription ownership claimed via linked token.", {
+            log.info("subscription_ownership.ownershipCandidateFound", {
+              billingTraceId: traceId || null,
               platform,
-              requestUidSuffix: identifierSuffix(uid),
-              ownershipIdSuffix: identifierSuffix(ownershipId),
-              linkedOwnershipIdSuffix: identifierSuffix(linkedId),
+              ownerUidSuffix: identifierSuffix(linkedOwnerUid),
+              ownerCurrentlyUsable: linkedOwnerUsability.ownerCurrentlyUsable,
+              decision: linkedOwnerUsability.ownerCurrentlyUsable
+                ? "reject_active_owner"
+                : "allow_inactive_history",
+              decisionSource: linkedOwnerUsability.decisionSource,
+              context: "linked_ownership_conflict",
             });
           }
-          return;
+          if (linkedOwnerUsability.ownerCurrentlyUsable) {
+            throwSubscriptionAlreadyLinked({
+              platform,
+              ownerUid: linkedOwnerUid,
+              ownershipId: linkedId,
+              log,
+              traceId,
+              rejectReason: "linked_ownership_conflict",
+            });
+          }
         }
+        tx.set(
+          ref,
+          {
+            ownerUid: uid,
+            platform,
+            status: "active",
+            claimedAt: now,
+            updatedAt: now,
+            linkedFromOwnershipId: linkedId,
+            ...ownershipFields,
+          },
+          { merge: true }
+        );
+        tx.set(
+          linked.ref,
+          {
+            updatedAt: now,
+            latestOwnershipId: ownershipId,
+          },
+          { merge: true }
+        );
+        if (typeof log === "function") {
+          log.info("Subscription ownership claimed via linked token.", {
+            platform,
+            requestUidSuffix: identifierSuffix(uid),
+            ownershipIdSuffix: identifierSuffix(ownershipId),
+            linkedOwnershipIdSuffix: identifierSuffix(linkedId),
+          });
+        }
+        return;
       }
     }
 
@@ -257,14 +449,60 @@ async function claimOwnershipDocument(
       return;
     }
 
-    throwSubscriptionAlreadyLinked({
-      platform,
-      ownerUid: existingOwnerUid,
-      ownershipId,
-      log,
-      traceId,
-      rejectReason: "existing_owner_conflict",
-    });
+    const existingOwnerRef = db.collection("users").doc(existingOwnerUid);
+    const existingOwnerSnap = await tx.get(existingOwnerRef);
+    const existingOwnerUsability = existingOwnerSnap.exists
+      ? isSubscriptionOwnerCurrentlyUsable(
+          existingOwnerSnap.data() || {},
+          platform,
+          new Date()
+        )
+      : { ownerCurrentlyUsable: false, decisionSource: "missing_owner_doc" };
+    if (typeof log === "function") {
+      log.info("subscription_ownership.ownershipCandidateFound", {
+        billingTraceId: traceId || null,
+        platform,
+        ownerUidSuffix: identifierSuffix(existingOwnerUid),
+        ownerCurrentlyUsable: existingOwnerUsability.ownerCurrentlyUsable,
+        decision: existingOwnerUsability.ownerCurrentlyUsable
+          ? "reject_active_owner"
+          : "allow_inactive_history",
+        decisionSource: existingOwnerUsability.decisionSource,
+        context: "existing_owner_conflict",
+      });
+    }
+    if (existingOwnerUsability.ownerCurrentlyUsable) {
+      throwSubscriptionAlreadyLinked({
+        platform,
+        ownerUid: existingOwnerUid,
+        ownershipId,
+        log,
+        traceId,
+        rejectReason: "existing_owner_conflict",
+      });
+    }
+
+    tx.set(
+      ref,
+      {
+        ownerUid: uid,
+        platform,
+        status: "active",
+        previousOwnerUid: existingOwnerUid,
+        transferredAt: now,
+        updatedAt: now,
+        ...ownershipFields,
+      },
+      { merge: true }
+    );
+    if (typeof log === "function") {
+      log.info("Subscription ownership transferred from inactive owner.", {
+        platform,
+        requestUidSuffix: identifierSuffix(uid),
+        previousOwnerUidSuffix: identifierSuffix(existingOwnerUid),
+        ownershipIdSuffix: identifierSuffix(ownershipId),
+      });
+    }
   });
 }
 
@@ -352,17 +590,43 @@ async function assertSubscriptionNotLinkedToOtherUser(
   }
 
   const ownerUidList = [...ownerUids];
+  const { activeOwners, inactiveOwners } = await evaluateOwnerCandidates({
+    db,
+    platform,
+    ownerUids: ownerUidList,
+    log,
+    traceId,
+  });
+
+  if (activeOwners.length === 0) {
+    if (typeof log === "function") {
+      log.info("subscription_ownership.users_search.allow", {
+        billingTraceId: traceId || null,
+        platform,
+        requestUidSuffix: identifierSuffix(uid),
+        hitCount: ownerUidList.length,
+        inactiveOwnerCount: inactiveOwners.length,
+        matchCount: ownerMatches.length,
+        matchFields: ownerMatches.map((match) => match.match),
+        decision: "allow_inactive_history",
+      });
+    }
+    return;
+  }
+
   if (typeof log === "function") {
     log.warn("subscription_ownership.users_search.reject", {
       billingTraceId: traceId || null,
       platform,
       requestUidSuffix: identifierSuffix(uid),
-      ownerUidCount: ownerUidList.length,
-      ownerUidTails: ownerUidList.map((item) => identifierSuffix(item)),
+      ownerUidCount: activeOwners.length,
+      ownerUidTails: activeOwners.map((item) => identifierSuffix(item.uid)),
+      inactiveOwnerCount: inactiveOwners.length,
       matchCount: ownerMatches.length,
       matchFields: ownerMatches.map((match) => match.match),
       rejectCode: SUBSCRIPTION_ALREADY_LINKED_CODE,
-      rejectReason: "users_collection_conflict",
+      rejectReason: "users_collection_active_owner",
+      decision: "reject_active_owner",
     });
   }
 
@@ -372,7 +636,7 @@ async function assertSubscriptionNotLinkedToOtherUser(
     {
       code: SUBSCRIPTION_ALREADY_LINKED_CODE,
       platform,
-      ownerUidCount: ownerUidList.length,
+      ownerUidCount: activeOwners.length,
     }
   );
 }
@@ -601,4 +865,6 @@ module.exports = {
   claimIosSubscriptionOwnership,
   claimAndroidSubscriptionOwnership,
   claimOwnershipDocument,
+  isSubscriptionOwnerCurrentlyUsable,
+  evaluateOwnerCandidates,
 };

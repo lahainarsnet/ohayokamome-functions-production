@@ -6,14 +6,18 @@ const {
   buildIosOwnershipId,
   buildAndroidOwnershipId,
   normalizeUuid,
+  isSubscriptionOwnerCurrentlyUsable,
   SUBSCRIPTION_ALREADY_LINKED_CODE,
   SUBSCRIPTION_TOKEN_MISMATCH_CODE,
 } = require("./subscriptionOwnership");
 
-function createMockDb(docsByQuery, ownershipDocs = {}) {
+const futureExpiry = new Date(Date.now() + 60 * 60 * 1000).toISOString();
+const pastExpiry = new Date(Date.now() - 60 * 60 * 1000).toISOString();
+
+function createMockDb(docsByQuery, ownershipDocs = {}, userDocs = {}) {
   return {
     collection(name) {
-      if (name !== "subscription_ownership") {
+      if (name === "users") {
         return {
           where(field, op, value) {
             const key = `${field}|${op}|${value}`;
@@ -34,17 +38,25 @@ function createMockDb(docsByQuery, ownershipDocs = {}) {
           },
           doc(uid) {
             return {
+              id: uid,
               async get() {
+                const data = userDocs[uid];
                 return {
-                  exists: false,
-                  get() {
-                    return "";
+                  exists: data != null,
+                  data: () => data,
+                  get(field) {
+                    return data ? data[field] : undefined;
                   },
+                  id: uid,
                 };
               },
             };
           },
         };
+      }
+
+      if (name !== "subscription_ownership") {
+        throw new Error(`Unexpected collection: ${name}`);
       }
 
       return {
@@ -56,6 +68,16 @@ function createMockDb(docsByQuery, ownershipDocs = {}) {
     async runTransaction(callback) {
       const tx = {
         async get(ref) {
+          if (Object.prototype.hasOwnProperty.call(userDocs, ref.id)) {
+            const data = userDocs[ref.id];
+            return {
+              exists: data != null,
+              data: () => data,
+              get(field) {
+                return data ? data[field] : undefined;
+              },
+            };
+          }
           const existing = ownershipDocs[ref.id];
           return {
             exists: Boolean(existing),
@@ -84,6 +106,74 @@ const admin = {
   },
 };
 
+function activeIosUser(overrides = {}) {
+  return {
+    entitlementUsable: true,
+    entitlementExpiryTime: futureExpiry,
+    entitlementSource: "ios",
+    subscriptions: {
+      ios: {
+        status: "active",
+        expiryTime: futureExpiry,
+        source: "app_store_verify",
+      },
+    },
+    appStoreOriginalTransactionId: "2000001194540581",
+    ...overrides,
+  };
+}
+
+function expiredIosUser(overrides = {}) {
+  return {
+    entitlementUsable: false,
+    entitlementExpiryTime: pastExpiry,
+    entitlementSource: "none",
+    subscriptions: {
+      ios: {
+        status: "expired",
+        expiryTime: pastExpiry,
+        source: "app_store_verify",
+      },
+    },
+    appStoreOriginalTransactionId: "2000001194540581",
+    ...overrides,
+  };
+}
+
+function activeAndroidUser(overrides = {}) {
+  return {
+    entitlementUsable: true,
+    entitlementExpiryTime: futureExpiry,
+    entitlementSource: "android",
+    subscriptions: {
+      android: {
+        status: "active",
+        expiryTime: futureExpiry,
+        source: "google_play_verify",
+      },
+    },
+    activePurchaseTokens: ["android-token-1"],
+    ...overrides,
+  };
+}
+
+function expiredAndroidUser(overrides = {}) {
+  return {
+    entitlementUsable: false,
+    entitlementExpiryTime: pastExpiry,
+    entitlementSource: "none",
+    subscriptions: {
+      android: {
+        status: "expired",
+        expiryTime: pastExpiry,
+        source: "google_play_verify",
+      },
+    },
+    activePurchaseTokens: ["android-token-1"],
+    ...overrides,
+  };
+}
+
 async function run() {
   const dbUnlinked = createMockDb({});
   await assertSubscriptionNotLinkedToOtherUser(dbUnlinked, {
@@ -93,25 +183,203 @@ async function run() {
       originalTransactionId: "2000001194540581",
       transactionId: "2000001203730221",
     },
-    log: { warn() {} },
+    log: { info() {}, warn() {} },
   });
 
-  const dbOther = createMockDb({
-    "appStoreOriginalTransactionId|==|2000001194540581": [{ id: "uid-b" }],
-  });
+  const dbActiveOther = createMockDb(
+    {
+      "appStoreOriginalTransactionId|==|2000001194540581": [{ id: "uid-b" }],
+    },
+    {},
+    {
+      "uid-b": activeIosUser(),
+    }
+  );
   await assert.rejects(
     () =>
-      assertSubscriptionNotLinkedToOtherUser(dbOther, {
+      assertSubscriptionNotLinkedToOtherUser(dbActiveOther, {
         uid: "uid-a",
         platform: "ios",
         identifiers: {
           originalTransactionId: "2000001194540581",
           transactionId: "2000001203730221",
         },
-        log: { warn() {} },
+        log: { info() {}, warn() {} },
       }),
     (error) => error.details.code === SUBSCRIPTION_ALREADY_LINKED_CODE
   );
+
+  const dbExpiredOther = createMockDb(
+    {
+      "appStoreOriginalTransactionId|==|2000001194540581": [{ id: "uid-b" }],
+    },
+    {},
+    {
+      "uid-b": expiredIosUser(),
+    }
+  );
+  await assertSubscriptionNotLinkedToOtherUser(dbExpiredOther, {
+    uid: "uid-a",
+    platform: "ios",
+    identifiers: {
+      originalTransactionId: "2000001194540581",
+      transactionId: "2000001203730221",
+    },
+    log: { info() {}, warn() {} },
+  });
+
+  const dbActiveAndroidOther = createMockDb(
+    {
+      "activePurchaseTokens|array-contains|android-token-1": [{ id: "uid-b" }],
+    },
+    {},
+    {
+      "uid-b": activeAndroidUser(),
+    }
+  );
+  await assert.rejects(
+    () =>
+      assertSubscriptionNotLinkedToOtherUser(dbActiveAndroidOther, {
+        uid: "uid-a",
+        platform: "android",
+        identifiers: {
+          purchaseToken: "android-token-1",
+        },
+        log: { info() {}, warn() {} },
+      }),
+    (error) => error.details.code === SUBSCRIPTION_ALREADY_LINKED_CODE
+  );
+
+  const dbExpiredAndroidOther = createMockDb(
+    {
+      "activePurchaseTokens|array-contains|android-token-1": [{ id: "uid-b" }],
+    },
+    {},
+    {
+      "uid-b": expiredAndroidUser(),
+    }
+  );
+  await assertSubscriptionNotLinkedToOtherUser(dbExpiredAndroidOther, {
+    uid: "uid-a",
+    platform: "android",
+    identifiers: {
+      purchaseToken: "android-token-1",
+    },
+    log: { info() {}, warn() {} },
+  });
+
+  const dbSameUid = createMockDb(
+    {
+      "appStoreOriginalTransactionId|==|2000001194540581": [{ id: "uid-a" }],
+    },
+    {},
+    {
+      "uid-a": activeIosUser(),
+    }
+  );
+  await assertSubscriptionNotLinkedToOtherUser(dbSameUid, {
+    uid: "uid-a",
+    platform: "ios",
+    identifiers: {
+      originalTransactionId: "2000001194540581",
+      transactionId: "2000001203730221",
+    },
+    log: { info() {}, warn() {} },
+  });
+
+  const dbBrokenOwner = createMockDb(
+    {
+      "appStoreOriginalTransactionId|==|2000001194540581": [{ id: "uid-b" }],
+    },
+    {},
+    {
+      "uid-b": {
+        entitlementUsable: "not-a-boolean",
+        subscriptionStatus: "active",
+        subscriptionExpiryTime: futureExpiry,
+        subscriptionPlatform: "ios",
+      },
+    }
+  );
+  await assert.rejects(
+    () =>
+      assertSubscriptionNotLinkedToOtherUser(dbBrokenOwner, {
+        uid: "uid-a",
+        platform: "ios",
+        identifiers: {
+          originalTransactionId: "2000001194540581",
+          transactionId: "2000001203730221",
+        },
+        log: { info() {}, warn() {} },
+      }),
+    (error) => error.details.code === SUBSCRIPTION_ALREADY_LINKED_CODE
+  );
+
+  const dbLoadFail = {
+    collection(name) {
+      if (name !== "users") {
+        throw new Error(`Unexpected collection: ${name}`);
+      }
+      return {
+        where(field, op, value) {
+          const key = `${field}|${op}|${value}`;
+          const docs =
+            {
+              "appStoreOriginalTransactionId|==|2000001194540581": [{ id: "uid-b" }],
+            }[key] || [];
+          return {
+            limit() {
+              return {
+                async get() {
+                  return {
+                    docs: docs.map((entry) => ({ id: entry.id })),
+                  };
+                },
+              };
+            },
+          };
+        },
+        doc() {
+          return {
+            async get() {
+              throw new Error("simulated owner load failure");
+            },
+          };
+        },
+      };
+    },
+  };
+  await assert.rejects(
+    () =>
+      assertSubscriptionNotLinkedToOtherUser(dbLoadFail, {
+        uid: "uid-a",
+        platform: "ios",
+        identifiers: {
+          originalTransactionId: "2000001194540581",
+          transactionId: "2000001203730221",
+        },
+        log: { info() {}, warn() {} },
+      }),
+    (error) => error.details.code === SUBSCRIPTION_ALREADY_LINKED_CODE
+  );
+
+  const crossPlatformOnly = isSubscriptionOwnerCurrentlyUsable(
+    {
+      entitlementUsable: true,
+      entitlementExpiryTime: futureExpiry,
+      entitlementSource: "android",
+      subscriptions: {
+        android: {
+          status: "active",
+          expiryTime: futureExpiry,
+        },
+      },
+      appStoreOriginalTransactionId: "2000001194540581",
+    },
+    "ios"
+  );
+  assert.equal(crossPlatformOnly.ownerCurrentlyUsable, false);
+  assert.equal(crossPlatformOnly.reason, "active_other_platform_only");
 
   const ownershipDocs = {};
   const dbOwnership = createMockDb({}, ownershipDocs);
@@ -139,10 +407,14 @@ async function run() {
   });
   assert.equal(ownershipDocs[ownershipId].ownerUid, "uid-a");
 
+  const activeConflictDocs = { [ownershipId]: { ownerUid: "uid-b" } };
+  const dbActiveConflict = createMockDb({}, activeConflictDocs, {
+    "uid-b": activeIosUser(),
+  });
   await assert.rejects(
     () =>
-      claimOwnershipDocument(dbOwnership, admin, {
-        uid: "uid-b",
+      claimOwnershipDocument(dbActiveConflict, admin, {
+        uid: "uid-c",
         ownershipId,
         platform: "ios",
         ownershipFields: {
@@ -156,6 +428,22 @@ async function run() {
       return true;
     }
   );
+
+  const inactiveConflictDocs = { [ownershipId]: { ownerUid: "uid-b" } };
+  const dbInactiveConflict = createMockDb({}, inactiveConflictDocs, {
+    "uid-b": expiredIosUser(),
+  });
+  await claimOwnershipDocument(dbInactiveConflict, admin, {
+    uid: "uid-c",
+    ownershipId,
+    platform: "ios",
+    ownershipFields: {
+      productId: "ohayo_kamome_monthly",
+    },
+    log: { info() {}, warn() {} },
+  });
+  assert.equal(inactiveConflictDocs[ownershipId].ownerUid, "uid-c");
+  assert.equal(inactiveConflictDocs[ownershipId].previousOwnerUid, "uid-b");
 
   const raceDocs = {};
   const dbRace = createMockDb({}, raceDocs);
