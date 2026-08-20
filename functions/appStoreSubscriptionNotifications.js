@@ -18,6 +18,7 @@ const {
   buildIosStoreState,
   commitUserSubscriptionDualWrite,
 } = require("./subscriptionEntitlement");
+const { normalizeUuid, tokenSuffix } = require("./billingFinalTrace");
 
 const NOTIFICATION_TRACE = "APP_STORE_NOTIFICATION_TRACE";
 const PROCESSING_STALE_MS = 10 * 60 * 1000;
@@ -180,7 +181,12 @@ async function beginNotificationProcessing(db, notificationUUID, baseFields) {
         }
       }
       if (existingStatus !== "failed" && existingStatus !== "processing") {
-        if (existingStatus === "rejected" || existingStatus === "ambiguous" || existingStatus === "unlinked") {
+        if (
+          existingStatus === "rejected" ||
+          existingStatus === "ambiguous" ||
+          existingStatus === "unlinked" ||
+          existingStatus === "deferred_token_mismatch"
+        ) {
           return { action: "skip", reason: existingStatus };
         }
       }
@@ -246,6 +252,62 @@ async function findTargetUser(db, originalTransactionId, transactionId) {
   }
 
   return { kind: "unlinked" };
+}
+
+async function findUsersByAppAccountToken(db, appAccountToken) {
+  const token = normalizeUuid(appAccountToken);
+  if (!token) {
+    return { kind: "none", uids: [] };
+  }
+  const snap = await db
+    .collection("users")
+    .where("appStoreAppAccountToken", "==", token)
+    .limit(2)
+    .get();
+  if (snap.size === 1) {
+    return { kind: "single", uid: snap.docs[0].id, uids: [snap.docs[0].id] };
+  }
+  if (snap.size > 1) {
+    return { kind: "ambiguous", uids: snap.docs.map((doc) => doc.id) };
+  }
+  return { kind: "none", uids: [] };
+}
+
+function decideAppStoreNotificationApply({
+  originalOwnerUid,
+  appAccountToken,
+  tokenOwnerUids = [],
+}) {
+  const originalUid = String(originalOwnerUid || "").trim();
+  const token = normalizeUuid(appAccountToken);
+  if (!token) {
+    return { action: "apply", reason: "legacy_missing_token" };
+  }
+  const owners = [
+    ...new Set(
+      (Array.isArray(tokenOwnerUids) ? tokenOwnerUids : [])
+        .map((uid) => String(uid || "").trim())
+        .filter(Boolean)
+    ),
+  ];
+  if (owners.length === 1 && originalUid && owners[0] === originalUid) {
+    return {
+      action: "apply",
+      reason: "token_matches_original_owner",
+      tokenOwnerUid: owners[0],
+    };
+  }
+  if (owners.length === 1 && originalUid && owners[0] !== originalUid) {
+    return {
+      action: "defer",
+      reason: "deferred_token_mismatch",
+      tokenOwnerUid: owners[0],
+    };
+  }
+  if (owners.length > 1) {
+    return { action: "defer", reason: "deferred_token_ambiguous" };
+  }
+  return { action: "apply", reason: "legacy_token_unlinked" };
 }
 
 function autoRenewingFromRenewalInfo(renewalInfo) {
@@ -491,6 +553,40 @@ function createAppStoreNotificationHandler({
         return;
       }
 
+      const appleToken = normalizeUuid(transactionInfo?.appAccountToken);
+      const tokenLookup = appleToken
+        ? await findUsersByAppAccountToken(db, appleToken)
+        : { kind: "none", uids: [] };
+      const applyDecision = decideAppStoreNotificationApply({
+        originalOwnerUid: userLookup.uid,
+        appAccountToken: appleToken,
+        tokenOwnerUids: tokenLookup.uids || [],
+      });
+      if (applyDecision.action === "defer") {
+        await writeSubscriptionEvent(db, notificationUUID, {
+          ...baseFields,
+          originalTransactionId,
+          transactionId,
+          uid: userLookup.uid,
+          status: "deferred_token_mismatch",
+          errorCode: applyDecision.reason,
+          tokenOwnerUid: applyDecision.tokenOwnerUid || null,
+          userMatch: userLookup.match,
+        });
+        logger.info(`${NOTIFICATION_TRACE} deferred_token_mismatch`, {
+          notificationUUID,
+          reason: applyDecision.reason,
+          oldOwnerUidSuffix: tokenSuffix(userLookup.uid),
+          tokenOwnerUidSuffix: tokenSuffix(applyDecision.tokenOwnerUid || ""),
+          originalTransactionIdSuffix: tokenSuffix(originalTransactionId),
+          transactionIdSuffix: tokenSuffix(transactionId),
+          notificationType: baseFields.notificationType,
+          subtype: baseFields.subtype,
+        });
+        res.status(200).send("OK");
+        return;
+      }
+
       const apiResult = await fetchAppStoreAllSubscriptionStatuses(
         originalTransactionId,
         notificationEnvironment,
@@ -617,5 +713,7 @@ function createAppStoreNotificationHandler({
 
 module.exports = {
   createAppStoreNotificationHandler,
+  decideAppStoreNotificationApply,
+  findUsersByAppAccountToken,
   NOTIFICATION_TRACE,
 };
