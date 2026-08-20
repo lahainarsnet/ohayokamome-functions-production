@@ -25,6 +25,16 @@ const {
   createRegisterDeviceUsageHandler,
 } = require("./registerDeviceUsage");
 const {
+  createRegisterDeviceFcmTokenHandler,
+} = require("./registerDeviceFcmToken");
+const {
+  createClearDeviceFcmTokenHandler,
+} = require("./clearDeviceFcmToken");
+const {
+  resolvePushTokenSet,
+  dispatchChatPushNotification,
+} = require("./pushNotificationDispatch");
+const {
   fetchAppStoreAllSubscriptionStatuses,
   pickLatestTransactionEntry,
   deriveSubscriptionState,
@@ -907,24 +917,24 @@ exports.sendPushNotification = onDocumentCreated(
     const participants = chatId.split("_");
     const recipientId = participants.find((id) => id !== senderId) || "";
 
-    let toToken = message.token || ""; // フォールバック（旧メッセージとの互換性）
+    const embeddedToken = message.token || "";
+    let userFcmToken = "";
+    let deviceEntries = [];
 
     if (recipientId) {
       try {
-        const recipientDoc = await admin.getDb().collection("users").doc(recipientId).get();
-        const latestToken = recipientDoc.get("fcmToken") || "";
-        if (latestToken) {
-          toToken = latestToken;
-          logger.info("Using latest FCM token from Firestore.", {
-            recipientIdSuffix: uidTailForLog(recipientId),
-          });
-        } else {
-          logger.warn("Recipient fcmToken is empty in Firestore; falling back to embedded token.", {
-            recipientIdSuffix: uidTailForLog(recipientId),
-          });
-        }
+        const userRef = admin.getDb().collection("users").doc(recipientId);
+        const [recipientDoc, devicesSnap] = await Promise.all([
+          userRef.get(),
+          userRef.collection("devices").get(),
+        ]);
+        userFcmToken = recipientDoc.get("fcmToken") || "";
+        deviceEntries = devicesSnap.docs.map((doc) => ({
+          deviceId: doc.id,
+          fcmToken: doc.get("fcmToken"),
+        }));
       } catch (e) {
-        logger.warn("Failed to fetch recipient FCM token; falling back to embedded token.", {
+        logger.warn("Failed to fetch recipient FCM tokens; falling back to embedded token.", {
           recipientIdSuffix: uidTailForLog(recipientId),
           errorType: e?.constructor?.name || typeof e,
         });
@@ -936,10 +946,16 @@ exports.sendPushNotification = onDocumentCreated(
       });
     }
 
-    if (!toToken || typeof toToken !== "string") {
+    const resolvedTokens = resolvePushTokenSet({
+      deviceEntries,
+      userFcmToken,
+      embeddedToken,
+    });
+    if (resolvedTokens.tokens.length === 0) {
       logger.warn("FCM token missing; skip send.", {
         chatIdTail: logIdTailForLog(chatId),
         messageIdTail: logIdTailForLog(messageId),
+        recipientIdSuffix: uidTailForLog(recipientId),
       });
       return { success: false, reason: "MISSING_TOKEN" };
     }
@@ -970,7 +986,6 @@ exports.sendPushNotification = onDocumentCreated(
     const ANDROID_MESSAGE_CHANNEL_ID = "com.lahainars.tonikaku.new_message_alerts";
     const ANDROID_NOTIFICATION_TAG = "chat_unread_summary";
     const msg = {
-      token: toToken,
       notification: {
         title,
         body,
@@ -1028,11 +1043,22 @@ exports.sendPushNotification = onDocumentCreated(
       messageIdTail: logIdTailForLog(messageId),
     });
 
+    logger.info("[KAMOME_PUSH_DEVICES] sending", {
+      recipientIdSuffix: uidTailForLog(recipientId),
+      source: resolvedTokens.source,
+      deviceTokenCount: resolvedTokens.deviceTokenCount,
+      uniqueTokenCount: resolvedTokens.uniqueTokenCount,
+      chatIdTail: logIdTailForLog(chatId),
+      messageIdTail: logIdTailForLog(messageId),
+    });
+
     logger.info("Attempting to send notification message", {
       chatIdTail: logIdTailForLog(chatId),
       messageIdTail: logIdTailForLog(messageId),
       recipientIdSuffix: uidTailForLog(recipientId),
-      ...fcmTokenMetaForLog(toToken),
+      source: resolvedTokens.source,
+      uniqueTokenCount: resolvedTokens.uniqueTokenCount,
+      hasToken: resolvedTokens.tokens.length > 0,
       collapseKey: msg.android.collapseKey,
       ttlMs: msg.android.ttl,
       priority: msg.android.priority,
@@ -1041,7 +1067,39 @@ exports.sendPushNotification = onDocumentCreated(
     });
 
     try {
-      const response = await admin.getMessagingClient().send(msg);
+      const dispatchResult = await dispatchChatPushNotification({
+        messaging: admin.getMessagingClient(),
+        db: admin.getDb(),
+        admin,
+        uid: recipientId,
+        tokens: resolvedTokens.tokens,
+        tokenToDeviceIds: resolvedTokens.tokenToDeviceIds,
+        message: msg,
+      });
+      logger.info("[KAMOME_PUSH_DEVICES] send result", {
+        recipientIdSuffix: uidTailForLog(recipientId),
+        source: resolvedTokens.source,
+        uniqueTokenCount: resolvedTokens.uniqueTokenCount,
+        successCount: dispatchResult.successCount,
+        failureCount: dispatchResult.failureCount,
+        invalidTokenClearedCount: dispatchResult.invalidTokenClearedCount,
+        chatIdTail: logIdTailForLog(chatId),
+        messageIdTail: logIdTailForLog(messageId),
+      });
+      if (!dispatchResult.success) {
+        logger.error("[KAMOME_BADGE_V3] Notification send failed.", {
+          recipientIdSuffix: uidTailForLog(recipientId),
+          unreadTotal,
+          iosBadge: msg.apns.payload.aps.badge,
+          androidNotificationTag: msg.android.notification.tag,
+          androidNotificationCount: msg.android.notification.notificationCount,
+          chatIdTail: logIdTailForLog(chatId),
+          messageIdTail: logIdTailForLog(messageId),
+          successCount: dispatchResult.successCount,
+          failureCount: dispatchResult.failureCount,
+        });
+        return { success: false };
+      }
       logger.info("[KAMOME_BADGE_V3] Notification send success.", {
         recipientIdSuffix: uidTailForLog(recipientId),
         unreadTotal,
@@ -1050,6 +1108,8 @@ exports.sendPushNotification = onDocumentCreated(
         androidNotificationCount: msg.android.notification.notificationCount,
         chatIdTail: logIdTailForLog(chatId),
         messageIdTail: logIdTailForLog(messageId),
+        successCount: dispatchResult.successCount,
+        failureCount: dispatchResult.failureCount,
       });
       return { success: true };
     } catch (error) {
@@ -2494,6 +2554,16 @@ exports.probeGooglePlaySubscriptionEntitlement = onCall(
 exports.registerDeviceUsage = onCall(
   { region: "us-central1", enforceAppCheck: true },
   createRegisterDeviceUsageHandler({ admin, logger }),
+);
+
+exports.registerDeviceFcmToken = onCall(
+  { region: "us-central1", enforceAppCheck: true },
+  createRegisterDeviceFcmTokenHandler({ admin, logger }),
+);
+
+exports.clearDeviceFcmToken = onCall(
+  { region: "us-central1", enforceAppCheck: true },
+  createClearDeviceFcmTokenHandler({ admin, logger }),
 );
 
 exports.transcribeExperiment = transcribeExperiment;
