@@ -35,6 +35,9 @@ const {
   dispatchChatPushNotification,
 } = require("./pushNotificationDispatch");
 const {
+  createEmitKamomeClientDiagHandler,
+} = require("./emitKamomeClientDiag");
+const {
   fetchAppStoreAllSubscriptionStatuses,
   pickLatestTransactionEntry,
   deriveSubscriptionState,
@@ -2546,6 +2549,15 @@ exports.probeGooglePlaySubscriptionEntitlement = onCall(
     admin,
     logger,
   }),
+);
+
+/* =========================================================
+ * Client diagnostic events (billing / subscription / CF)
+ *  - Flutter fire-and-forget; Cloud Logging only
+ * =======================================================*/
+exports.emitKamomeClientDiag = onCall(
+  { region: "us-central1", enforceAppCheck: true },
+  createEmitKamomeClientDiagHandler({ logger }),
 );
 
 /* =========================================================
