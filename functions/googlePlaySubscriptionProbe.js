@@ -5,7 +5,6 @@
  * Does NOT accept purchaseToken / UID from the client payload.
  */
 const { HttpsError } = require("firebase-functions/v2/https");
-const { uidTail } = require("./kamomeIdTrace");
 const {
   GOOGLE_PLAY_PACKAGE_NAME,
   deriveGooglePlayEntitlement,
@@ -16,6 +15,17 @@ const {
 } = require("./googlePlaySubscriptionNotifications");
 
 const PROBE_TRACE = "SUBSCRIPTION_ACK_GOOGLE_PLAY_PROBE";
+
+function uidTail(uid) {
+  const normalized = String(uid || "").trim();
+  if (!normalized) {
+    return "none";
+  }
+  if (normalized.length <= 4) {
+    return normalized;
+  }
+  return normalized.slice(-4);
+}
 
 function resolveStoredPrimaryPurchaseToken(userData) {
   const primary = String(userData?.googlePlayPrimaryPurchaseToken || "").trim();
