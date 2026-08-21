@@ -49,6 +49,179 @@ function buildIosOwnershipId(originalTransactionId) {
   return `ios_${normalized}`;
 }
 
+function originalTransactionIdFromIosOwnership(ownershipId, ownershipFields = {}) {
+  const fromFields = String(
+    ownershipFields?.appStoreOriginalTransactionId || ""
+  ).trim();
+  if (fromFields) {
+    return fromFields;
+  }
+  const id = String(ownershipId || "").trim();
+  if (id.startsWith("ios_")) {
+    return id.slice(4);
+  }
+  return "";
+}
+
+function isTrustedIosOwnershipStatus(status) {
+  const normalized = String(status || "").trim().toLowerCase();
+  return normalized === "" || normalized === "active";
+}
+
+/**
+ * Strip only Apple identifiers that would make a previous owner show up in
+ * ASN `users` searches for this originalTransactionId series.
+ * Leaves subscriptions.*, entitlement*, Android tokens, and audit fields intact.
+ */
+function buildDetachedAppleIdentifierUpdate(
+  userData,
+  { originalTransactionId, transactionId, admin }
+) {
+  const originalId = String(originalTransactionId || "").trim();
+  const latestId = String(transactionId || "").trim();
+  const idsToRemove = new Set([originalId, latestId].filter(Boolean));
+  if (idsToRemove.size === 0 || !admin?.FieldValue?.delete) {
+    return null;
+  }
+
+  const data = userData && typeof userData === "object" ? userData : {};
+  const storedOriginal = String(data.appStoreOriginalTransactionId || "").trim();
+  const originalMatches = Boolean(storedOriginal && storedOriginal === originalId);
+  const storedTxn = String(data.appStoreTransactionId || "").trim();
+  if (originalMatches && storedTxn) {
+    idsToRemove.add(storedTxn);
+  }
+
+  const tokens = Array.isArray(data.activePurchaseTokens)
+    ? data.activePurchaseTokens.map((token) => String(token || "").trim()).filter(Boolean)
+    : [];
+  const nextTokens = tokens.filter((token) => !idsToRemove.has(token));
+  const tokensChanged = nextTokens.length !== tokens.length;
+
+  if (!originalMatches && !tokensChanged) {
+    return null;
+  }
+
+  const update = {};
+  if (originalMatches) {
+    update.appStoreOriginalTransactionId = admin.FieldValue.delete();
+    update.appStoreTransactionId = admin.FieldValue.delete();
+  }
+  if (tokensChanged) {
+    update.activePurchaseTokens = nextTokens;
+  }
+  return Object.keys(update).length > 0 ? update : null;
+}
+
+async function readTrustedIosOwnershipOwner(db, originalTransactionId) {
+  const originalId = String(originalTransactionId || "").trim();
+  if (!originalId) {
+    return { kind: "none", reason: "missing_original_transaction_id" };
+  }
+
+  let ownershipId;
+  try {
+    ownershipId = buildIosOwnershipId(originalId);
+  } catch (error) {
+    return { kind: "none", reason: "missing_original_transaction_id" };
+  }
+
+  const snap = await db
+    .collection(SUBSCRIPTION_OWNERSHIP_COLLECTION)
+    .doc(ownershipId)
+    .get();
+  if (!snap.exists) {
+    return { kind: "none", reason: "ownership_missing" };
+  }
+
+  const ownerUid = String(snap.get("ownerUid") || "").trim();
+  if (!ownerUid) {
+    return { kind: "untrusted", reason: "ownership_owner_uid_missing" };
+  }
+  if (!isTrustedIosOwnershipStatus(snap.get("status"))) {
+    return {
+      kind: "untrusted",
+      reason: "ownership_status_untrusted",
+      ownerUid,
+    };
+  }
+
+  const userSnap = await db.collection("users").doc(ownerUid).get();
+  if (!userSnap.exists) {
+    return {
+      kind: "untrusted",
+      reason: "ownership_owner_user_missing",
+      ownerUid,
+    };
+  }
+
+  return {
+    kind: "trusted",
+    uid: ownerUid,
+    reason: "ownership_document",
+    status: String(snap.get("status") || "active"),
+  };
+}
+
+async function detachStaleAppleIdentifiersFromOtherUsers(
+  db,
+  admin,
+  { ownerUid, originalTransactionId, transactionId, logger }
+) {
+  const originalId = String(originalTransactionId || "").trim();
+  const owner = String(ownerUid || "").trim();
+  if (!originalId || !owner) {
+    return { detachedCount: 0 };
+  }
+
+  const seen = new Set();
+  const candidateDocs = [];
+  const users = db.collection("users");
+  const queries = [
+    users.where("appStoreOriginalTransactionId", "==", originalId).limit(10),
+    users.where("activePurchaseTokens", "array-contains", originalId).limit(10),
+  ];
+  const latestId = String(transactionId || "").trim();
+  if (latestId && latestId !== originalId) {
+    queries.push(
+      users.where("activePurchaseTokens", "array-contains", latestId).limit(10)
+    );
+  }
+
+  for (const query of queries) {
+    const snap = await query.get();
+    for (const doc of snap.docs || []) {
+      if (!doc?.id || seen.has(doc.id) || doc.id === owner) {
+        continue;
+      }
+      seen.add(doc.id);
+      candidateDocs.push(doc);
+    }
+  }
+
+  let detachedCount = 0;
+  for (const doc of candidateDocs) {
+    const update = buildDetachedAppleIdentifierUpdate(doc.data() || {}, {
+      originalTransactionId: originalId,
+      transactionId: latestId,
+      admin,
+    });
+    if (!update) {
+      continue;
+    }
+    await doc.ref.set(update, { merge: true });
+    detachedCount += 1;
+    if (logger && typeof logger.info === "function") {
+      logger.info("APP_STORE_NOTIFICATION_TRACE detached_stale_apple_identifiers", {
+        ownerUidSuffix: identifierSuffix(owner),
+        previousOwnerUidSuffix: identifierSuffix(doc.id),
+        originalTransactionIdSuffix: identifierSuffix(originalId),
+      });
+    }
+  }
+  return { detachedCount };
+}
+
 function buildAndroidOwnershipId(purchaseToken) {
   const normalized = String(purchaseToken || "").trim();
   if (!normalized) {
@@ -495,6 +668,32 @@ async function claimOwnershipDocument(
       },
       { merge: true }
     );
+
+    if (normalizeSubscriptionPlatform(platform) === "ios") {
+      const detachUpdate = buildDetachedAppleIdentifierUpdate(
+        existingOwnerSnap.exists ? existingOwnerSnap.data() || {} : {},
+        {
+          originalTransactionId: originalTransactionIdFromIosOwnership(
+            ownershipId,
+            ownershipFields
+          ),
+          transactionId: String(ownershipFields?.appStoreTransactionId || "").trim(),
+          admin,
+        }
+      );
+      if (detachUpdate) {
+        tx.set(existingOwnerRef, detachUpdate, { merge: true });
+        if (log && typeof log.info === "function") {
+          log.info("subscription_ownership.detached_previous_owner_identifiers", {
+            platform,
+            requestUidSuffix: identifierSuffix(uid),
+            previousOwnerUidSuffix: identifierSuffix(existingOwnerUid),
+            ownershipIdSuffix: identifierSuffix(ownershipId),
+          });
+        }
+      }
+    }
+
     if (typeof log === "function") {
       log.info("Subscription ownership transferred from inactive owner.", {
         platform,
@@ -867,4 +1066,9 @@ module.exports = {
   claimOwnershipDocument,
   isSubscriptionOwnerCurrentlyUsable,
   evaluateOwnerCandidates,
+  isTrustedIosOwnershipStatus,
+  readTrustedIosOwnershipOwner,
+  buildDetachedAppleIdentifierUpdate,
+  detachStaleAppleIdentifiersFromOtherUsers,
+  originalTransactionIdFromIosOwnership,
 };

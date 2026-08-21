@@ -19,6 +19,10 @@ const {
   commitUserSubscriptionDualWrite,
 } = require("./subscriptionEntitlement");
 const { normalizeUuid, tokenSuffix } = require("./billingFinalTrace");
+const {
+  readTrustedIosOwnershipOwner,
+  detachStaleAppleIdentifiersFromOtherUsers,
+} = require("./subscriptionOwnership");
 
 const NOTIFICATION_TRACE = "APP_STORE_NOTIFICATION_TRACE";
 const PROCESSING_STALE_MS = 10 * 60 * 1000;
@@ -252,6 +256,71 @@ async function findTargetUser(db, originalTransactionId, transactionId) {
   }
 
   return { kind: "unlinked" };
+}
+
+async function resolveAppStoreNotificationUser(
+  db,
+  originalTransactionId,
+  transactionId
+) {
+  const usersLookup = await findTargetUser(
+    db,
+    originalTransactionId,
+    transactionId
+  );
+  const legacyUids =
+    usersLookup.kind === "ambiguous"
+      ? usersLookup.uids || []
+      : usersLookup.kind === "single" && usersLookup.uid
+        ? [usersLookup.uid]
+        : [];
+  const legacyCandidateCount = legacyUids.length;
+
+  const ownership = await readTrustedIosOwnershipOwner(
+    db,
+    originalTransactionId
+  );
+  if (ownership.kind === "trusted") {
+    return {
+      kind: "single",
+      uid: ownership.uid,
+      match: "ownership_document",
+      resolution: "ownership_document",
+      resolutionReason: ownership.reason,
+      legacyCandidateCount,
+      legacyKind: usersLookup.kind,
+      legacyUids,
+    };
+  }
+
+  return {
+    ...usersLookup,
+    resolution: "users_query",
+    resolutionReason: ownership.reason || "ownership_missing",
+    legacyCandidateCount,
+    legacyKind: usersLookup.kind,
+    legacyUids,
+  };
+}
+
+function logNotificationUserResolved(logger, fields) {
+  if (!logger || typeof logger.info !== "function") {
+    return;
+  }
+  logger.info(`${NOTIFICATION_TRACE} user_resolved`, {
+    notificationUUID: fields.notificationUUID || null,
+    resolution: fields.resolution || null,
+    resolutionReason: fields.resolutionReason || null,
+    ownerUidSuffix: tokenSuffix(fields.uid || ""),
+    originalTransactionIdSuffix: tokenSuffix(fields.originalTransactionId || ""),
+    notificationType: fields.notificationType || "",
+    subtype: fields.subtype || "",
+    legacyCandidateCount:
+      typeof fields.legacyCandidateCount === "number"
+        ? fields.legacyCandidateCount
+        : null,
+    legacyKind: fields.legacyKind || fields.kind || null,
+  });
 }
 
 async function findUsersByAppAccountToken(db, appAccountToken) {
@@ -498,11 +567,23 @@ function createAppStoreNotificationHandler({
         return;
       }
 
-      const userLookup = await findTargetUser(
+      const userLookup = await resolveAppStoreNotificationUser(
         db,
         originalTransactionId,
         transactionId
       );
+      logNotificationUserResolved(logger, {
+        notificationUUID,
+        uid: userLookup.uid,
+        originalTransactionId,
+        notificationType: baseFields.notificationType,
+        subtype: baseFields.subtype,
+        resolution: userLookup.resolution,
+        resolutionReason: userLookup.resolutionReason,
+        legacyCandidateCount: userLookup.legacyCandidateCount,
+        legacyKind: userLookup.legacyKind,
+        kind: userLookup.kind,
+      });
 
       if (userLookup.kind === "ambiguous") {
         await writeSubscriptionEvent(db, notificationUUID, {
@@ -658,6 +739,24 @@ function createAppStoreNotificationHandler({
         }
       );
 
+      if (userLookup.resolution === "ownership_document") {
+        try {
+          await detachStaleAppleIdentifiersFromOtherUsers(db, admin, {
+            ownerUid: userLookup.uid,
+            originalTransactionId:
+              derived.originalTransactionId || originalTransactionId,
+            transactionId: derived.latestTransactionId || transactionId,
+            logger,
+          });
+        } catch (cleanupError) {
+          logger.warn(`${NOTIFICATION_TRACE} detach_stale_failed`, {
+            ownerUidSuffix: tokenSuffix(userLookup.uid),
+            originalTransactionIdSuffix: tokenSuffix(originalTransactionId),
+            errorMessage: cleanupError?.message || String(cleanupError),
+          });
+        }
+      }
+
       await writeSubscriptionEvent(db, notificationUUID, {
         ...baseFields,
         originalTransactionId: derived.originalTransactionId || originalTransactionId,
@@ -667,15 +766,23 @@ function createAppStoreNotificationHandler({
         result: derived.validationCode,
         subscriptionStatus: derived.status,
         userMatch: userLookup.match,
+        resolution: userLookup.resolution || null,
       });
 
       logger.info(`${NOTIFICATION_TRACE} processed`, {
         notificationUUID,
-        uid: userLookup.uid,
+        uidSuffix: tokenSuffix(userLookup.uid),
         notificationType: baseFields.notificationType,
         subtype: baseFields.subtype,
         validationCode: derived.validationCode,
         subscriptionStatus: derived.status,
+        resolution: userLookup.resolution || null,
+        resolutionReason: userLookup.resolutionReason || null,
+        originalTransactionIdSuffix: tokenSuffix(originalTransactionId),
+        legacyCandidateCount:
+          typeof userLookup.legacyCandidateCount === "number"
+            ? userLookup.legacyCandidateCount
+            : null,
       });
 
       res.status(200).send("OK");
@@ -715,5 +822,8 @@ module.exports = {
   createAppStoreNotificationHandler,
   decideAppStoreNotificationApply,
   findUsersByAppAccountToken,
+  findTargetUser,
+  resolveAppStoreNotificationUser,
+  applyUserSubscriptionUpdate,
   NOTIFICATION_TRACE,
 };

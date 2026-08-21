@@ -7,6 +7,7 @@ const {
   buildAndroidOwnershipId,
   normalizeUuid,
   isSubscriptionOwnerCurrentlyUsable,
+  buildDetachedAppleIdentifierUpdate,
   SUBSCRIPTION_ALREADY_LINKED_CODE,
   SUBSCRIPTION_TOKEN_MISMATCH_CODE,
 } = require("./subscriptionOwnership");
@@ -15,6 +16,18 @@ const futureExpiry = new Date(Date.now() + 60 * 60 * 1000).toISOString();
 const pastExpiry = new Date(Date.now() - 60 * 60 * 1000).toISOString();
 
 function createMockDb(docsByQuery, ownershipDocs = {}, userDocs = {}) {
+  function applyMerge(target, data) {
+    const next = { ...(target || {}) };
+    for (const [key, value] of Object.entries(data || {})) {
+      if (value && value.__type === "delete") {
+        delete next[key];
+      } else {
+        next[key] = value;
+      }
+    }
+    return next;
+  }
+
   return {
     collection(name) {
       if (name === "users") {
@@ -39,6 +52,7 @@ function createMockDb(docsByQuery, ownershipDocs = {}, userDocs = {}) {
           doc(uid) {
             return {
               id: uid,
+              __kind: "user",
               async get() {
                 const data = userDocs[uid];
                 return {
@@ -61,14 +75,14 @@ function createMockDb(docsByQuery, ownershipDocs = {}, userDocs = {}) {
 
       return {
         doc(id) {
-          return { id };
+          return { id, __kind: "ownership" };
         },
       };
     },
     async runTransaction(callback) {
       const tx = {
         async get(ref) {
-          if (Object.prototype.hasOwnProperty.call(userDocs, ref.id)) {
+          if (ref.__kind === "user" || Object.prototype.hasOwnProperty.call(userDocs, ref.id)) {
             const data = userDocs[ref.id];
             return {
               exists: data != null,
@@ -87,10 +101,11 @@ function createMockDb(docsByQuery, ownershipDocs = {}, userDocs = {}) {
           };
         },
         set(ref, data) {
-          ownershipDocs[ref.id] = {
-            ...(ownershipDocs[ref.id] || {}),
-            ...data,
-          };
+          if (ref.__kind === "user") {
+            userDocs[ref.id] = applyMerge(userDocs[ref.id], data);
+            return;
+          }
+          ownershipDocs[ref.id] = applyMerge(ownershipDocs[ref.id], data);
         },
       };
       return callback(tx);
@@ -102,6 +117,9 @@ const admin = {
   FieldValue: {
     serverTimestamp() {
       return { __type: "serverTimestamp" };
+    },
+    delete() {
+      return { __type: "delete" };
     },
   },
 };
@@ -429,21 +447,93 @@ async function run() {
     }
   );
 
+  const previousOwnerUsers = {
+    "uid-b": expiredIosUser({
+      appStoreTransactionId: "txn-old-b",
+      activePurchaseTokens: ["txn-old-b", "keep-other-token"],
+      googlePlayPurchaseToken: "keep-play-token",
+      auditNote: "keep-history",
+      subscriptions: {
+        ios: {
+          status: "expired",
+          expiryTime: pastExpiry,
+          source: "app_store_verify",
+        },
+        android: {
+          status: "active",
+          expiryTime: futureExpiry,
+        },
+      },
+    }),
+  };
   const inactiveConflictDocs = { [ownershipId]: { ownerUid: "uid-b" } };
-  const dbInactiveConflict = createMockDb({}, inactiveConflictDocs, {
-    "uid-b": expiredIosUser(),
-  });
+  const dbInactiveConflict = createMockDb({}, inactiveConflictDocs, previousOwnerUsers);
   await claimOwnershipDocument(dbInactiveConflict, admin, {
     uid: "uid-c",
     ownershipId,
     platform: "ios",
     ownershipFields: {
       productId: "ohayo_kamome_monthly",
+      appStoreOriginalTransactionId: "2000001194540581",
+      appStoreTransactionId: "txn-old-b",
     },
     log: { info() {}, warn() {} },
   });
   assert.equal(inactiveConflictDocs[ownershipId].ownerUid, "uid-c");
   assert.equal(inactiveConflictDocs[ownershipId].previousOwnerUid, "uid-b");
+  assert.equal(
+    previousOwnerUsers["uid-b"].appStoreOriginalTransactionId,
+    undefined
+  );
+  assert.equal(previousOwnerUsers["uid-b"].appStoreTransactionId, undefined);
+  assert.deepEqual(previousOwnerUsers["uid-b"].activePurchaseTokens, [
+    "keep-other-token",
+  ]);
+  assert.equal(previousOwnerUsers["uid-b"].googlePlayPurchaseToken, "keep-play-token");
+  assert.equal(previousOwnerUsers["uid-b"].auditNote, "keep-history");
+  assert.equal(previousOwnerUsers["uid-b"].subscriptions.android.status, "active");
+  assert.equal(previousOwnerUsers["uid-b"].subscriptions.ios.status, "expired");
+  assert.equal(previousOwnerUsers["uid-b"].entitlementUsable, false);
+
+  const otherSeriesUsers = {
+    "uid-b": expiredIosUser({
+      appStoreOriginalTransactionId: "2000001999999999",
+      appStoreTransactionId: "txn-other-series",
+      activePurchaseTokens: ["txn-other-series"],
+    }),
+  };
+  const otherSeriesDocs = { [ownershipId]: { ownerUid: "uid-b" } };
+  await claimOwnershipDocument(
+    createMockDb({}, otherSeriesDocs, otherSeriesUsers),
+    admin,
+    {
+      uid: "uid-c",
+      ownershipId,
+      platform: "ios",
+      ownershipFields: {
+        productId: "ohayo_kamome_monthly",
+        appStoreOriginalTransactionId: "2000001194540581",
+      },
+      log: { info() {}, warn() {} },
+    }
+  );
+  assert.equal(
+    otherSeriesUsers["uid-b"].appStoreOriginalTransactionId,
+    "2000001999999999"
+  );
+  assert.deepEqual(otherSeriesUsers["uid-b"].activePurchaseTokens, [
+    "txn-other-series",
+  ]);
+
+  const detachNone = buildDetachedAppleIdentifierUpdate(
+    { appStoreOriginalTransactionId: "2000001999999999" },
+    {
+      originalTransactionId: "2000001194540581",
+      transactionId: "txn-new",
+      admin,
+    }
+  );
+  assert.equal(detachNone, null);
 
   const raceDocs = {};
   const dbRace = createMockDb({}, raceDocs);
