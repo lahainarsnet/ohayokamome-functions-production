@@ -70,8 +70,12 @@ const {
 } = require("./sendMessageGuardCodes");
 const {
   describeAccountAccessUsability,
-  evaluateCrossPlatformPurchaseGuard,
 } = require("./accountAccessUsability");
+const { platformFromAppCheckAppId } = require("./appCheckPlatform");
+const { evaluatePlatformEntitlement } = require("./platformEntitlement");
+const {
+  createAcknowledgeCrossPlatformSwitchHandler,
+} = require("./crossPlatformSwitchAck");
 const {
   computeEntitlementExpiryDeltaMs,
   resolveRecipientSubscriptionWithExpiryLagRetry,
@@ -407,43 +411,13 @@ async function assertPurchasingPlatformAllowed(
   traceId = null
 ) {
   const normalizedPurchasing = normalizeSubscriptionPlatform(purchasingPlatform);
-  if (normalizedPurchasing !== "ios" && normalizedPurchasing !== "android") {
-    throw new HttpsError("internal", "Invalid purchasing platform.");
-  }
-
   const uidTail = uidTailForLog(uid);
-  const userSnap = await admin.getDb().collection("users").doc(uid).get();
-  if (!userSnap.exists) {
-    logger.info("KAMOME_BILLING_FINAL_TRACE", {
-      step: "platform_mismatch.allow_no_user_doc",
-      billingTraceId: traceId,
-      uidTail,
-      purchasingPlatform: normalizedPurchasing,
-    });
-    return;
-  }
-
-  const userData = userSnap.data() || {};
-  const guard = evaluateCrossPlatformPurchaseGuard({
-    userData,
-    purchasingPlatform: normalizedPurchasing,
-    now: new Date(),
-    parseExpiryWithMeta: parseSubscriptionExpiryTimeWithMeta,
-  });
-
-  logCrossPlatformPurchaseGuardTrace({
+  logger.info("KAMOME_BILLING_FINAL_TRACE", {
+    step: "platform_mismatch.allow_x_policy",
+    billingTraceId: traceId,
     uidTail,
-    traceId,
     purchasingPlatform: normalizedPurchasing,
-    guard,
   });
-
-  if (guard.block) {
-    throw new HttpsError(
-      "failed-precondition",
-      SUBSCRIPTION_PLATFORM_MISMATCH_MESSAGE
-    );
-  }
 }
 
 function logRecipientSubscriptionGuard({
@@ -500,6 +474,7 @@ function logSenderSubscriptionGuard({
   denyReason,
   action,
   code,
+  senderPlatform,
 }) {
   const statusForLog =
     (subscriptionStatus || "").trim().length === 0
@@ -507,6 +482,7 @@ function logSenderSubscriptionGuard({
       : (subscriptionStatus || "").trim().toLowerCase();
   logger.info(
     `[SenderSubscriptionGuard] senderUidTail=${senderUidTail} ` +
+      `senderPlatform=${senderPlatform || "unknown"} ` +
       `decisionSource=${decisionSource} entitlementUsable=${entitlementUsable ?? "null"} ` +
       `entitlementExpiryIsFuture=${entitlementExpiryIsFuture} ` +
       `subscriptionStatus=${statusForLog} legacyStatusAllowsAccess=${legacyStatusAllowsAccess} ` +
@@ -1216,6 +1192,17 @@ exports.sendMessageWithLimit = onCall(
     return { success: false, code: "SENDER_AUTH_MISMATCH" };
   }
 
+  const senderPlatform = platformFromAppCheckAppId(
+    request.app && request.app.appId
+  );
+  if (senderPlatform !== "ios" && senderPlatform !== "android") {
+    logger.warn("sendMessageWithLimit: SENDER_SUBSCRIPTION_UNAVAILABLE unknown_app_id", {
+      senderUidTail: uidTailForLog(senderId),
+      hasAppCheckApp: Boolean(request.app),
+    });
+    return { success: false, code: SENDER_SUBSCRIPTION_UNAVAILABLE };
+  }
+
   const accessGate = await assertAccessNotBlocked();
   if (accessGate.blocked) {
     return { success: false, code: accessGate.code };
@@ -1365,19 +1352,23 @@ exports.sendMessageWithLimit = onCall(
       if (userDoc.exists) {
         const senderData = userDoc.data() || {};
         const senderSubscriptionStatus = senderData.subscriptionStatus;
-        const senderUsability = describeAccountAccessUsability(senderData, new Date(), {
-          parseExpiryWithMeta: parseSubscriptionExpiryTimeWithMeta,
-        });
-        if (!senderUsability.subscriptionUsable) {
+        const senderUsability = evaluatePlatformEntitlement(
+          senderData,
+          senderPlatform,
+          new Date(),
+          { parseExpiryWithMeta: parseSubscriptionExpiryTimeWithMeta }
+        );
+        if (!senderUsability.usable) {
           logSenderSubscriptionGuard({
             senderUidTail: uidTailForLog(senderId),
+            senderPlatform,
             decisionSource: senderUsability.decisionSource,
-            entitlementUsable: senderUsability.entitlementUsable,
-            entitlementExpiryIsFuture: senderUsability.entitlementExpiryIsFuture,
+            entitlementUsable: senderData.entitlementUsable ?? null,
+            entitlementExpiryIsFuture: false,
             subscriptionStatus: senderSubscriptionStatus,
-            legacyStatusAllowsAccess: senderUsability.legacyStatusAllowsAccess,
-            legacyExpiryIsFuture: senderUsability.legacyExpiryIsFuture,
-            subscriptionUsable: senderUsability.subscriptionUsable,
+            legacyStatusAllowsAccess: false,
+            legacyExpiryIsFuture: false,
+            subscriptionUsable: senderUsability.usable,
             denyReason: senderUsability.denyReason,
             action: "blockSend",
             code: SENDER_SUBSCRIPTION_UNAVAILABLE,
@@ -2576,6 +2567,11 @@ exports.registerDeviceFcmToken = onCall(
 exports.clearDeviceFcmToken = onCall(
   { region: "us-central1", enforceAppCheck: true },
   createClearDeviceFcmTokenHandler({ admin, logger }),
+);
+
+exports.acknowledgeCrossPlatformSwitch = onCall(
+  { region: "us-central1", enforceAppCheck: true },
+  createAcknowledgeCrossPlatformSwitchHandler({ admin, logger }),
 );
 
 exports.transcribeExperiment = transcribeExperiment;

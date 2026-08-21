@@ -457,6 +457,10 @@ async function runTests() {
     thinkingTokens: null,
   });
 
+  const {
+    IOS_FIREBASE_APP_ID,
+    ANDROID_FIREBASE_APP_ID,
+  } = require("./appCheckPlatform");
   const now = new Date("2026-07-18T12:00:00.000Z");
   const future = new Date("2026-08-01T00:00:00.000Z");
   const past = new Date("2026-06-01T00:00:00.000Z");
@@ -465,43 +469,86 @@ async function runTests() {
     {
       subscriptionStatus: "active",
       subscriptionExpiryTime: future,
+      subscriptionPlatform: "ios",
     },
     now,
+    { platform: "ios" },
   );
   assert.strictEqual(activeLegacy.subscriptionUsable, true);
 
-  const cancelledEntitlement = evaluateCallerSubscriptionAccess(
+  const iosAppleStore = evaluateCallerSubscriptionAccess(
+    {
+      subscriptions: {
+        ios: { status: "active", expiryTime: future },
+      },
+    },
+    now,
+    { appId: IOS_FIREBASE_APP_ID },
+  );
+  assert.strictEqual(iosAppleStore.subscriptionUsable, true);
+
+  const iosGoogleOnly = evaluateCallerSubscriptionAccess(
     {
       entitlementUsable: true,
       entitlementExpiryTime: future,
-      subscriptionStatus: "cancelled",
-      subscriptionExpiryTime: past,
+      entitlementSource: "android",
+      subscriptions: {
+        android: { status: "active", expiryTime: future },
+      },
     },
     now,
+    { appId: IOS_FIREBASE_APP_ID },
   );
-  assert.strictEqual(cancelledEntitlement.subscriptionUsable, true);
+  assert.strictEqual(iosGoogleOnly.subscriptionUsable, false);
+
+  const androidGoogleStore = evaluateCallerSubscriptionAccess(
+    {
+      subscriptions: {
+        android: { status: "active", expiryTime: future },
+      },
+    },
+    now,
+    { appId: ANDROID_FIREBASE_APP_ID },
+  );
+  assert.strictEqual(androidGoogleStore.subscriptionUsable, true);
+
+  const androidAppleOnly = evaluateCallerSubscriptionAccess(
+    {
+      subscriptions: {
+        ios: { status: "active", expiryTime: future },
+      },
+    },
+    now,
+    { appId: ANDROID_FIREBASE_APP_ID },
+  );
+  assert.strictEqual(androidAppleOnly.subscriptionUsable, false);
 
   const expired = evaluateCallerSubscriptionAccess(
     {
       subscriptionStatus: "active",
       subscriptionExpiryTime: past,
+      subscriptionPlatform: "ios",
     },
     now,
+    { platform: "ios" },
   );
   assert.strictEqual(expired.subscriptionUsable, false);
 
-  const entitlementFalse = evaluateCallerSubscriptionAccess(
+  const unknownAppId = evaluateCallerSubscriptionAccess(
     {
-      entitlementUsable: false,
-      subscriptionStatus: "active",
-      subscriptionExpiryTime: future,
+      subscriptions: {
+        ios: { status: "active", expiryTime: future },
+      },
     },
     now,
+    { appId: "unknown" },
   );
-  assert.strictEqual(entitlementFalse.subscriptionUsable, false);
+  assert.strictEqual(unknownAppId.subscriptionUsable, false);
+  assert.strictEqual(unknownAppId.denyReason, "unknown_app_id");
 
   const allowed = await assertCallerSubscriptionUsable("user-active", {
     now,
+    platform: "ios",
     getDb: () => ({
       collection: () => ({
         doc: () => ({
@@ -510,6 +557,7 @@ async function runTests() {
             data: () => ({
               subscriptionStatus: "active",
               subscriptionExpiryTime: future,
+              subscriptionPlatform: "ios",
             }),
           }),
         }),
@@ -520,6 +568,7 @@ async function runTests() {
 
   const denied = await assertCallerSubscriptionUsable("user-expired", {
     now,
+    platform: "ios",
     getDb: () => ({
       collection: () => ({
         doc: () => ({
@@ -528,6 +577,7 @@ async function runTests() {
             data: () => ({
               subscriptionStatus: "active",
               subscriptionExpiryTime: past,
+              subscriptionPlatform: "ios",
             }),
           }),
         }),

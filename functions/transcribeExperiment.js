@@ -15,7 +15,8 @@ const { onCall } = require("firebase-functions/v2/https");
 const { defineSecret, defineString } = require("firebase-functions/params");
 const admin = require("./firebaseAdmin");
 const { loadAppConfig, assertAccessNotBlocked } = require("./appConfig");
-const { describeAccountAccessUsability } = require("./accountAccessUsability");
+const { platformFromAppCheckAppId } = require("./appCheckPlatform");
+const { evaluatePlatformEntitlement } = require("./platformEntitlement");
 const { SENDER_SUBSCRIPTION_UNAVAILABLE } = require("./sendMessageGuardCodes");
 const {
   DEFAULT_DAILY_TRANSCRIBE_LIMIT,
@@ -60,7 +61,34 @@ function logSttEvent(fields) {
 }
 
 function evaluateCallerSubscriptionAccess(userData, now = new Date(), options = {}) {
-  return describeAccountAccessUsability(userData, now, options);
+  const platform =
+    options.platform || platformFromAppCheckAppId(options.appId);
+  if (platform !== "ios" && platform !== "android") {
+    return {
+      subscriptionUsable: false,
+      decisionSource: "app_check",
+      denyReason: "unknown_app_id",
+      entitlementUsable: userData && userData.entitlementUsable != null
+        ? userData.entitlementUsable
+        : null,
+      entitlementExpiryIsFuture: false,
+      legacyStatusAllowsAccess: false,
+      legacyExpiryIsFuture: false,
+    };
+  }
+  const decision = evaluatePlatformEntitlement(userData, platform, now, options);
+  return {
+    subscriptionUsable: decision.usable,
+    decisionSource: decision.decisionSource,
+    denyReason: decision.denyReason,
+    entitlementUsable: userData && userData.entitlementUsable != null
+      ? userData.entitlementUsable
+      : null,
+    entitlementExpiryIsFuture: false,
+    legacyStatusAllowsAccess: decision.decisionSource === "legacyFallback",
+    legacyExpiryIsFuture: decision.expiryDate instanceof Date,
+    platform,
+  };
 }
 
 async function assertCallerSubscriptionUsable(uid, options = {}) {
@@ -71,6 +99,8 @@ async function assertCallerSubscriptionUsable(uid, options = {}) {
   const userData = userDoc.exists ? userDoc.data() || {} : {};
   const usability = evaluateCallerSubscriptionAccess(userData, now, {
     ...(parseExpiryWithMeta ? { parseExpiryWithMeta } : {}),
+    platform: options.platform,
+    appId: options.appId,
   });
 
   if (!usability.subscriptionUsable) {
@@ -565,7 +595,9 @@ exports.transcribeExperiment = onCall(
 
     let subscriptionCheck;
     try {
-      subscriptionCheck = await assertCallerSubscriptionUsable(uid);
+      subscriptionCheck = await assertCallerSubscriptionUsable(uid, {
+        appId: request.app && request.app.appId,
+      });
     } catch (e) {
       logger.error("transcribeExperiment: SUBSCRIPTION_CHECK_FAILED", {
         uidSuffix: uidSuffix(uid),

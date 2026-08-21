@@ -184,7 +184,7 @@ function runHandlerOrderTests() {
   const authIdx = transcribeSource.indexOf('code: "UNAUTHENTICATED"');
   const gateIdx = transcribeSource.indexOf("runTranscribeAdminGateAfterAuth(request)");
   const subscriptionIdx = transcribeSource.indexOf(
-    "subscriptionCheck = await assertCallerSubscriptionUsable(uid)",
+    "subscriptionCheck = await assertCallerSubscriptionUsable(uid",
   );
   const quotaIdx = transcribeSource.indexOf(
     "quota = await reserveDailyTranscribeQuota(uid",

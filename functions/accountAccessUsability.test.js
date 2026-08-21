@@ -152,8 +152,10 @@ assertUsability(
 const indexSource = fs.readFileSync(path.join(__dirname, "index.js"), "utf8");
 const describeCalls = indexSource.match(/describeAccountAccessUsability\(/g) || [];
 assert.ok(
-  describeCalls.length >= 2,
-  `sendMessageWithLimit should call describeAccountAccessUsability at least twice (sender+recipient), found ${describeCalls.length}`
+  describeCalls.length >= 1,
+  `sendMessageWithLimit recipient guard should still call describeAccountAccessUsability, found ${describeCalls.length}`
 );
+assert.match(indexSource, /evaluatePlatformEntitlement\(/);
+assert.match(indexSource, /platformFromAppCheckAppId\(/);
 
 console.log("accountAccessUsability.test.js: ok");
