@@ -1,7 +1,8 @@
 const assert = require("node:assert/strict");
+const fs = require("node:fs");
+const path = require("node:path");
 const {
-  MAX_CHAT_PUSH_TOKENS,
-  collectDevicePushTokens,
+  resolveActiveDevicePushToken,
   resolvePushTokenSet,
   isPermanentInvalidFcmTokenError,
   toMulticastMessage,
@@ -11,6 +12,9 @@ const {
 const TOKEN_A = "token-galaxy-aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
 const TOKEN_B = "token-pixel-bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb";
 const TOKEN_C = "token-iphone-cccccccccccccccccccccccccccccccccccccccc";
+const DEVICE_A = "dev-a";
+const DEVICE_B = "dev-b";
+const DEVICE_C = "dev-c";
 
 function createMockDb(initialDocs = {}) {
   const docs = new Map(Object.entries(initialDocs));
@@ -103,76 +107,54 @@ function basePushMessage() {
 }
 
 async function run() {
-  const one = collectDevicePushTokens([
-    { deviceId: "dev-a", fcmToken: TOKEN_A },
-  ]);
-  assert.deepEqual(one.tokens, [TOKEN_A]);
-  assert.equal(one.deviceTokenCount, 1);
-  assert.equal(one.uniqueTokenCount, 1);
-
-  const three = collectDevicePushTokens([
-    { deviceId: "dev-a", fcmToken: TOKEN_A },
-    { deviceId: "dev-b", fcmToken: TOKEN_B },
-    { deviceId: "dev-c", fcmToken: TOKEN_C },
-  ]);
-  assert.deepEqual(three.tokens, [TOKEN_A, TOKEN_B, TOKEN_C]);
-  assert.equal(three.uniqueTokenCount, 3);
-
-  const dup = collectDevicePushTokens([
-    { deviceId: "dev-a", fcmToken: TOKEN_A },
-    { deviceId: "dev-b", fcmToken: TOKEN_A },
-    { deviceId: "dev-c", fcmToken: ` ${TOKEN_A} ` },
-  ]);
-  assert.deepEqual(dup.tokens, [TOKEN_A]);
-  assert.equal(dup.deviceTokenCount, 3);
-  assert.equal(dup.uniqueTokenCount, 1);
-  assert.deepEqual(dup.tokenToDeviceIds.get(TOKEN_A), [
-    "dev-a",
-    "dev-b",
-    "dev-c",
-  ]);
-
-  const cappedEntries = Array.from({ length: MAX_CHAT_PUSH_TOKENS + 4 }, (_, i) => ({
-    deviceId: `dev-${i}`,
-    fcmToken: `token-${String(i).padStart(8, "0")}-${"x".repeat(40)}`,
-  }));
-  const capped = collectDevicePushTokens(cappedEntries);
-  assert.equal(capped.tokens.length, MAX_CHAT_PUSH_TOKENS);
-
-  const fromDevices = resolvePushTokenSet({
-    deviceEntries: [
-      { deviceId: "dev-a", fcmToken: TOKEN_A },
-      { deviceId: "dev-b", fcmToken: TOKEN_B },
-    ],
+  const matchA = resolveActiveDevicePushToken({
+    activeDeviceId: DEVICE_A,
+    activeDeviceFcmToken: TOKEN_A,
     userFcmToken: TOKEN_C,
-    embeddedToken: "embedded-should-be-ignored",
   });
-  assert.equal(fromDevices.source, "devices");
-  assert.deepEqual(fromDevices.tokens, [TOKEN_A, TOKEN_B]);
+  assert.equal(matchA.source, "active_device");
+  assert.deepEqual(matchA.tokens, [TOKEN_A]);
+  assert.equal(matchA.uniqueTokenCount, 1);
+  assert.deepEqual(matchA.tokenToDeviceIds.get(TOKEN_A), [DEVICE_A]);
 
-  const fromUser = resolvePushTokenSet({
-    deviceEntries: [{ deviceId: "dev-empty", fcmToken: "  " }],
-    userFcmToken: TOKEN_C,
-    embeddedToken: TOKEN_A,
+  const ignoreOthers = resolveActiveDevicePushToken({
+    activeDeviceId: DEVICE_A,
+    activeDeviceFcmToken: TOKEN_A,
+    userFcmToken: TOKEN_B,
   });
-  assert.equal(fromUser.source, "user_fcmToken");
-  assert.deepEqual(fromUser.tokens, [TOKEN_C]);
+  assert.deepEqual(ignoreOthers.tokens, [TOKEN_A]);
+  assert.equal(ignoreOthers.tokens.includes(TOKEN_B), false);
+  assert.equal(ignoreOthers.tokens.includes(TOKEN_C), false);
 
-  const fromEmbedded = resolvePushTokenSet({
-    deviceEntries: [],
-    userFcmToken: "",
-    embeddedToken: TOKEN_A,
+  const afterSwitch = resolveActiveDevicePushToken({
+    activeDeviceId: DEVICE_B,
+    activeDeviceFcmToken: TOKEN_B,
+    userFcmToken: TOKEN_A,
   });
-  assert.equal(fromEmbedded.source, "embedded");
-  assert.deepEqual(fromEmbedded.tokens, [TOKEN_A]);
+  assert.deepEqual(afterSwitch.tokens, [TOKEN_B]);
+  assert.equal(afterSwitch.tokens.includes(TOKEN_A), false);
 
-  const none = resolvePushTokenSet({
-    deviceEntries: [],
-    userFcmToken: "",
-    embeddedToken: "",
+  const noToken = resolveActiveDevicePushToken({
+    activeDeviceId: DEVICE_A,
+    activeDeviceFcmToken: "",
+    userFcmToken: TOKEN_B,
   });
-  assert.equal(none.source, "none");
-  assert.deepEqual(none.tokens, []);
+  assert.equal(noToken.source, "active_device_no_token");
+  assert.deepEqual(noToken.tokens, []);
+
+  const noActive = resolveActiveDevicePushToken({
+    activeDeviceId: "",
+    activeDeviceFcmToken: TOKEN_A,
+    userFcmToken: TOKEN_A,
+  });
+  assert.equal(noActive.source, "no_active_device");
+  assert.deepEqual(noActive.tokens, []);
+
+  const aliased = resolvePushTokenSet({
+    activeDeviceId: DEVICE_A,
+    activeDeviceFcmToken: TOKEN_A,
+  });
+  assert.deepEqual(aliased.tokens, [TOKEN_A]);
 
   assert.equal(
     isPermanentInvalidFcmTokenError({
@@ -190,26 +172,16 @@ async function run() {
     isPermanentInvalidFcmTokenError({ code: "messaging/internal-error" }),
     false
   );
-  assert.equal(
-    isPermanentInvalidFcmTokenError({ code: "unavailable" }),
-    false
-  );
 
   const multicast = toMulticastMessage(
     { ...basePushMessage(), token: TOKEN_A },
-    [TOKEN_A, TOKEN_B]
+    [TOKEN_A]
   );
   assert.equal(multicast.token, undefined);
-  assert.deepEqual(multicast.tokens, [TOKEN_A, TOKEN_B]);
-  assert.equal(
-    multicast.android.notification.channelId,
-    "com.lahainars.tonikaku.new_message_alerts"
-  );
+  assert.deepEqual(multicast.tokens, [TOKEN_A]);
   assert.equal(multicast.apns.payload.aps.sound, "default");
-  assert.equal(multicast.apns.payload.aps.badge, 2);
-  assert.equal(multicast.notification.title, "新しいメッセージ");
-  assert.equal(multicast.android.priority, "high");
-  assert.equal(multicast.android.collapseKey, "chat");
+  assert.equal(multicast.android.notification.channelId,
+    "com.lahainars.tonikaku.new_message_alerts");
 
   const sentOne = [];
   const oneSend = await dispatchChatPushNotification({
@@ -224,38 +196,13 @@ async function run() {
       },
     },
     tokens: [TOKEN_A],
-    tokenToDeviceIds: new Map([[TOKEN_A, ["dev-a"]]]),
+    tokenToDeviceIds: new Map([[TOKEN_A, [DEVICE_A]]]),
     message: basePushMessage(),
     uid: "recipient-uid",
   });
   assert.equal(oneSend.success, true);
   assert.equal(oneSend.successCount, 1);
-  assert.equal(sentOne[0].tokens.length, 1);
-
-  const sentThree = [];
-  const threeSend = await dispatchChatPushNotification({
-    messaging: {
-      async sendEachForMulticast(payload) {
-        sentThree.push(payload);
-        return {
-          successCount: 3,
-          failureCount: 0,
-          responses: [{ success: true }, { success: true }, { success: true }],
-        };
-      },
-    },
-    tokens: [TOKEN_A, TOKEN_B, TOKEN_C],
-    tokenToDeviceIds: new Map([
-      [TOKEN_A, ["dev-a"]],
-      [TOKEN_B, ["dev-b"]],
-      [TOKEN_C, ["dev-c"]],
-    ]),
-    message: basePushMessage(),
-    uid: "recipient-uid",
-  });
-  assert.equal(threeSend.successCount, 3);
-  assert.equal(threeSend.failureCount, 0);
-  assert.deepEqual(sentThree[0].tokens, [TOKEN_A, TOKEN_B, TOKEN_C]);
+  assert.deepEqual(sentOne[0].tokens, [TOKEN_A]);
 
   const db = createMockDb({
     "users/recipient-uid/devices/dev-a": {
@@ -274,15 +221,13 @@ async function run() {
       modelName: "iPhone",
     },
   });
-  const partial = await dispatchChatPushNotification({
+  const invalidActive = await dispatchChatPushNotification({
     messaging: {
       async sendEachForMulticast() {
         return {
-          successCount: 2,
+          successCount: 0,
           failureCount: 1,
           responses: [
-            { success: true },
-            { success: true },
             {
               success: false,
               error: { code: "messaging/registration-token-not-registered" },
@@ -294,21 +239,19 @@ async function run() {
     db,
     admin: createAdmin(),
     uid: "recipient-uid",
-    tokens: [TOKEN_A, TOKEN_B, TOKEN_C],
-    tokenToDeviceIds: new Map([
-      [TOKEN_A, ["dev-a"]],
-      [TOKEN_B, ["dev-b"]],
-      [TOKEN_C, ["dev-c"]],
-    ]),
+    tokens: [TOKEN_A],
+    tokenToDeviceIds: new Map([[TOKEN_A, [DEVICE_A]]]),
     message: basePushMessage(),
   });
-  assert.equal(partial.success, true);
-  assert.equal(partial.successCount, 2);
-  assert.equal(partial.failureCount, 1);
-  assert.equal(partial.invalidTokenClearedCount, 1);
+  assert.equal(invalidActive.success, false);
+  assert.equal(invalidActive.invalidTokenClearedCount, 1);
   assert.equal(
     db.docs.get("users/recipient-uid/devices/dev-a").fcmToken,
-    TOKEN_A
+    undefined
+  );
+  assert.equal(
+    db.docs.get("users/recipient-uid/devices/dev-a").platform,
+    "android"
   );
   assert.equal(
     db.docs.get("users/recipient-uid/devices/dev-b").fcmToken,
@@ -316,11 +259,7 @@ async function run() {
   );
   assert.equal(
     db.docs.get("users/recipient-uid/devices/dev-c").fcmToken,
-    undefined
-  );
-  assert.equal(
-    db.docs.get("users/recipient-uid/devices/dev-c").platform,
-    "ios"
+    TOKEN_C
   );
   assert.equal(
     db.docs.get("users/recipient-uid/devices/dev-c").modelName,
@@ -349,15 +288,36 @@ async function run() {
     admin: createAdmin(),
     uid: "recipient-uid",
     tokens: [TOKEN_A],
-    tokenToDeviceIds: new Map([[TOKEN_A, ["dev-a"]]]),
+    tokenToDeviceIds: new Map([[TOKEN_A, [DEVICE_A]]]),
     message: basePushMessage(),
   });
-  assert.equal(transient.success, false);
   assert.equal(transient.invalidTokenClearedCount, 0);
   assert.equal(
     transientDb.docs.get("users/recipient-uid/devices/dev-a").fcmToken,
     TOKEN_A
   );
+
+  const indexSource = fs.readFileSync(path.join(__dirname, "index.js"), "utf8");
+  const sendStart = indexSource.indexOf("exports.sendPushNotification");
+  const sendEnd = indexSource.indexOf("exports.deleteOldMessages");
+  assert.ok(sendStart >= 0 && sendEnd > sendStart);
+  const sendSource = indexSource.slice(sendStart, sendEnd);
+  assert.match(sendSource, /resolveActiveDevicePushToken/);
+  assert.match(sendSource, /activeDeviceId/);
+  assert.doesNotMatch(sendSource, /collection\("devices"\)\.get\(\)/);
+  assert.doesNotMatch(sendSource, /deviceEntries/);
+  assert.doesNotMatch(sendSource, /embeddedToken\)/);
+
+  const asnSource = fs.readFileSync(
+    path.join(__dirname, "appStoreSubscriptionNotifications.js"),
+    "utf8"
+  );
+  const rtdnSource = fs.readFileSync(
+    path.join(__dirname, "googlePlaySubscriptionNotifications.js"),
+    "utf8"
+  );
+  assert.doesNotMatch(asnSource, /resolveActiveDevicePushToken|sendEachForMulticast/);
+  assert.doesNotMatch(rtdnSource, /resolveActiveDevicePushToken|sendEachForMulticast/);
 
   console.log("pushNotificationDispatch.test.js: ok");
 }

@@ -18,6 +18,7 @@ const { loadAppConfig, assertAccessNotBlocked } = require("./appConfig");
 const { platformFromAppCheckAppId } = require("./appCheckPlatform");
 const { evaluatePlatformEntitlement } = require("./platformEntitlement");
 const { SENDER_SUBSCRIPTION_UNAVAILABLE } = require("./sendMessageGuardCodes");
+const { evaluateActiveDeviceGateForRequest } = require("./activeDeviceGate");
 const {
   DEFAULT_DAILY_TRANSCRIBE_LIMIT,
   MAX_AUDIO_BYTES,
@@ -569,6 +570,31 @@ exports.transcribeExperiment = onCall(
         sttProviderSetting: null,
       });
       return { ok: false, code: "UNAUTHENTICATED" };
+    }
+
+    const deviceGate = await evaluateActiveDeviceGateForRequest({
+      admin,
+      uid,
+      data: request.data,
+    });
+    if (!deviceGate.ok) {
+      logger.warn("transcribeExperiment: " + deviceGate.code, {
+        uidSuffix: uidSuffix(uid),
+      });
+      logSttEvent({
+        event: "transcribe_failed",
+        provider: null,
+        model: null,
+        receivedBytes: null,
+        apiLatencyMs: null,
+        totalLatencyMs: Date.now() - startedAt,
+        success: false,
+        errorCode: deviceGate.code,
+        textLength: null,
+        uidSuffix: uidSuffix(uid),
+        sttProviderSetting: null,
+      });
+      return { ok: false, code: deviceGate.code };
     }
 
     const adminGate = await runTranscribeAdminGateAfterAuth(request);

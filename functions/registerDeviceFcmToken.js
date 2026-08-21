@@ -1,6 +1,7 @@
 const { HttpsError } = require("firebase-functions/v2/https");
 const { tokenSuffix } = require("./billingFinalTrace");
 const { UUID_PATTERN } = require("./registerDeviceUsage");
+const { assertActiveDeviceAllowed } = require("./activeDeviceGate");
 
 const REGISTER_DEVICE_FCM_TOKEN_TAG = "KAMOME_DEVICE_FCM_TOKEN";
 const MAX_FCM_TOKEN_LENGTH = 4096;
@@ -50,12 +51,14 @@ function createRegisterDeviceFcmTokenHandler({ admin, logger }) {
     }
 
     const input = validateRegisterDeviceFcmTokenInput(request.data);
+    await assertActiveDeviceAllowed({
+      admin,
+      uid,
+      data: { deviceId: input.deviceId },
+    });
     const db = admin.getDb();
-    const deviceRef = db
-      .collection("users")
-      .doc(uid)
-      .collection("devices")
-      .doc(input.deviceId);
+    const userRef = db.collection("users").doc(uid);
+    const deviceRef = userRef.collection("devices").doc(input.deviceId);
     const snap = await deviceRef.get();
     const created = !snap.exists;
 
@@ -63,6 +66,12 @@ function createRegisterDeviceFcmTokenHandler({ admin, logger }) {
       {
         fcmToken: input.fcmToken,
         fcmUpdatedAt: admin.FieldValue.serverTimestamp(),
+      },
+      { merge: true }
+    );
+    await userRef.set(
+      {
+        fcmToken: input.fcmToken,
       },
       { merge: true }
     );

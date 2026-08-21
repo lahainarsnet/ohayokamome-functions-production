@@ -26,6 +26,7 @@ function createClearDeviceFcmTokenHandler({ admin, logger }) {
       throw new HttpsError("unauthenticated", "Authentication required.");
     }
 
+    // activeDeviceId gate は付けない。旧端末 logout が自分の token だけ消せるようにする。
     const input = validateClearDeviceFcmTokenInput(request.data);
     const deviceRef = admin
       .getDb()

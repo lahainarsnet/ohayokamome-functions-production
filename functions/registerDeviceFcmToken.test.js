@@ -9,6 +9,7 @@ const {
 } = require("./registerDeviceFcmToken");
 
 const VALID_DEVICE_ID = "550e8400-e29b-41d4-a716-446655440000";
+const OTHER_DEVICE_ID = "6ba7b810-9dad-11d1-80b4-00c04fd430c8";
 const OTHER_UID = "other-uid-001";
 const OWNER_UID = "owner-uid-001";
 const VALID_FCM_TOKEN =
@@ -17,8 +18,22 @@ const VALID_FCM_TOKEN =
 function createMockAdmin(initialDocs = {}) {
   const docs = new Map(Object.entries(initialDocs));
 
-  function docPath(uid, deviceId) {
-    return `users/${uid}/devices/${deviceId}`;
+  function applyMerge(existing, data) {
+    const next = { ...(existing || {}) };
+    for (const [field, value] of Object.entries(data)) {
+      next[field] = value;
+    }
+    return next;
+  }
+
+  function makeSnap(value) {
+    return {
+      exists: value != null,
+      data: () => value,
+      get(field) {
+        return value ? value[field] : undefined;
+      },
+    };
   }
 
   return {
@@ -35,30 +50,33 @@ function createMockAdmin(initialDocs = {}) {
           }
           return {
             doc(uid) {
+              const userPath = `users/${uid}`;
               return {
+                async get() {
+                  return makeSnap(docs.get(userPath));
+                },
+                async set(data, options = {}) {
+                  if (options.merge) {
+                    docs.set(userPath, applyMerge(docs.get(userPath), data));
+                    return;
+                  }
+                  docs.set(userPath, { ...data });
+                },
                 collection(subName) {
                   if (subName !== "devices") {
                     throw new Error(`Unexpected subcollection: ${subName}`);
                   }
                   return {
                     doc(deviceId) {
-                      const key = docPath(uid, deviceId);
+                      const key = `${userPath}/devices/${deviceId}`;
                       return {
                         key,
                         async get() {
-                          const value = docs.get(key);
-                          return {
-                            exists: value != null,
-                            data: () => value,
-                            get(field) {
-                              return value ? value[field] : undefined;
-                            },
-                          };
+                          return makeSnap(docs.get(key));
                         },
                         async set(data, options = {}) {
                           if (options.merge) {
-                            const existing = docs.get(key) || {};
-                            docs.set(key, { ...existing, ...data });
+                            docs.set(key, applyMerge(docs.get(key), data));
                             return;
                           }
                           docs.set(key, { ...data });
@@ -154,7 +172,11 @@ async function run() {
     (error) => error instanceof HttpsError && error.code === "invalid-argument"
   );
 
-  const admin = createMockAdmin();
+  const admin = createMockAdmin({
+    [`users/${OWNER_UID}`]: {
+      activeDeviceId: VALID_DEVICE_ID,
+    },
+  });
   const logger = createTestLogger();
   const handler = createRegisterDeviceFcmTokenHandler({ admin, logger });
 
@@ -184,6 +206,10 @@ async function run() {
   assert.equal(createdDoc.fcmToken, VALID_FCM_TOKEN);
   assert.equal(createdDoc.fcmUpdatedAt.__type, "serverTimestamp");
   assert.equal(createdDoc.platform, undefined);
+  assert.equal(
+    admin.docs.get(`users/${OWNER_UID}`).fcmToken,
+    VALID_FCM_TOKEN
+  );
 
   const existingKey = `users/${OWNER_UID}/devices/${VALID_DEVICE_ID}`;
   const existingStamp = { __type: "serverTimestamp", label: "firstUsedAt" };
@@ -197,6 +223,11 @@ async function run() {
     lastUsedAt: existingStamp,
     fcmToken: "old-token-should-be-replaced-but-keep-other-fields-here-xxxxx",
     fcmUpdatedAt: { __type: "serverTimestamp", label: "old" },
+  });
+  admin.docs.set(`users/${OWNER_UID}`, {
+    activeDeviceId: VALID_DEVICE_ID,
+    fcmToken: "old-token-should-be-replaced-but-keep-other-fields-here-xxxxx",
+    email: "owner@example.com",
   });
 
   const merged = await runHandler(handler, {
@@ -218,11 +249,22 @@ async function run() {
   assert.equal(mergedDoc.buildNumber, "252");
   assert.deepEqual(mergedDoc.firstUsedAt, existingStamp);
   assert.deepEqual(mergedDoc.lastUsedAt, existingStamp);
+  assert.equal(
+    admin.docs.get(`users/${OWNER_UID}`).fcmToken,
+    VALID_FCM_TOKEN
+  );
+  assert.equal(admin.docs.get(`users/${OWNER_UID}`).email, "owner@example.com");
 
   const otherUserAdmin = createMockAdmin({
+    [`users/${OWNER_UID}`]: {
+      activeDeviceId: VALID_DEVICE_ID,
+    },
     [`users/${OWNER_UID}/devices/${VALID_DEVICE_ID}`]: {
       platform: "ios",
       fcmToken: VALID_FCM_TOKEN,
+    },
+    [`users/${OTHER_UID}`]: {
+      activeDeviceId: VALID_DEVICE_ID,
     },
   });
   const otherHandler = createRegisterDeviceFcmTokenHandler({
@@ -250,6 +292,66 @@ async function run() {
       .fcmToken,
     VALID_FCM_TOKEN
   );
+
+  const mismatchAdmin = createMockAdmin({
+    [`users/${OWNER_UID}`]: {
+      activeDeviceId: VALID_DEVICE_ID,
+      fcmToken: VALID_FCM_TOKEN,
+    },
+    [`users/${OWNER_UID}/devices/${VALID_DEVICE_ID}`]: {
+      fcmToken: VALID_FCM_TOKEN,
+      platform: "ios",
+    },
+    [`users/${OWNER_UID}/devices/${OTHER_DEVICE_ID}`]: {
+      fcmToken: "old-other-device-token-should-not-be-replaced-here-xxxxx",
+      platform: "android",
+    },
+  });
+  const mismatchHandler = createRegisterDeviceFcmTokenHandler({
+    admin: mismatchAdmin,
+    logger: createTestLogger(),
+  });
+  const mismatch = await runHandler(mismatchHandler, {
+    auth: { uid: OWNER_UID },
+    data: {
+      deviceId: OTHER_DEVICE_ID,
+      fcmToken: VALID_FCM_TOKEN,
+    },
+  });
+  assert.equal(mismatch.ok, false);
+  assert.equal(mismatch.error.code, "failed-precondition");
+  assert.equal(mismatch.error.details.code, "ACTIVE_DEVICE_MISMATCH");
+  assert.equal(
+    mismatchAdmin.docs.get(`users/${OWNER_UID}/devices/${OTHER_DEVICE_ID}`)
+      .fcmToken,
+    "old-other-device-token-should-not-be-replaced-here-xxxxx"
+  );
+  assert.equal(
+    mismatchAdmin.docs.get(`users/${OWNER_UID}`).fcmToken,
+    VALID_FCM_TOKEN
+  );
+
+  const unsetAdmin = createMockAdmin({
+    [`users/${OWNER_UID}`]: {
+      email: "owner@example.com",
+    },
+  });
+  const unsetHandler = createRegisterDeviceFcmTokenHandler({
+    admin: unsetAdmin,
+    logger: createTestLogger(),
+  });
+  const unset = await runHandler(unsetHandler, {
+    auth: { uid: OWNER_UID },
+    data: {
+      deviceId: VALID_DEVICE_ID,
+      fcmToken: VALID_FCM_TOKEN,
+    },
+  });
+  assert.equal(unset.ok, false);
+  assert.equal(unset.error.details.code, "ACTIVE_DEVICE_MISMATCH");
+
+  const source = fs.readFileSync(path.join(__dirname, "registerDeviceFcmToken.js"), "utf8");
+  assert.match(source, /assertActiveDeviceAllowed/);
 
   const invalidDevice = await runHandler(handler, {
     auth: { uid: OWNER_UID },

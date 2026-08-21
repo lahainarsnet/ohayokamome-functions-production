@@ -31,7 +31,14 @@ const {
   createClearDeviceFcmTokenHandler,
 } = require("./clearDeviceFcmToken");
 const {
-  resolvePushTokenSet,
+  createClaimActiveDeviceHandler,
+} = require("./claimActiveDevice");
+const {
+  evaluateActiveDeviceGateForRequest,
+  assertActiveDeviceAllowed,
+} = require("./activeDeviceGate");
+const {
+  resolveActiveDevicePushToken,
   dispatchChatPushNotification,
 } = require("./pushNotificationDispatch");
 const {
@@ -898,22 +905,26 @@ exports.sendPushNotification = onDocumentCreated(
 
     const embeddedToken = message.token || "";
     let userFcmToken = "";
-    let deviceEntries = [];
+    let activeDeviceId = "";
+    let activeDeviceFcmToken = "";
 
     if (recipientId) {
       try {
         const userRef = admin.getDb().collection("users").doc(recipientId);
-        const [recipientDoc, devicesSnap] = await Promise.all([
-          userRef.get(),
-          userRef.collection("devices").get(),
-        ]);
+        const recipientDoc = await userRef.get();
         userFcmToken = recipientDoc.get("fcmToken") || "";
-        deviceEntries = devicesSnap.docs.map((doc) => ({
-          deviceId: doc.id,
-          fcmToken: doc.get("fcmToken"),
-        }));
+        activeDeviceId = String(recipientDoc.get("activeDeviceId") || "").trim();
+        if (activeDeviceId) {
+          const activeDeviceSnap = await userRef
+            .collection("devices")
+            .doc(activeDeviceId)
+            .get();
+          if (activeDeviceSnap.exists) {
+            activeDeviceFcmToken = activeDeviceSnap.get("fcmToken") || "";
+          }
+        }
       } catch (e) {
-        logger.warn("Failed to fetch recipient FCM tokens; falling back to embedded token.", {
+        logger.warn("Failed to fetch recipient FCM tokens; skip push.", {
           recipientIdSuffix: uidTailForLog(recipientId),
           errorType: e?.constructor?.name || typeof e,
         });
@@ -925,16 +936,18 @@ exports.sendPushNotification = onDocumentCreated(
       });
     }
 
-    const resolvedTokens = resolvePushTokenSet({
-      deviceEntries,
+    const resolvedTokens = resolveActiveDevicePushToken({
+      activeDeviceId,
+      activeDeviceFcmToken,
       userFcmToken,
-      embeddedToken,
     });
     if (resolvedTokens.tokens.length === 0) {
       logger.warn("FCM token missing; skip send.", {
         chatIdTail: logIdTailForLog(chatId),
         messageIdTail: logIdTailForLog(messageId),
         recipientIdSuffix: uidTailForLog(recipientId),
+        source: resolvedTokens.source,
+        hasEmbeddedToken: Boolean(String(embeddedToken || "").trim()),
       });
       return { success: false, reason: "MISSING_TOKEN" };
     }
@@ -1190,6 +1203,18 @@ exports.sendMessageWithLimit = onCall(
       senderUidTail: uidTailForLog(senderId),
     });
     return { success: false, code: "SENDER_AUTH_MISMATCH" };
+  }
+
+  const deviceGate = await evaluateActiveDeviceGateForRequest({
+    admin,
+    uid: senderId,
+    data: request.data,
+  });
+  if (!deviceGate.ok) {
+    logger.warn("sendMessageWithLimit: " + deviceGate.code, {
+      senderUidTail: uidTailForLog(senderId),
+    });
+    return { success: false, code: deviceGate.code };
   }
 
   const senderPlatform = platformFromAppCheckAppId(
@@ -1743,6 +1768,12 @@ exports.verifyGooglePlaySubscriptionPurchase = onCall(
       throw new HttpsError("unauthenticated", "Sign-in is required.");
     }
 
+    await assertActiveDeviceAllowed({
+      admin,
+      uid,
+      data: request.data,
+    });
+
     await assertPurchasingPlatformAllowed(uid, "android");
 
     const data = request.data || {};
@@ -2009,6 +2040,12 @@ exports.verifyAppStoreSubscriptionPurchase = onCall(
       dataTransactionIdSuffix: billingTokenSuffix(data.transactionId),
       extractedTransactionIdSuffix: billingTokenSuffix(transactionId),
       environmentHint: environmentHint || null,
+    });
+
+    await assertActiveDeviceAllowed({
+      admin,
+      uid,
+      data,
     });
 
     await assertPurchasingPlatformAllowed(uid, "ios", traceId);
@@ -2381,6 +2418,12 @@ exports.ensureAppStoreAppAccountToken = onCall({ enforceAppCheck: true }, async 
     payloadKeys: payloadKeys(data),
   });
 
+  await assertActiveDeviceAllowed({
+    admin,
+    uid,
+    data,
+  });
+
   try {
     const token = await ensureAppStoreAppAccountTokenForUser(admin.getDb(), admin, {
       uid,
@@ -2567,6 +2610,15 @@ exports.registerDeviceFcmToken = onCall(
 exports.clearDeviceFcmToken = onCall(
   { region: "us-central1", enforceAppCheck: true },
   createClearDeviceFcmTokenHandler({ admin, logger }),
+);
+
+/* =========================================================
+ * Active device claim (1 account = 1 usable device)
+ *  - Separate from registerDeviceUsage / registerDeviceFcmToken
+ * =======================================================*/
+exports.claimActiveDevice = onCall(
+  { region: "us-central1", enforceAppCheck: true },
+  createClaimActiveDeviceHandler({ admin, logger }),
 );
 
 exports.acknowledgeCrossPlatformSwitch = onCall(

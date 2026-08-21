@@ -209,6 +209,11 @@ async function run() {
     indexSource,
     /exports\.clearDeviceFcmToken = onCall\([\s\S]*enforceAppCheck: true/
   );
+  const clearSource = fs.readFileSync(
+    path.join(__dirname, "clearDeviceFcmToken.js"),
+    "utf8"
+  );
+  assert.doesNotMatch(clearSource, /assertActiveDeviceAllowed/);
 
   console.log("clearDeviceFcmToken.test.js: ok");
 }

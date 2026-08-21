@@ -1,5 +1,3 @@
-const MAX_CHAT_PUSH_TOKENS = 16;
-
 function normalizePushToken(value) {
   if (typeof value !== "string") {
     return "";
@@ -7,81 +5,66 @@ function normalizePushToken(value) {
   return value.trim();
 }
 
-function collectDevicePushTokens(deviceEntries, { limit = MAX_CHAT_PUSH_TOKENS } = {}) {
-  const tokenToDeviceIds = new Map();
-  let deviceTokenCount = 0;
+function normalizeDeviceId(value) {
+  return String(value ?? "").trim();
+}
 
-  for (const entry of Array.isArray(deviceEntries) ? deviceEntries : []) {
-    const token = normalizePushToken(entry?.fcmToken);
-    if (!token) {
-      continue;
-    }
-    deviceTokenCount += 1;
-    const deviceId = String(entry?.deviceId || "").trim();
-    if (!tokenToDeviceIds.has(token)) {
-      tokenToDeviceIds.set(token, []);
-    }
-    if (deviceId) {
-      tokenToDeviceIds.get(token).push(deviceId);
-    }
-  }
-
-  const tokens = [];
-  for (const token of tokenToDeviceIds.keys()) {
-    tokens.push(token);
-    if (tokens.length >= limit) {
-      break;
-    }
-  }
-
+function emptyPushTokenSet(source, deviceId = "") {
   return {
-    tokens,
-    deviceTokenCount,
-    uniqueTokenCount: tokens.length,
-    tokenToDeviceIds,
+    tokens: [],
+    deviceId,
+    source,
+    uniqueTokenCount: 0,
+    deviceTokenCount: 0,
+    tokenToDeviceIds: new Map(),
   };
 }
 
-function resolvePushTokenSet({
-  deviceEntries = [],
+/**
+ * 通知先は users/{uid}.activeDeviceId の 1 token だけ。
+ * 旧端末 devices には送らない。users.fcmToken は active token と確認できるときだけ。
+ */
+function resolveActiveDevicePushToken({
+  activeDeviceId = "",
+  activeDeviceFcmToken = "",
   userFcmToken = "",
-  embeddedToken = "",
-  limit = MAX_CHAT_PUSH_TOKENS,
 } = {}) {
-  const collected = collectDevicePushTokens(deviceEntries, { limit });
-  if (collected.tokens.length > 0) {
-    return { ...collected, source: "devices" };
+  const deviceId = normalizeDeviceId(activeDeviceId);
+  if (!deviceId) {
+    return emptyPushTokenSet("no_active_device");
+  }
+
+  const deviceToken = normalizePushToken(activeDeviceFcmToken);
+  if (deviceToken) {
+    return {
+      tokens: [deviceToken],
+      deviceId,
+      source: "active_device",
+      uniqueTokenCount: 1,
+      deviceTokenCount: 1,
+      tokenToDeviceIds: new Map([[deviceToken, [deviceId]]]),
+    };
   }
 
   const userToken = normalizePushToken(userFcmToken);
-  if (userToken) {
+  // active 端末 token と同一だと確認できる場合だけ users.fcmToken を使う。
+  // device token が空なら確認できないので送らない（旧端末へ fallback しない）。
+  if (userToken && userToken === deviceToken) {
     return {
       tokens: [userToken],
-      deviceTokenCount: 0,
-      uniqueTokenCount: 1,
-      tokenToDeviceIds: new Map(),
+      deviceId,
       source: "user_fcmToken",
-    };
-  }
-
-  const embedded = normalizePushToken(embeddedToken);
-  if (embedded) {
-    return {
-      tokens: [embedded],
-      deviceTokenCount: 0,
       uniqueTokenCount: 1,
-      tokenToDeviceIds: new Map(),
-      source: "embedded",
+      deviceTokenCount: 0,
+      tokenToDeviceIds: new Map([[userToken, [deviceId]]]),
     };
   }
 
-  return {
-    tokens: [],
-    deviceTokenCount: 0,
-    uniqueTokenCount: 0,
-    tokenToDeviceIds: new Map(),
-    source: "none",
-  };
+  return emptyPushTokenSet("active_device_no_token", deviceId);
+}
+
+function resolvePushTokenSet(options = {}) {
+  return resolveActiveDevicePushToken(options);
 }
 
 function isPermanentInvalidFcmTokenError(error) {
@@ -182,9 +165,8 @@ async function dispatchChatPushNotification({
 }
 
 module.exports = {
-  MAX_CHAT_PUSH_TOKENS,
   normalizePushToken,
-  collectDevicePushTokens,
+  resolveActiveDevicePushToken,
   resolvePushTokenSet,
   isPermanentInvalidFcmTokenError,
   toMulticastMessage,

@@ -10,6 +10,7 @@ const sendEnd = indexSource.indexOf("exports.deleteMyAccount");
 assert.ok(sendStart >= 0 && sendEnd > sendStart, "sendMessageWithLimit region");
 const sendSource = indexSource.slice(sendStart, sendEnd);
 
+assert.match(sendSource, /evaluateActiveDeviceGateForRequest/);
 assert.match(sendSource, /platformFromAppCheckAppId\(/);
 assert.match(sendSource, /request\.app && request\.app\.appId/);
 assert.match(sendSource, /evaluatePlatformEntitlement\(/);
@@ -27,6 +28,7 @@ const transcribeSource = fs.readFileSync(
   path.join(__dirname, "transcribeExperiment.js"),
   "utf8"
 );
+assert.match(transcribeSource, /evaluateActiveDeviceGateForRequest/);
 assert.match(
   transcribeSource,
   /assertCallerSubscriptionUsable\(uid, \{\s*appId: request\.app && request\.app\.appId/
@@ -40,6 +42,7 @@ const asnSource = fs.readFileSync(
 );
 assert.doesNotMatch(asnSource, /platformFromAppCheckAppId/);
 assert.doesNotMatch(asnSource, /evaluatePlatformEntitlement/);
+assert.doesNotMatch(asnSource, /evaluateActiveDeviceGateForRequest|assertActiveDeviceAllowed/);
 
 const rtdnSource = fs.readFileSync(
   path.join(__dirname, "googlePlaySubscriptionNotifications.js"),
@@ -47,5 +50,6 @@ const rtdnSource = fs.readFileSync(
 );
 assert.doesNotMatch(rtdnSource, /platformFromAppCheckAppId/);
 assert.doesNotMatch(rtdnSource, /evaluatePlatformEntitlement/);
+assert.doesNotMatch(rtdnSource, /evaluateActiveDeviceGateForRequest|assertActiveDeviceAllowed/);
 
 console.log("sendMessagePlatformGate.test.js: ok");
