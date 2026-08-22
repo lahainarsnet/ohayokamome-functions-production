@@ -30,7 +30,12 @@ function createInvalidDeviceIdError() {
   });
 }
 
-async function evaluateActiveDeviceGate({ getUserData, uid, data }) {
+async function evaluateActiveDeviceGate({
+  getUserData,
+  uid,
+  data,
+  allowPendingDevice = false,
+}) {
   const extracted = extractRequestDeviceId(data);
   if (!extracted.ok) {
     return {
@@ -42,22 +47,37 @@ async function evaluateActiveDeviceGate({ getUserData, uid, data }) {
 
   const userData = (await getUserData(uid)) || {};
   const activeDeviceId = normalizeDeviceId(userData.activeDeviceId);
-  // Step 2 で初回 claim 済みが前提。未設定は旧端末/未移行の重要処理を拒否する。
-  if (!activeDeviceId || activeDeviceId !== extracted.deviceId) {
-    return {
-      ok: false,
-      code: ACTIVE_DEVICE_MISMATCH,
-      httpsError: createActiveDeviceMismatchError(),
-    };
+  if (activeDeviceId && activeDeviceId === extracted.deviceId) {
+    return { ok: true, deviceId: extracted.deviceId };
   }
+  const pendingDeviceId = normalizeDeviceId(userData.pendingActiveDeviceId);
+  if (
+    allowPendingDevice &&
+    pendingDeviceId &&
+    pendingDeviceId === extracted.deviceId
+  ) {
+    return { ok: true, deviceId: extracted.deviceId, viaPending: true };
+  }
+  // Step 2 で初回 claim 済みが前提。未設定は旧端末/未移行の重要処理を拒否する。
+  return {
+    ok: false,
+    code: ACTIVE_DEVICE_MISMATCH,
+    httpsError: createActiveDeviceMismatchError(),
+  };
 
   return { ok: true, deviceId: extracted.deviceId };
 }
 
-async function evaluateActiveDeviceGateForRequest({ admin, uid, data }) {
+async function evaluateActiveDeviceGateForRequest({
+  admin,
+  uid,
+  data,
+  allowPendingDevice = false,
+}) {
   return evaluateActiveDeviceGate({
     uid,
     data,
+    allowPendingDevice,
     getUserData: async (userId) => {
       const snap = await admin.getDb().collection("users").doc(userId).get();
       return snap.exists ? snap.data() || {} : {};
@@ -65,8 +85,18 @@ async function evaluateActiveDeviceGateForRequest({ admin, uid, data }) {
   });
 }
 
-async function assertActiveDeviceAllowed({ admin, uid, data }) {
-  const result = await evaluateActiveDeviceGateForRequest({ admin, uid, data });
+async function assertActiveDeviceAllowed({
+  admin,
+  uid,
+  data,
+  allowPendingDevice = false,
+}) {
+  const result = await evaluateActiveDeviceGateForRequest({
+    admin,
+    uid,
+    data,
+    allowPendingDevice,
+  });
   if (!result.ok) {
     throw result.httpsError;
   }

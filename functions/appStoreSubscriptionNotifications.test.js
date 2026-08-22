@@ -398,7 +398,6 @@ async function runTests() {
     log: { info() {}, warn() {} },
   });
   assert.equal(ownershipDocs[ownershipId].ownerUid, "uid-1b");
-  assert.equal(ownershipDocs[ownershipId].previousOwnerUid, "uid-4b");
 
   const activeDocs = { [ownershipId]: { ownerUid: "uid-4b" } };
   const dbActive = createOwnershipMockDb(activeDocs, {

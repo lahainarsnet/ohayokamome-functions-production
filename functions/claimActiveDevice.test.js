@@ -457,6 +457,45 @@ async function run() {
   );
   assert.ok(!otherAdmin.docs.has(`users/${OWNER_UID}/devices/${DEVICE_B}`));
 
+  const reserveAdmin = createMockAdmin({
+    [`users/${OWNER_UID}`]: {
+      email: "owner@example.com",
+      activeDeviceId: DEVICE_A,
+    },
+    [`users/${OWNER_UID}/devices/${DEVICE_A}`]: {
+      deviceId: DEVICE_A,
+    },
+  });
+  const reserved = await runHandler(
+    createClaimActiveDeviceHandler({ admin: reserveAdmin, logger }),
+    authedRequest(
+      OWNER_UID,
+      devicePayload(DEVICE_B, {
+        mode: "reserve",
+        claimReason: "reserve",
+      })
+    )
+  );
+  assert.equal(reserved.ok, true);
+  const reservedUser = reserveAdmin.docs.get(`users/${OWNER_UID}`);
+  assert.equal(reservedUser.activeDeviceId, DEVICE_A);
+  assert.equal(reservedUser.pendingActiveDeviceId, DEVICE_B);
+
+  const promoted = await runHandler(
+    createClaimActiveDeviceHandler({ admin: reserveAdmin, logger }),
+    authedRequest(
+      OWNER_UID,
+      devicePayload(DEVICE_B, {
+        mode: "confirmed",
+        claimReason: "confirmed",
+      })
+    )
+  );
+  assert.equal(promoted.ok, true);
+  const promotedUser = reserveAdmin.docs.get(`users/${OWNER_UID}`);
+  assert.equal(promotedUser.activeDeviceId, DEVICE_B);
+  assert.equal(promotedUser.pendingActiveDeviceId, "");
+
   const indexSource = fs.readFileSync(path.join(__dirname, "index.js"), "utf8");
   assert.match(
     indexSource,

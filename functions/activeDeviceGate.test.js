@@ -45,6 +45,29 @@ async function evaluate(userData, deviceId) {
   assert.equal(match.ok, true);
   assert.equal(match.deviceId, DEVICE_A);
 
+  const pendingAllowed = await evaluateActiveDeviceGate({
+    uid: OWNER_UID,
+    data: { deviceId: DEVICE_B },
+    allowPendingDevice: true,
+    getUserData: async () => ({
+      activeDeviceId: DEVICE_A,
+      pendingActiveDeviceId: DEVICE_B,
+    }),
+  });
+  assert.equal(pendingAllowed.ok, true);
+  assert.equal(pendingAllowed.viaPending, true);
+
+  const pendingDeniedForSend = await evaluateActiveDeviceGate({
+    uid: OWNER_UID,
+    data: { deviceId: DEVICE_B },
+    getUserData: async () => ({
+      activeDeviceId: DEVICE_A,
+      pendingActiveDeviceId: DEVICE_B,
+    }),
+  });
+  assert.equal(pendingDeniedForSend.ok, false);
+  assert.equal(pendingDeniedForSend.code, ACTIVE_DEVICE_MISMATCH);
+
   const mismatch = await evaluate({ activeDeviceId: DEVICE_A }, DEVICE_B);
   assert.equal(mismatch.ok, false);
   assert.equal(mismatch.code, ACTIVE_DEVICE_MISMATCH);

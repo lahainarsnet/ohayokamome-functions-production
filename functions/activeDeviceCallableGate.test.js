@@ -97,6 +97,18 @@ assertGateBefore(
   "ensureAppStoreAppAccountToken"
 );
 
+const inspectSource = exportBlock(
+  indexSource,
+  "inspectSubscriptionSeriesOwnership"
+);
+assert.match(inspectSource, /assertActiveDeviceAllowed/);
+const inspectHandlerSource = fs.readFileSync(
+  path.join(__dirname, "inspectSubscriptionSeriesOwnership.js"),
+  "utf8"
+);
+assert.match(inspectHandlerSource, /assertActiveDeviceAllowed/);
+assert.match(inspectHandlerSource, /allowPendingDevice: true/);
+
 const ungated = [
   "handleAppStoreServerNotification",
   "handleGooglePlayRtdn",

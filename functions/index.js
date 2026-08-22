@@ -34,6 +34,9 @@ const {
   createClaimActiveDeviceHandler,
 } = require("./claimActiveDevice");
 const {
+  createInspectSubscriptionSeriesOwnershipHandler,
+} = require("./inspectSubscriptionSeriesOwnership");
+const {
   evaluateActiveDeviceGateForRequest,
   assertActiveDeviceAllowed,
 } = require("./activeDeviceGate");
@@ -1644,6 +1647,9 @@ exports.upsertUserEmailAndAccount = onCall({ enforceAppCheck: true }, async (req
       accountId: accountIdToUse,
       updatedAt: admin.FieldValue.serverTimestamp(),
     };
+    if (!snap.exists) {
+      update.appTypes = ["basic"];
+    }
 
     await userRef.set(update, { merge: true });
 
@@ -1772,6 +1778,7 @@ exports.verifyGooglePlaySubscriptionPurchase = onCall(
       admin,
       uid,
       data: request.data,
+      allowPendingDevice: true,
     });
 
     await assertPurchasingPlatformAllowed(uid, "android");
@@ -2046,6 +2053,7 @@ exports.verifyAppStoreSubscriptionPurchase = onCall(
       admin,
       uid,
       data,
+      allowPendingDevice: true,
     });
 
     await assertPurchasingPlatformAllowed(uid, "ios", traceId);
@@ -2422,6 +2430,7 @@ exports.ensureAppStoreAppAccountToken = onCall({ enforceAppCheck: true }, async 
     admin,
     uid,
     data,
+    allowPendingDevice: true,
   });
 
   try {
@@ -2624,6 +2633,15 @@ exports.claimActiveDevice = onCall(
 exports.acknowledgeCrossPlatformSwitch = onCall(
   { region: "us-central1", enforceAppCheck: true },
   createAcknowledgeCrossPlatformSwitchHandler({ admin, logger }),
+);
+
+exports.inspectSubscriptionSeriesOwnership = onCall(
+  { region: "us-central1", enforceAppCheck: true },
+  createInspectSubscriptionSeriesOwnershipHandler({
+    admin,
+    logger,
+    assertActiveDeviceAllowed,
+  }),
 );
 
 exports.transcribeExperiment = transcribeExperiment;

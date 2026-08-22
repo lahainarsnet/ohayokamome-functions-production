@@ -236,6 +236,7 @@ function runExemptFunctionTests() {
     "verifyAppStoreSubscriptionPurchase",
     "verifyGooglePlaySubscriptionPurchase",
     "ensureAppStoreAppAccountToken",
+    "inspectSubscriptionSeriesOwnership",
     "deleteMyAccount",
     "adminUpsertUserSubscription",
   ];

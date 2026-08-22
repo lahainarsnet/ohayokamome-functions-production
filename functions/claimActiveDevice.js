@@ -38,25 +38,29 @@ function normalizeClaimReason(value) {
   if (
     normalized === "auto" ||
     normalized === "confirmed" ||
-    normalized === "retry"
+    normalized === "retry" ||
+    normalized === "reserve"
   ) {
     return normalized;
   }
   return null;
 }
 
-// auto | confirmed。不正・欠落は安全側の auto（既存activeを上書きしない）。
+// auto | confirmed | reserve。不正・欠落は安全側の auto（既存activeを上書きしない）。
 function normalizeClaimMode(data) {
   if (!isPlainObject(data)) {
     return "auto";
   }
   const mode = String(data.mode ?? "").trim();
-  if (mode === "auto" || mode === "confirmed") {
+  if (mode === "auto" || mode === "confirmed" || mode === "reserve") {
     return mode;
   }
   const reason = normalizeClaimReason(data.claimReason);
   if (reason === "confirmed" || reason === "retry") {
     return "confirmed";
+  }
+  if (reason === "reserve") {
+    return "reserve";
   }
   return "auto";
 }
@@ -114,6 +118,40 @@ function createClaimActiveDeviceHandler({ admin, logger }) {
         Boolean(previousActiveDeviceId) &&
         previousActiveDeviceId !== input.deviceId;
 
+      if (input.mode === "reserve") {
+        const userUpdate = {
+          pendingActiveDeviceId: input.deviceId,
+          pendingActiveDeviceUpdatedAt: now,
+        };
+        if (input.fcmToken) {
+          userUpdate.fcmToken = input.fcmToken;
+        }
+        tx.set(userRef, userUpdate, { merge: true });
+        const deviceUpdate = {
+          deviceId: input.deviceId,
+          platform: input.platform,
+          modelName: input.modelName,
+          appVersion: input.appVersion,
+          buildNumber: input.buildNumber,
+          lastUsedAt: now,
+        };
+        if (created) {
+          deviceUpdate.firstUsedAt = now;
+        }
+        if (input.fcmToken) {
+          deviceUpdate.fcmToken = input.fcmToken;
+          deviceUpdate.fcmUpdatedAt = now;
+        }
+        tx.set(deviceRef, deviceUpdate, { merge: true });
+        return {
+          denied: false,
+          created,
+          switched: false,
+          reserved: true,
+          previousActiveDeviceId,
+        };
+      }
+
       if (input.mode === "auto" && switched) {
         logger.info(CLAIM_ACTIVE_DEVICE_TAG, {
           event: "claim_active_device.needs_confirmation",
@@ -132,6 +170,7 @@ function createClaimActiveDeviceHandler({ admin, logger }) {
       const userUpdate = {
         activeDeviceId: input.deviceId,
         activeDeviceUpdatedAt: now,
+        pendingActiveDeviceId: "",
       };
       if (input.fcmToken) {
         userUpdate.fcmToken = input.fcmToken;
