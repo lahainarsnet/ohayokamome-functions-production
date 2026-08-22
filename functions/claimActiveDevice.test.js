@@ -7,6 +7,7 @@ const { HttpsError } = require("firebase-functions/v2/https");
 const {
   createClaimActiveDeviceHandler,
   validateClaimActiveDeviceInput,
+  CLAIM_ACTIVE_DEVICE_NEEDS_CONFIRMATION,
 } = require("./claimActiveDevice");
 
 const DEVICE_A = "550e8400-e29b-41d4-a716-446655440000";
@@ -141,6 +142,35 @@ async function run() {
   const input = validateClaimActiveDeviceInput(devicePayload(DEVICE_A));
   assert.equal(input.deviceId, DEVICE_A);
   assert.equal(input.fcmToken, "");
+  assert.equal(input.claimReason, null);
+  assert.equal(input.mode, "auto");
+
+  const confirmedInput = validateClaimActiveDeviceInput(
+    devicePayload(DEVICE_A, { claimReason: "confirmed" })
+  );
+  assert.equal(confirmedInput.claimReason, "confirmed");
+  assert.equal(confirmedInput.mode, "confirmed");
+  const retryInput = validateClaimActiveDeviceInput(
+    devicePayload(DEVICE_A, { claimReason: "retry" })
+  );
+  assert.equal(retryInput.mode, "confirmed");
+  const ignoredReason = validateClaimActiveDeviceInput(
+    devicePayload(DEVICE_A, { claimReason: "hack" })
+  );
+  assert.equal(ignoredReason.claimReason, null);
+  assert.equal(ignoredReason.mode, "auto");
+  const explicitAuto = validateClaimActiveDeviceInput(
+    devicePayload(DEVICE_A, { mode: "auto", claimReason: "confirmed" })
+  );
+  assert.equal(explicitAuto.mode, "auto");
+  const explicitConfirmed = validateClaimActiveDeviceInput(
+    devicePayload(DEVICE_A, { mode: "confirmed" })
+  );
+  assert.equal(explicitConfirmed.mode, "confirmed");
+  const garbageMode = validateClaimActiveDeviceInput(
+    devicePayload(DEVICE_A, { mode: "switch-please" })
+  );
+  assert.equal(garbageMode.mode, "auto");
 
   assert.throws(
     () => validateClaimActiveDeviceInput(devicePayload("not-a-uuid")),
@@ -202,6 +232,19 @@ async function run() {
   assert.ok(firstDevice.firstUsedAt);
   assert.ok(firstDevice.lastUsedAt);
 
+  const emptyAutoAdmin = createMockAdmin();
+  const emptyAuto = await runHandler(
+    createClaimActiveDeviceHandler({ admin: emptyAutoAdmin, logger }),
+    authedRequest(
+      OWNER_UID,
+      devicePayload(DEVICE_A, { mode: "auto", claimReason: "auto" })
+    )
+  );
+  assert.equal(emptyAuto.ok, true);
+  assert.equal(emptyAuto.result.created, true);
+  assert.equal(emptyAuto.result.switched, false);
+  assert.equal(emptyAutoAdmin.docs.get(`users/${OWNER_UID}`).activeDeviceId, DEVICE_A);
+
   const sameAdmin = createMockAdmin({
     [`users/${OWNER_UID}`]: {
       email: "owner@example.com",
@@ -236,6 +279,28 @@ async function run() {
   assert.equal(sameDevice.buildNumber, "257");
   assert.deepEqual(sameDevice.firstUsedAt, { __type: "existing" });
 
+  const sameAuto = await runHandler(
+    createClaimActiveDeviceHandler({ admin: sameAdmin, logger }),
+    authedRequest(
+      OWNER_UID,
+      devicePayload(DEVICE_A, { mode: "auto", buildNumber: "258" })
+    )
+  );
+  assert.equal(sameAuto.ok, true);
+  assert.equal(sameAuto.result.switched, false);
+  assert.equal(sameAdmin.docs.get(`users/${OWNER_UID}`).activeDeviceId, DEVICE_A);
+
+  const sameConfirmed = await runHandler(
+    createClaimActiveDeviceHandler({ admin: sameAdmin, logger }),
+    authedRequest(
+      OWNER_UID,
+      devicePayload(DEVICE_A, { mode: "confirmed", buildNumber: "259" })
+    )
+  );
+  assert.equal(sameConfirmed.ok, true);
+  assert.equal(sameConfirmed.result.switched, false);
+  assert.equal(sameAdmin.docs.get(`users/${OWNER_UID}`).activeDeviceId, DEVICE_A);
+
   const switchAdmin = createMockAdmin({
     [`users/${OWNER_UID}`]: {
       email: "owner@example.com",
@@ -257,6 +322,8 @@ async function run() {
         platform: "android",
         modelName: "Google Pixel 8a",
         fcmToken: VALID_FCM_TOKEN,
+        claimReason: "confirmed",
+        mode: "confirmed",
       })
     )
   );
@@ -274,6 +341,72 @@ async function run() {
   const createdB = switchAdmin.docs.get(`users/${OWNER_UID}/devices/${DEVICE_B}`);
   assert.equal(createdB.deviceId, DEVICE_B);
   assert.equal(createdB.fcmToken, VALID_FCM_TOKEN);
+  assert.equal(switchedUser.claimReason, undefined);
+  const switchLogs = logger.entries.filter(
+    (entry) =>
+      entry.payload &&
+      (entry.payload.event === "claim_active_device.start" ||
+        entry.payload.event === "claim_active_device.success") &&
+      entry.payload.newDeviceIdSuffix === DEVICE_B.slice(-6)
+  );
+  assert.equal(switchLogs[0].payload.event, "claim_active_device.start");
+  assert.equal(switchLogs[0].payload.reason, "confirmed");
+  assert.equal(switchLogs[0].payload.mode, "confirmed");
+  assert.equal(switchLogs[0].payload.uidSuffix, OWNER_UID.slice(-6));
+  assert.equal(switchLogs[1].payload.event, "claim_active_device.success");
+  assert.equal(switchLogs[1].payload.reason, "confirmed");
+  assert.equal(switchLogs[1].payload.mode, "confirmed");
+  assert.equal(switchLogs[1].payload.previousDeviceIdSuffix, DEVICE_A.slice(-6));
+  assert.equal(switchLogs[1].payload.newDeviceIdSuffix, DEVICE_B.slice(-6));
+
+  const autoBlockedAdmin = createMockAdmin({
+    [`users/${OWNER_UID}`]: {
+      email: "owner@example.com",
+      activeDeviceId: DEVICE_A,
+    },
+    [`users/${OWNER_UID}/devices/${DEVICE_A}`]: {
+      deviceId: DEVICE_A,
+      historyMarker: "keep-a",
+    },
+  });
+  const autoBlocked = await runHandler(
+    createClaimActiveDeviceHandler({ admin: autoBlockedAdmin, logger }),
+    authedRequest(
+      OWNER_UID,
+      devicePayload(DEVICE_B, {
+        platform: "android",
+        mode: "auto",
+        claimReason: "auto",
+      })
+    )
+  );
+  assert.equal(autoBlocked.ok, false);
+  assert.equal(autoBlocked.error.code, "failed-precondition");
+  assert.equal(autoBlocked.error.message, CLAIM_ACTIVE_DEVICE_NEEDS_CONFIRMATION);
+  assert.equal(autoBlocked.error.details.code, CLAIM_ACTIVE_DEVICE_NEEDS_CONFIRMATION);
+  assert.equal(
+    autoBlockedAdmin.docs.get(`users/${OWNER_UID}`).activeDeviceId,
+    DEVICE_A
+  );
+  assert.ok(!autoBlockedAdmin.docs.has(`users/${OWNER_UID}/devices/${DEVICE_B}`));
+  assert.equal(
+    autoBlockedAdmin.docs.get(`users/${OWNER_UID}/devices/${DEVICE_A}`).historyMarker,
+    "keep-a"
+  );
+
+  const missingModeAdmin = createMockAdmin({
+    [`users/${OWNER_UID}`]: { activeDeviceId: DEVICE_A },
+  });
+  const missingMode = await runHandler(
+    createClaimActiveDeviceHandler({ admin: missingModeAdmin, logger }),
+    authedRequest(OWNER_UID, devicePayload(DEVICE_B, { platform: "android" }))
+  );
+  assert.equal(missingMode.ok, false);
+  assert.equal(missingMode.error.message, CLAIM_ACTIVE_DEVICE_NEEDS_CONFIRMATION);
+  assert.equal(
+    missingModeAdmin.docs.get(`users/${OWNER_UID}`).activeDeviceId,
+    DEVICE_A
+  );
 
   const failAdmin = createMockAdmin(
     {
@@ -290,7 +423,10 @@ async function run() {
   );
   const failed = await runHandler(
     createClaimActiveDeviceHandler({ admin: failAdmin, logger }),
-    authedRequest(OWNER_UID, devicePayload(DEVICE_B, { platform: "android" }))
+    authedRequest(
+      OWNER_UID,
+      devicePayload(DEVICE_B, { platform: "android", mode: "confirmed" })
+    )
   );
   assert.equal(failed.ok, false);
   const failedUser = failAdmin.docs.get(`users/${OWNER_UID}`);

@@ -11,6 +11,7 @@ const {
 } = require("./registerDeviceFcmToken");
 
 const CLAIM_ACTIVE_DEVICE_TAG = "KAMOME_CLAIM_ACTIVE_DEVICE";
+const CLAIM_ACTIVE_DEVICE_NEEDS_CONFIRMATION = "NEEDS_CONFIRMATION";
 const FCM_TOKEN_PATTERN = /^[A-Za-z0-9_.:-]+$/;
 
 function isPlainObject(value) {
@@ -32,6 +33,34 @@ function normalizeOptionalFcmToken(value) {
   return normalized;
 }
 
+function normalizeClaimReason(value) {
+  const normalized = String(value ?? "").trim();
+  if (
+    normalized === "auto" ||
+    normalized === "confirmed" ||
+    normalized === "retry"
+  ) {
+    return normalized;
+  }
+  return null;
+}
+
+// auto | confirmed。不正・欠落は安全側の auto（既存activeを上書きしない）。
+function normalizeClaimMode(data) {
+  if (!isPlainObject(data)) {
+    return "auto";
+  }
+  const mode = String(data.mode ?? "").trim();
+  if (mode === "auto" || mode === "confirmed") {
+    return mode;
+  }
+  const reason = normalizeClaimReason(data.claimReason);
+  if (reason === "confirmed" || reason === "retry") {
+    return "confirmed";
+  }
+  return "auto";
+}
+
 function validateClaimActiveDeviceInput(data) {
   const deviceInput = validateRegisterDeviceUsageInput(data);
   if (!isPlainObject(data)) {
@@ -43,6 +72,8 @@ function validateClaimActiveDeviceInput(data) {
   return {
     ...deviceInput,
     fcmToken,
+    claimReason: normalizeClaimReason(data.claimReason),
+    mode: normalizeClaimMode(data),
   };
 }
 
@@ -57,6 +88,17 @@ function createClaimActiveDeviceHandler({ admin, logger }) {
     }
 
     const input = validateClaimActiveDeviceInput(request.data);
+    const uidSuffix = tokenSuffix(uid);
+    const newDeviceIdSuffix = tokenSuffix(input.deviceId);
+    logger.info(CLAIM_ACTIVE_DEVICE_TAG, {
+      event: "claim_active_device.start",
+      uidSuffix,
+      newDeviceIdSuffix,
+      reason: input.claimReason,
+      mode: input.mode,
+      platform: input.platform,
+      buildNumber: input.buildNumber,
+    });
     const db = admin.getDb();
     const userRef = db.collection("users").doc(uid);
     const deviceRef = userRef.collection("devices").doc(input.deviceId);
@@ -71,6 +113,21 @@ function createClaimActiveDeviceHandler({ admin, logger }) {
       const switched =
         Boolean(previousActiveDeviceId) &&
         previousActiveDeviceId !== input.deviceId;
+
+      if (input.mode === "auto" && switched) {
+        logger.info(CLAIM_ACTIVE_DEVICE_TAG, {
+          event: "claim_active_device.needs_confirmation",
+          uidSuffix,
+          newDeviceIdSuffix,
+          previousDeviceIdSuffix: tokenSuffix(previousActiveDeviceId),
+          mode: input.mode,
+          reason: input.claimReason,
+        });
+        return {
+          denied: true,
+          previousActiveDeviceId,
+        };
+      }
 
       const userUpdate = {
         activeDeviceId: input.deviceId,
@@ -99,19 +156,35 @@ function createClaimActiveDeviceHandler({ admin, logger }) {
       tx.set(deviceRef, deviceUpdate, { merge: true });
 
       return {
+        denied: false,
         created,
         switched,
         previousActiveDeviceId,
       };
     });
 
+    if (result.denied) {
+      throw new HttpsError(
+        "failed-precondition",
+        CLAIM_ACTIVE_DEVICE_NEEDS_CONFIRMATION,
+        {
+          code: CLAIM_ACTIVE_DEVICE_NEEDS_CONFIRMATION,
+          previousDeviceIdSuffix: tokenSuffix(result.previousActiveDeviceId),
+        }
+      );
+    }
+
     logger.info(CLAIM_ACTIVE_DEVICE_TAG, {
-      uidSuffix: tokenSuffix(uid),
-      deviceIdSuffix: tokenSuffix(input.deviceId),
+      event: "claim_active_device.success",
+      uidSuffix,
+      newDeviceIdSuffix,
       previousDeviceIdSuffix: result.previousActiveDeviceId
         ? tokenSuffix(result.previousActiveDeviceId)
         : null,
+      reason: input.claimReason,
+      mode: input.mode,
       platform: input.platform,
+      buildNumber: input.buildNumber,
       created: result.created,
       switched: result.switched,
       hasFcmToken: Boolean(input.fcmToken),
@@ -127,6 +200,9 @@ function createClaimActiveDeviceHandler({ admin, logger }) {
 
 module.exports = {
   CLAIM_ACTIVE_DEVICE_TAG,
+  CLAIM_ACTIVE_DEVICE_NEEDS_CONFIRMATION,
   validateClaimActiveDeviceInput,
+  normalizeClaimReason,
+  normalizeClaimMode,
   createClaimActiveDeviceHandler,
 };
