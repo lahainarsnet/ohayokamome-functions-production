@@ -555,40 +555,77 @@ async function beginNotificationProcessing(db, eventId, baseFields) {
   });
 }
 
+const USER_PURCHASE_TOKEN_LOOKUPS = [
+  {
+    field: "activePurchaseTokens",
+    op: "array-contains",
+    match: "activePurchaseTokens",
+  },
+  {
+    field: "googlePlayPrimaryPurchaseToken",
+    op: "==",
+    match: "googlePlayPrimaryPurchaseToken",
+  },
+  {
+    field: "subscriptions.android.primaryPurchaseToken",
+    op: "==",
+    match: "subscriptions.android.primaryPurchaseToken",
+  },
+  {
+    field: "subscriptions.android.activePurchaseTokens",
+    op: "array-contains",
+    match: "subscriptions.android.activePurchaseTokens",
+  },
+];
+
 async function findUserByPurchaseToken(db, purchaseToken, linkedPurchaseToken) {
   const users = db.collection("users");
   const tokens = [purchaseToken, linkedPurchaseToken]
     .map((value) => String(value || "").trim())
     .filter(Boolean);
 
-  const seen = new Set();
+  const seenTokens = new Set();
+  const uidMatches = new Map();
+
   for (const token of tokens) {
-    if (seen.has(token)) {
+    if (seenTokens.has(token)) {
       continue;
     }
-    seen.add(token);
+    seenTokens.add(token);
 
-    const byToken = await users
-      .where("activePurchaseTokens", "array-contains", token)
-      .limit(2)
-      .get();
-    if (byToken.size === 1) {
-      return {
-        kind: "single",
-        uid: byToken.docs[0].id,
-        match: "activePurchaseTokens",
-        matchedToken: token,
-      };
-    }
-    if (byToken.size > 1) {
-      return {
-        kind: "ambiguous",
-        uids: byToken.docs.map((doc) => doc.id),
-      };
+    for (const lookup of USER_PURCHASE_TOKEN_LOOKUPS) {
+      const snap = await users.where(lookup.field, lookup.op, token).limit(2).get();
+      const docs = Array.isArray(snap?.docs) ? snap.docs : [];
+      for (const doc of docs) {
+        const uid = String(doc?.id || "").trim();
+        if (!uid || uidMatches.has(uid)) {
+          continue;
+        }
+        uidMatches.set(uid, {
+          match: lookup.match,
+          matchedToken: token,
+        });
+      }
     }
   }
 
-  return { kind: "unlinked" };
+  if (uidMatches.size === 0) {
+    return { kind: "unlinked" };
+  }
+  if (uidMatches.size > 1) {
+    return {
+      kind: "ambiguous",
+      uids: [...uidMatches.keys()],
+    };
+  }
+
+  const [uid, info] = uidMatches.entries().next().value;
+  return {
+    kind: "single",
+    uid,
+    match: info.match,
+    matchedToken: info.matchedToken,
+  };
 }
 
 function shouldSkipStaleActiveUpdate(existingData, derived) {
@@ -1186,5 +1223,6 @@ module.exports = {
   parseFirestoreExpiryTime,
   syncGooglePlaySubscriptionByPurchaseToken,
   applyGoogleSubscriptionUpdateToUser,
+  findUserByPurchaseToken,
   tokenSuffix,
 };
