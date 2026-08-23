@@ -3,24 +3,11 @@
 const { HttpsError } = require("firebase-functions/v2/https");
 const { inspectSubscriptionSeriesOwnership } = require("./subscriptionOwnership");
 
-function createInspectSubscriptionSeriesOwnershipHandler({
-  admin,
-  logger,
-  assertActiveDeviceAllowed,
-}) {
+function createInspectSubscriptionSeriesOwnershipHandler({ admin, logger }) {
   return async (request) => {
     const uid = request.auth && request.auth.uid;
     if (!uid) {
       throw new HttpsError("unauthenticated", "Sign-in is required.");
-    }
-
-    if (typeof assertActiveDeviceAllowed === "function") {
-      await assertActiveDeviceAllowed({
-        admin,
-        uid,
-        data: request.data,
-        allowPendingDevice: true,
-      });
     }
 
     const data = request.data || {};

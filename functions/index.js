@@ -2640,7 +2640,6 @@ exports.inspectSubscriptionSeriesOwnership = onCall(
   createInspectSubscriptionSeriesOwnershipHandler({
     admin,
     logger,
-    assertActiveDeviceAllowed,
   }),
 );
 
