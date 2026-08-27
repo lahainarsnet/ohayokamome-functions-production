@@ -95,10 +95,7 @@ const {
   resolveGetUserInfoByAccountIdLookup,
 } = require("./accountIdGuard");
 const { onMessagePublished } = require("firebase-functions/v2/pubsub");
-const {
-  CHAT_MESSAGE_LIMIT,
-  computeMessagesToDeleteCount,
-} = require("./deleteOldMessagesLib");
+const { runChatMessageCleanup } = require("./deleteOldMessagesHandler");
 
 const { randomUUID } = crypto;
 
@@ -1138,46 +1135,15 @@ exports.deleteOldMessages = onDocumentCreated(
   async (event) => {
     const chatId = event.params.chatId;
     logger.info(
-      `[Auto-Delete] New message in chatTail=${logIdTailForLog(chatId)}. Checking message count.`
+      `[Auto-Delete] New message in chatTail=${logIdTailForLog(chatId)}. Evaluating cleanup schedule.`
     );
 
-    const MESSAGE_LIMIT = CHAT_MESSAGE_LIMIT;
-    const messagesRef = admin.getDb().collection("chats").doc(chatId).collection("messages");
-
     try {
-      const currentMessageCount = await getQueryCount(messagesRef);
-
-      logger.info(
-        `[Auto-Delete] Current message count in chatTail=${logIdTailForLog(chatId)} is ${currentMessageCount}. Limit is ${MESSAGE_LIMIT}.`
-      );
-
-      const messagesToDeleteCount = computeMessagesToDeleteCount(
-        currentMessageCount,
-        MESSAGE_LIMIT
-      );
-
-      if (messagesToDeleteCount > 0) {
-        logger.info(
-          `[Auto-Delete] Deleting ${messagesToDeleteCount} oldest message(s).`
-        );
-
-        const query = messagesRef.orderBy("timestamp", "asc").limit(messagesToDeleteCount);
-        const messagesToDeleteSnapshot = await query.get();
-
-        const batch = admin.getDb().batch();
-        messagesToDeleteSnapshot.forEach((doc) => {
-          batch.delete(doc.ref);
-        });
-
-        await batch.commit();
-        logger.info(
-          `[Auto-Delete] Deleted ${messagesToDeleteSnapshot.size} old message(s) from chatTail=${logIdTailForLog(chatId)}.`
-        );
-      } else {
-        logger.info(`[Auto-Delete] No action needed.`);
-      }
-
-      return { success: true };
+      return await runChatMessageCleanup({
+        chatId,
+        logIdTailForLog,
+        logger,
+      });
     } catch (error) {
       logger.error("[Auto-Delete] Error deleting old messages.", {
         chatIdTail: logIdTailForLog(chatId),
