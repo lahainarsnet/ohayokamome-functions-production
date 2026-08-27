@@ -23,6 +23,9 @@ assert.doesNotMatch(
   sendSource,
   /platformFromAppCheckAppId\(request\.data/
 );
+assert.match(sendSource, /let createdMessageId = null;/);
+assert.match(sendSource, /createdMessageId = msgRef\.id;/);
+assert.match(sendSource, /return \{ success: true, messageId: createdMessageId \};/);
 
 const transcribeSource = fs.readFileSync(
   path.join(__dirname, "transcribeExperiment.js"),

@@ -1370,6 +1370,7 @@ exports.sendMessageWithLimit = onCall(
   const today = getJstDateKey(new Date());
   const userRef = admin.getDb().collection("users").doc(senderId);
   let senderSubscriptionBlocked = false;
+  let createdMessageId = null;
 
   try {
     await admin.getDb().runTransaction(async (transaction) => {
@@ -1449,6 +1450,7 @@ exports.sendMessageWithLimit = onCall(
       );
 
       const msgRef = chatRef.collection("messages").doc();
+      createdMessageId = msgRef.id;
       const messageData = {
         senderId: senderId,
         recipientId: recipientId,
@@ -1471,7 +1473,7 @@ exports.sendMessageWithLimit = onCall(
       return { success: false, code: SENDER_SUBSCRIPTION_UNAVAILABLE };
     }
 
-    return { success: true };
+    return { success: true, messageId: createdMessageId };
   } catch (error) {
     const code =
       (error && typeof error.message === "string" && error.message) || "UNKNOWN";
