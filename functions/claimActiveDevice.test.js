@@ -8,10 +8,12 @@ const {
   createClaimActiveDeviceHandler,
   validateClaimActiveDeviceInput,
   CLAIM_ACTIVE_DEVICE_NEEDS_CONFIRMATION,
+  CLAIM_ACTIVE_DEVICE_STALE_CLAIM,
 } = require("./claimActiveDevice");
 
 const DEVICE_A = "550e8400-e29b-41d4-a716-446655440000";
 const DEVICE_B = "6ba7b810-9dad-11d1-80b4-00c04fd430c8";
+const DEVICE_C = "123e4567-e89b-12d3-a456-426614174000";
 const OWNER_UID = "owner-uid-001";
 const OTHER_UID = "other-uid-002";
 const VALID_FCM_TOKEN = "dK3exampleTokenSegment:APA91b" + "A".repeat(120);
@@ -314,6 +316,21 @@ async function run() {
       historyMarker: "keep-a",
     },
   });
+  const switchReserved = await runHandler(
+    createClaimActiveDeviceHandler({ admin: switchAdmin, logger }),
+    authedRequest(
+      OWNER_UID,
+      devicePayload(DEVICE_B, {
+        platform: "android",
+        modelName: "Google Pixel 8a",
+        fcmToken: VALID_FCM_TOKEN,
+        mode: "reserve",
+        claimReason: "reserve",
+      })
+    )
+  );
+  assert.equal(switchReserved.ok, true);
+  assert.equal(switchReserved.result.claimGeneration, 1);
   const switched = await runHandler(
     createClaimActiveDeviceHandler({ admin: switchAdmin, logger }),
     authedRequest(
@@ -324,11 +341,12 @@ async function run() {
         fcmToken: VALID_FCM_TOKEN,
         claimReason: "confirmed",
         mode: "confirmed",
+        claimGeneration: 1,
       })
     )
   );
   assert.equal(switched.ok, true);
-  assert.equal(switched.result.created, true);
+  assert.equal(switched.result.created, false);
   assert.equal(switched.result.switched, true);
   const switchedUser = switchAdmin.docs.get(`users/${OWNER_UID}`);
   assert.equal(switchedUser.activeDeviceId, DEVICE_B);
@@ -346,18 +364,16 @@ async function run() {
     (entry) =>
       entry.payload &&
       (entry.payload.event === "claim_active_device.start" ||
-        entry.payload.event === "claim_active_device.success") &&
-      entry.payload.newDeviceIdSuffix === DEVICE_B.slice(-6)
+        entry.payload.event === "claim_active_device.success" ||
+        entry.payload.event === "claim_active_device.confirmed_accepted") &&
+      entry.payload.newDeviceIdSuffix === DEVICE_B.slice(-6) &&
+      entry.payload.mode === "confirmed"
   );
   assert.equal(switchLogs[0].payload.event, "claim_active_device.start");
   assert.equal(switchLogs[0].payload.reason, "confirmed");
   assert.equal(switchLogs[0].payload.mode, "confirmed");
   assert.equal(switchLogs[0].payload.uidSuffix, OWNER_UID.slice(-6));
-  assert.equal(switchLogs[1].payload.event, "claim_active_device.success");
-  assert.equal(switchLogs[1].payload.reason, "confirmed");
-  assert.equal(switchLogs[1].payload.mode, "confirmed");
-  assert.equal(switchLogs[1].payload.previousDeviceIdSuffix, DEVICE_A.slice(-6));
-  assert.equal(switchLogs[1].payload.newDeviceIdSuffix, DEVICE_B.slice(-6));
+  assert.equal(switchLogs[1].payload.event, "claim_active_device.confirmed_accepted");
 
   const autoBlockedAdmin = createMockAdmin({
     [`users/${OWNER_UID}`]: {
@@ -413,6 +429,8 @@ async function run() {
       [`users/${OWNER_UID}`]: {
         email: "owner@example.com",
         activeDeviceId: DEVICE_A,
+        pendingActiveDeviceId: DEVICE_B,
+        pendingActiveClaimGeneration: 1,
       },
       [`users/${OWNER_UID}/devices/${DEVICE_A}`]: {
         deviceId: DEVICE_A,
@@ -425,7 +443,11 @@ async function run() {
     createClaimActiveDeviceHandler({ admin: failAdmin, logger }),
     authedRequest(
       OWNER_UID,
-      devicePayload(DEVICE_B, { platform: "android", mode: "confirmed" })
+      devicePayload(DEVICE_B, {
+        platform: "android",
+        mode: "confirmed",
+        claimGeneration: 1,
+      })
     )
   );
   assert.equal(failed.ok, false);
@@ -477,9 +499,11 @@ async function run() {
     )
   );
   assert.equal(reserved.ok, true);
+  assert.equal(reserved.result.claimGeneration, 1);
   const reservedUser = reserveAdmin.docs.get(`users/${OWNER_UID}`);
   assert.equal(reservedUser.activeDeviceId, DEVICE_A);
   assert.equal(reservedUser.pendingActiveDeviceId, DEVICE_B);
+  assert.equal(reservedUser.pendingActiveClaimGeneration, 1);
 
   const promoted = await runHandler(
     createClaimActiveDeviceHandler({ admin: reserveAdmin, logger }),
@@ -488,6 +512,7 @@ async function run() {
       devicePayload(DEVICE_B, {
         mode: "confirmed",
         claimReason: "confirmed",
+        claimGeneration: 1,
       })
     )
   );
@@ -495,6 +520,154 @@ async function run() {
   const promotedUser = reserveAdmin.docs.get(`users/${OWNER_UID}`);
   assert.equal(promotedUser.activeDeviceId, DEVICE_B);
   assert.equal(promotedUser.pendingActiveDeviceId, "");
+  assert.equal(promotedUser.pendingActiveClaimGeneration, 0);
+
+  const staleChainAdmin = createMockAdmin({
+    [`users/${OWNER_UID}`]: {
+      activeDeviceId: DEVICE_A,
+      pendingActiveDeviceId: DEVICE_C,
+      pendingActiveClaimGeneration: 2,
+    },
+  });
+  const staleA = await runHandler(
+    createClaimActiveDeviceHandler({ admin: staleChainAdmin, logger }),
+    authedRequest(
+      OWNER_UID,
+      devicePayload(DEVICE_A, {
+        mode: "confirmed",
+        claimReason: "confirmed",
+        claimGeneration: 1,
+      })
+    )
+  );
+  assert.equal(staleA.ok, false);
+  assert.equal(staleA.error.message, CLAIM_ACTIVE_DEVICE_STALE_CLAIM);
+  assert.equal(
+    staleChainAdmin.docs.get(`users/${OWNER_UID}`).activeDeviceId,
+    DEVICE_A
+  );
+
+  const staleWithoutReserve = await runHandler(
+    createClaimActiveDeviceHandler({ admin: staleChainAdmin, logger }),
+    authedRequest(
+      OWNER_UID,
+      devicePayload(DEVICE_B, {
+        mode: "confirmed",
+        claimReason: "confirmed",
+        claimGeneration: 99,
+      })
+    )
+  );
+  assert.equal(staleWithoutReserve.ok, false);
+  assert.equal(staleWithoutReserve.error.message, CLAIM_ACTIVE_DEVICE_STALE_CLAIM);
+
+  const aToBToAToAAdmin = createMockAdmin({
+    [`users/${OWNER_UID}`]: {
+      activeDeviceId: DEVICE_B,
+      pendingActiveDeviceId: DEVICE_A,
+      pendingActiveClaimGeneration: 3,
+    },
+  });
+  const oldAReserveConfirmed = await runHandler(
+    createClaimActiveDeviceHandler({ admin: aToBToAToAAdmin, logger }),
+    authedRequest(
+      OWNER_UID,
+      devicePayload(DEVICE_A, {
+        mode: "confirmed",
+        claimReason: "confirmed",
+        claimGeneration: 1,
+      })
+    )
+  );
+  assert.equal(oldAReserveConfirmed.ok, false);
+  assert.equal(oldAReserveConfirmed.error.message, CLAIM_ACTIVE_DEVICE_STALE_CLAIM);
+
+  const newAConfirmed = await runHandler(
+    createClaimActiveDeviceHandler({ admin: aToBToAToAAdmin, logger }),
+    authedRequest(
+      OWNER_UID,
+      devicePayload(DEVICE_A, {
+        mode: "confirmed",
+        claimReason: "confirmed",
+        claimGeneration: 3,
+      })
+    )
+  );
+  assert.equal(newAConfirmed.ok, true);
+  assert.equal(
+    aToBToAToAAdmin.docs.get(`users/${OWNER_UID}`).activeDeviceId,
+    DEVICE_A
+  );
+
+  const tripleSwitchAdmin = createMockAdmin({
+    [`users/${OWNER_UID}`]: {
+      activeDeviceId: DEVICE_A,
+    },
+  });
+  const reserveB = await runHandler(
+    createClaimActiveDeviceHandler({ admin: tripleSwitchAdmin, logger }),
+    authedRequest(
+      OWNER_UID,
+      devicePayload(DEVICE_B, { mode: "reserve", claimReason: "reserve" })
+    )
+  );
+  assert.equal(reserveB.result.claimGeneration, 1);
+  const confirmB = await runHandler(
+    createClaimActiveDeviceHandler({ admin: tripleSwitchAdmin, logger }),
+    authedRequest(
+      OWNER_UID,
+      devicePayload(DEVICE_B, {
+        mode: "confirmed",
+        claimReason: "confirmed",
+        claimGeneration: 1,
+      })
+    )
+  );
+  assert.equal(confirmB.ok, true);
+  const reserveC = await runHandler(
+    createClaimActiveDeviceHandler({ admin: tripleSwitchAdmin, logger }),
+    authedRequest(
+      OWNER_UID,
+      devicePayload(DEVICE_C, { mode: "reserve", claimReason: "reserve" })
+    )
+  );
+  assert.equal(reserveC.result.claimGeneration, 2);
+  const confirmC = await runHandler(
+    createClaimActiveDeviceHandler({ admin: tripleSwitchAdmin, logger }),
+    authedRequest(
+      OWNER_UID,
+      devicePayload(DEVICE_C, {
+        mode: "confirmed",
+        claimReason: "confirmed",
+        claimGeneration: 2,
+      })
+    )
+  );
+  assert.equal(confirmC.ok, true);
+  const reserveA2 = await runHandler(
+    createClaimActiveDeviceHandler({ admin: tripleSwitchAdmin, logger }),
+    authedRequest(
+      OWNER_UID,
+      devicePayload(DEVICE_A, { mode: "reserve", claimReason: "reserve" })
+    )
+  );
+  assert.equal(reserveA2.result.claimGeneration, 3);
+  const confirmA2 = await runHandler(
+    createClaimActiveDeviceHandler({ admin: tripleSwitchAdmin, logger }),
+    authedRequest(
+      OWNER_UID,
+      devicePayload(DEVICE_A, {
+        mode: "confirmed",
+        claimReason: "confirmed",
+        claimGeneration: 3,
+      })
+    )
+  );
+  assert.equal(confirmA2.ok, true);
+  assert.equal(
+    tripleSwitchAdmin.docs.get(`users/${OWNER_UID}`).activeDeviceId,
+    DEVICE_A
+  );
 
   const indexSource = fs.readFileSync(path.join(__dirname, "index.js"), "utf8");
   assert.match(

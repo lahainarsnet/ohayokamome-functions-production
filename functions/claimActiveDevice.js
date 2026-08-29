@@ -12,6 +12,7 @@ const {
 
 const CLAIM_ACTIVE_DEVICE_TAG = "KAMOME_CLAIM_ACTIVE_DEVICE";
 const CLAIM_ACTIVE_DEVICE_NEEDS_CONFIRMATION = "NEEDS_CONFIRMATION";
+const CLAIM_ACTIVE_DEVICE_STALE_CLAIM = "STALE_ACTIVE_DEVICE_CLAIM";
 const FCM_TOKEN_PATTERN = /^[A-Za-z0-9_.:-]+$/;
 
 function isPlainObject(value) {
@@ -46,6 +47,14 @@ function normalizeClaimReason(value) {
   return null;
 }
 
+function normalizeClaimGeneration(value) {
+  const parsed = Number(value);
+  if (!Number.isFinite(parsed) || parsed <= 0 || !Number.isInteger(parsed)) {
+    return 0;
+  }
+  return parsed;
+}
+
 // auto | confirmed | reserve。不正・欠落は安全側の auto（既存activeを上書きしない）。
 function normalizeClaimMode(data) {
   if (!isPlainObject(data)) {
@@ -77,6 +86,7 @@ function validateClaimActiveDeviceInput(data) {
     ...deviceInput,
     fcmToken,
     claimReason: normalizeClaimReason(data.claimReason),
+    claimGeneration: normalizeClaimGeneration(data.claimGeneration),
     mode: normalizeClaimMode(data),
   };
 }
@@ -102,6 +112,9 @@ function createClaimActiveDeviceHandler({ admin, logger }) {
       mode: input.mode,
       platform: input.platform,
       buildNumber: input.buildNumber,
+      claimGenerationSuffix: input.claimGeneration
+        ? String(input.claimGeneration).slice(-2)
+        : null,
     });
     const db = admin.getDb();
     const userRef = db.collection("users").doc(uid);
@@ -113,15 +126,25 @@ function createClaimActiveDeviceHandler({ admin, logger }) {
       const deviceSnap = await tx.get(deviceRef);
       const userData = userSnap.exists ? userSnap.data() || {} : {};
       const previousActiveDeviceId = String(userData.activeDeviceId || "").trim();
+      const pendingActiveDeviceId = String(
+        userData.pendingActiveDeviceId || ""
+      ).trim();
+      const pendingActiveClaimGeneration = normalizeClaimGeneration(
+        userData.pendingActiveClaimGeneration
+      );
       const created = !deviceSnap.exists;
       const switched =
         Boolean(previousActiveDeviceId) &&
         previousActiveDeviceId !== input.deviceId;
 
       if (input.mode === "reserve") {
+        const nextClaimGeneration =
+          normalizeClaimGeneration(userData.claimGenerationSequence) + 1;
         const userUpdate = {
           pendingActiveDeviceId: input.deviceId,
           pendingActiveDeviceUpdatedAt: now,
+          pendingActiveClaimGeneration: nextClaimGeneration,
+          claimGenerationSequence: nextClaimGeneration,
         };
         if (input.fcmToken) {
           userUpdate.fcmToken = input.fcmToken;
@@ -149,6 +172,7 @@ function createClaimActiveDeviceHandler({ admin, logger }) {
           switched: false,
           reserved: true,
           previousActiveDeviceId,
+          claimGeneration: nextClaimGeneration,
         };
       }
 
@@ -167,10 +191,44 @@ function createClaimActiveDeviceHandler({ admin, logger }) {
         };
       }
 
+      if (input.mode === "confirmed") {
+        const sameDeviceRefresh =
+          previousActiveDeviceId === input.deviceId && !pendingActiveDeviceId;
+        const pendingMatches =
+          pendingActiveDeviceId === input.deviceId &&
+          input.claimGeneration > 0 &&
+          input.claimGeneration === pendingActiveClaimGeneration;
+        if (!sameDeviceRefresh && !pendingMatches) {
+          logger.info(CLAIM_ACTIVE_DEVICE_TAG, {
+            event: "claim_active_device.confirmed_rejected_stale",
+            uidSuffix,
+            newDeviceIdSuffix,
+            previousDeviceIdSuffix: previousActiveDeviceId
+              ? tokenSuffix(previousActiveDeviceId)
+              : null,
+            pendingDeviceIdSuffix: pendingActiveDeviceId
+              ? tokenSuffix(pendingActiveDeviceId)
+              : null,
+            pendingClaimGenerationSuffix: pendingActiveClaimGeneration
+              ? String(pendingActiveClaimGeneration).slice(-2)
+              : null,
+            inputClaimGenerationSuffix: input.claimGeneration
+              ? String(input.claimGeneration).slice(-2)
+              : null,
+          });
+          return {
+            denied: true,
+            stale: true,
+            previousActiveDeviceId,
+          };
+        }
+      }
+
       const userUpdate = {
         activeDeviceId: input.deviceId,
         activeDeviceUpdatedAt: now,
         pendingActiveDeviceId: "",
+        pendingActiveClaimGeneration: 0,
       };
       if (input.fcmToken) {
         userUpdate.fcmToken = input.fcmToken;
@@ -199,10 +257,21 @@ function createClaimActiveDeviceHandler({ admin, logger }) {
         created,
         switched,
         previousActiveDeviceId,
+        confirmedAccepted: input.mode === "confirmed",
       };
     });
 
     if (result.denied) {
+      if (result.stale) {
+        throw new HttpsError(
+          "failed-precondition",
+          CLAIM_ACTIVE_DEVICE_STALE_CLAIM,
+          {
+            code: CLAIM_ACTIVE_DEVICE_STALE_CLAIM,
+            previousDeviceIdSuffix: tokenSuffix(result.previousActiveDeviceId),
+          }
+        );
+      }
       throw new HttpsError(
         "failed-precondition",
         CLAIM_ACTIVE_DEVICE_NEEDS_CONFIRMATION,
@@ -211,6 +280,39 @@ function createClaimActiveDeviceHandler({ admin, logger }) {
           previousDeviceIdSuffix: tokenSuffix(result.previousActiveDeviceId),
         }
       );
+    }
+
+    if (result.reserved) {
+      logger.info(CLAIM_ACTIVE_DEVICE_TAG, {
+        event: "claim_active_device.reserve_accepted",
+        uidSuffix,
+        newDeviceIdSuffix,
+        previousDeviceIdSuffix: result.previousActiveDeviceId
+          ? tokenSuffix(result.previousActiveDeviceId)
+          : null,
+        claimGenerationSuffix: String(result.claimGeneration).slice(-2),
+        reason: input.claimReason,
+        mode: input.mode,
+        platform: input.platform,
+        buildNumber: input.buildNumber,
+      });
+    }
+    if (result.confirmedAccepted) {
+      logger.info(CLAIM_ACTIVE_DEVICE_TAG, {
+        event: "claim_active_device.confirmed_accepted",
+        uidSuffix,
+        newDeviceIdSuffix,
+        previousDeviceIdSuffix: result.previousActiveDeviceId
+          ? tokenSuffix(result.previousActiveDeviceId)
+          : null,
+        claimGenerationSuffix: input.claimGeneration
+          ? String(input.claimGeneration).slice(-2)
+          : null,
+        reason: input.claimReason,
+        mode: input.mode,
+        platform: input.platform,
+        buildNumber: input.buildNumber,
+      });
     }
 
     logger.info(CLAIM_ACTIVE_DEVICE_TAG, {
@@ -227,12 +329,18 @@ function createClaimActiveDeviceHandler({ admin, logger }) {
       created: result.created,
       switched: result.switched,
       hasFcmToken: Boolean(input.fcmToken),
+      claimGenerationSuffix: result.claimGeneration
+        ? String(result.claimGeneration).slice(-2)
+        : input.claimGeneration
+          ? String(input.claimGeneration).slice(-2)
+          : null,
     });
 
     return {
       ok: true,
       created: result.created,
       switched: result.switched,
+      claimGeneration: result.claimGeneration ?? null,
     };
   };
 }
@@ -240,8 +348,10 @@ function createClaimActiveDeviceHandler({ admin, logger }) {
 module.exports = {
   CLAIM_ACTIVE_DEVICE_TAG,
   CLAIM_ACTIVE_DEVICE_NEEDS_CONFIRMATION,
+  CLAIM_ACTIVE_DEVICE_STALE_CLAIM,
   validateClaimActiveDeviceInput,
   normalizeClaimReason,
   normalizeClaimMode,
+  normalizeClaimGeneration,
   createClaimActiveDeviceHandler,
 };
