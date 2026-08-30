@@ -87,6 +87,9 @@ const {
   createAcknowledgeCrossPlatformSwitchHandler,
 } = require("./crossPlatformSwitchAck");
 const {
+  createAcknowledgeDeviceSwitchNoticeHandler,
+} = require("./deviceSwitchNoticeAck");
+const {
   computeEntitlementExpiryDeltaMs,
   resolveRecipientSubscriptionWithExpiryLagRetry,
 } = require("./recipientSubscriptionGuardRetry");
@@ -2601,6 +2604,11 @@ exports.claimActiveDevice = onCall(
 exports.acknowledgeCrossPlatformSwitch = onCall(
   { region: "us-central1", enforceAppCheck: true },
   createAcknowledgeCrossPlatformSwitchHandler({ admin, logger }),
+);
+
+exports.acknowledgeDeviceSwitchNotice = onCall(
+  { region: "us-central1", enforceAppCheck: true },
+  createAcknowledgeDeviceSwitchNoticeHandler({ admin, logger }),
 );
 
 exports.inspectSubscriptionSeriesOwnership = onCall(
