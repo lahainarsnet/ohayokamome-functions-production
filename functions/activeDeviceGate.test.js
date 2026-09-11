@@ -7,6 +7,7 @@ const {
   INVALID_DEVICE_ID,
   extractRequestDeviceId,
   evaluateActiveDeviceGate,
+  evaluateActiveDeviceGateForRequest,
   assertActiveDeviceAllowed,
 } = require("./activeDeviceGate");
 
@@ -139,7 +140,23 @@ async function evaluate(userData, deviceId) {
   assert.equal(thrown.code, "failed-precondition");
   assert.equal(thrown.details.code, ACTIVE_DEVICE_MISMATCH);
 
-  console.log("activeDeviceGate.test.js: ok");
+  const requestPathMismatch = await evaluateActiveDeviceGateForRequest({
+    admin: mockAdmin,
+    uid: OWNER_UID,
+    data: { deviceId: DEVICE_B },
+  });
+  assert.equal(requestPathMismatch.ok, false);
+  assert.equal(requestPathMismatch.code, ACTIVE_DEVICE_MISMATCH);
+
+  const requestPathAllowed = await evaluateActiveDeviceGateForRequest({
+    admin: mockAdmin,
+    uid: OWNER_UID,
+    data: { deviceId: DEVICE_A },
+  });
+  assert.equal(requestPathAllowed.ok, true);
+  assert.equal(requestPathAllowed.deviceId, DEVICE_A);
+
+  console.log("activeDeviceGate.test.js: ok (incl. evaluateActiveDeviceGateForRequest runtime)");
 })().catch((error) => {
   console.error(error);
   process.exit(1);
