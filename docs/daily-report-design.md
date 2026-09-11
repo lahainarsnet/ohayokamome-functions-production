@@ -2,9 +2,14 @@
 
 ## 状態
 
-- **コード実装済み**（Functions `dailyReport/` モジュール、管理Web UI/API）
-- **production 未 deploy**（Functions / Scheduler / Rules / IAM 変更なし）
-- **production write 未実施**（`daily_reports` コレクションは本番に未作成）
+- **production 投入済み**（2026-09-11 JST）
+- **Functions deploy 済み** — activity increment hooks + `scheduledDailyReport`（HEAD `39e4872`）
+- **Cloud Scheduler** — job 1個: `20 0 * * *` / `Asia/Tokyo`（D+1 00:20 JST に前日確定）
+- **Cloud Scheduler API** — 有効化済み（今回のみ）
+- **daily_reports** — 稼働開始。deploy 直後は 0件正常。activity は通常利用から自然作成
+- **初日（2026-09-11）** — partial coverage day（deploy 完了 **2026-09-11 15:25 JST** 以降の activity のみ計測。バックフィルなし）
+- **管理Web** — Cloud Run deploy 済み（`asia-northeast1`）。URL は `docs/開発メモ.md` 参照
+- **未実施** — Firestore Rules deploy / 追加 IAM / Billing・Blaze 変更 / JSON SA key
 
 ## コレクション
 
