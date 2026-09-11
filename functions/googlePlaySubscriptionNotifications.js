@@ -494,6 +494,8 @@ async function resolveUserEntitlementAfterRevocation({
   });
 }
 
+const { recordSubscriptionEventActivity } = require("./dailyReport/increment");
+
 async function writeSubscriptionEvent(db, eventId, fields) {
   if (!eventId) {
     return;
@@ -506,6 +508,7 @@ async function writeSubscriptionEvent(db, eventId, fields) {
     },
     { merge: true },
   );
+  recordSubscriptionEventActivity(fields);
 }
 
 async function beginNotificationProcessing(db, eventId, baseFields) {

@@ -99,6 +99,12 @@ const {
 } = require("./accountIdGuard");
 const { onMessagePublished } = require("firebase-functions/v2/pubsub");
 const { runChatMessageCleanup } = require("./deleteOldMessagesHandler");
+const {
+  recordMessageSent,
+  recordMessageBlocked,
+  recordAccountDeletion,
+} = require("./dailyReport/increment");
+const { scheduledDailyReport } = require("./dailyReport/scheduledDailyReport");
 
 const { randomUUID } = crypto;
 
@@ -1186,6 +1192,7 @@ exports.sendMessageWithLimit = onCall(
     logger.warn("sendMessageWithLimit: " + deviceGate.code, {
       senderUidTail: uidTailForLog(senderId),
     });
+    recordMessageBlocked("deviceGate", { logger });
     return { success: false, code: deviceGate.code };
   }
 
@@ -1333,6 +1340,7 @@ exports.sendMessageWithLimit = onCall(
         `returnedCode=${RECIPIENT_SUBSCRIPTION_UNAVAILABLE} action=blockSend ` +
         `entitlementExpiryDeltaMs=${finalEntitlementExpiryDeltaMs ?? "null"}`,
     );
+    recordMessageBlocked("subscription", { logger });
     return { success: false, code: RECIPIENT_SUBSCRIPTION_UNAVAILABLE };
   }
 
@@ -1439,9 +1447,11 @@ exports.sendMessageWithLimit = onCall(
           `recipientUidTail=${uidTailForLog(recipientId)} guardType=SenderSubscriptionGuard ` +
           `returnedCode=${SENDER_SUBSCRIPTION_UNAVAILABLE} action=blockSend`,
       );
+      recordMessageBlocked("subscription", { logger });
       return { success: false, code: SENDER_SUBSCRIPTION_UNAVAILABLE };
     }
 
+    recordMessageSent({ logger });
     return { success: true, messageId: createdMessageId };
   } catch (error) {
     const code =
@@ -1449,6 +1459,7 @@ exports.sendMessageWithLimit = onCall(
     const extra = {};
     if (code === "DAILY_LIMIT_EXCEEDED" && typeof error.limit === "number") {
       extra.limit = error.limit;
+      recordMessageBlocked("limitExceeded", { logger });
     }
     logger.error("sendMessageWithLimit failed:", {
       code,
@@ -1568,6 +1579,7 @@ exports.deleteMyAccount = onCall(
         legacyLinkedContactsDeleted,
         sentMessagesDeleted,
       });
+      recordAccountDeletion({ logger });
       return { success: true };
     } catch (error) {
       logger.error("Account deletion failed.", {
@@ -2620,3 +2632,5 @@ exports.inspectSubscriptionSeriesOwnership = onCall(
 );
 
 exports.transcribeExperiment = transcribeExperiment;
+
+exports.scheduledDailyReport = scheduledDailyReport;

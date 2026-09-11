@@ -36,6 +36,12 @@ const { transcribeWithOpenAI } = require("./stt/openaiProvider");
 const { transcribeWithGoogle } = require("./stt/googleProvider");
 const { transcribeWithGemini } = require("./stt/geminiProvider");
 const { transcribeWithGroq } = require("./stt/groqProvider");
+const {
+  recordSttLimitExceeded,
+  recordSttAttempt,
+  recordSttSuccess,
+  recordSttFailure,
+} = require("./dailyReport/increment");
 
 const OPENAI_API_KEY = defineSecret("OPENAI_API_KEY");
 const GEMINI_API_KEY = defineSecret("GEMINI_API_KEY");
@@ -569,6 +575,7 @@ exports.transcribeExperiment = onCall(
         uidSuffix: uidSuffix(uid),
         sttProviderSetting: null,
       });
+      recordSttFailure("UNAUTHENTICATED", { logger });
       return { ok: false, code: "UNAUTHENTICATED" };
     }
 
@@ -594,6 +601,7 @@ exports.transcribeExperiment = onCall(
         uidSuffix: uidSuffix(uid),
         sttProviderSetting: null,
       });
+      recordSttFailure(deviceGate.code, { logger });
       return { ok: false, code: deviceGate.code };
     }
 
@@ -616,6 +624,7 @@ exports.transcribeExperiment = onCall(
         uidSuffix: uidSuffix(uid),
         sttProviderSetting: null,
       });
+      recordSttFailure(adminGate.code, { logger });
       return { ok: false, code: adminGate.code };
     }
 
@@ -642,6 +651,7 @@ exports.transcribeExperiment = onCall(
         uidSuffix: uidSuffix(uid),
         sttProviderSetting: null,
       });
+      recordSttFailure("SUBSCRIPTION_CHECK_FAILED", { logger });
       return { ok: false, code: "SUBSCRIPTION_CHECK_FAILED" };
     }
     if (!subscriptionCheck.ok) {
@@ -658,6 +668,7 @@ exports.transcribeExperiment = onCall(
         uidSuffix: uidSuffix(uid),
         sttProviderSetting: null,
       });
+      recordSttFailure(subscriptionCheck.code, { logger });
       return { ok: false, code: subscriptionCheck.code };
     }
 
@@ -1053,9 +1064,11 @@ exports.transcribeExperiment = onCall(
         usedCount: limitExceededResponse.usedCount,
         remainingCount: limitExceededResponse.remainingCount,
       });
+      recordSttLimitExceeded({ logger });
       return limitExceededResponse;
     }
 
+    recordSttAttempt({ logger });
     let providerResult;
     try {
       providerResult = await invokeSttProvider({
@@ -1104,6 +1117,7 @@ exports.transcribeExperiment = onCall(
         usedCount: releaseResult.usedCount ?? quota.usedCount,
         remainingCount: releaseResult.remainingCount ?? quota.remainingCount,
       });
+      recordSttFailure("TRANSCRIBE_INTERNAL_ERROR", { logger });
       return { ok: false, code: "TRANSCRIBE_INTERNAL_ERROR" };
     }
 
@@ -1139,6 +1153,7 @@ exports.transcribeExperiment = onCall(
         remainingCount: releaseResult.remainingCount ?? quota.remainingCount,
         ...buildProviderTraceExtras(providerResult),
       });
+      recordSttFailure(providerResult.code, { logger });
       return { ok: false, code: providerResult.code };
     }
 
@@ -1214,6 +1229,7 @@ exports.transcribeExperiment = onCall(
       quotaRemainingCount: quota.remainingCount,
     });
 
+    recordSttSuccess({ logger });
     return {
       ok: true,
       text: providerResult.text,

@@ -149,6 +149,8 @@ function eventBaseFields(decodedNotification, environment) {
   };
 }
 
+const { recordSubscriptionEventActivity } = require("./dailyReport/increment");
+
 async function writeSubscriptionEvent(db, notificationUUID, fields) {
   if (!notificationUUID) {
     return;
@@ -161,6 +163,7 @@ async function writeSubscriptionEvent(db, notificationUUID, fields) {
     },
     { merge: true }
   );
+  recordSubscriptionEventActivity(fields);
 }
 
 async function beginNotificationProcessing(db, notificationUUID, baseFields) {
