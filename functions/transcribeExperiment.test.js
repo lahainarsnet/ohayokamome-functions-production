@@ -6,8 +6,10 @@ const {
   STT_PROVIDER_GOOGLE,
   STT_PROVIDER_GEMINI,
   STT_PROVIDER_GROQ,
+  STT_PROVIDER_CLOUDFLARE,
   GEMINI_TRANSCRIBE_MODEL,
   GROQ_TRANSCRIBE_MODEL,
+  CLOUDFLARE_TRANSCRIBE_MODEL,
 } = require("./stt/constants");
 const {
   resolveSttProvider,
@@ -156,6 +158,10 @@ async function runTests() {
   const groqProvider = resolveSttProvider("groq");
   assert.strictEqual(groqProvider.ok, true);
   assert.strictEqual(groqProvider.provider, STT_PROVIDER_GROQ);
+
+  const cloudflareProvider = resolveSttProvider("cloudflare");
+  assert.strictEqual(cloudflareProvider.ok, true);
+  assert.strictEqual(cloudflareProvider.provider, STT_PROVIDER_CLOUDFLARE);
 
   const typoProvider = resolveSttProvider("openai2");
   assert.strictEqual(typoProvider.ok, false);
@@ -437,6 +443,41 @@ async function runTests() {
     ok: true,
     text: "groq text",
   });
+
+  let cloudflareFetchCalled = false;
+  const cloudflareInvoke = await invokeSttProvider({
+    provider: STT_PROVIDER_CLOUDFLARE,
+    audioBuffer: Buffer.from("audio"),
+    mimeType: "audio/mp4",
+    language: "ja",
+    prompt: "そのまま文字起こししてください",
+    receivedBytes: 5,
+    apiKey: "cloudflare-token",
+    cloudflareOptions: {
+      accountId: "test-account",
+      gatewayId: "ohayokamome-stt-test",
+      fetchImpl: async (_url, options) => {
+        cloudflareFetchCalled = true;
+        assert.strictEqual(options.headers["cf-aig-gateway-id"], "ohayokamome-stt-test");
+        return {
+          ok: true,
+          status: 200,
+          text: async () =>
+            JSON.stringify({
+              success: true,
+              result: { text: "cloudflare text" },
+              usage: { neurons: 9.7488 },
+            }),
+        };
+      },
+    },
+  });
+  assert.strictEqual(cloudflareFetchCalled, true);
+  assert.strictEqual(cloudflareInvoke.ok, true);
+  assert.strictEqual(cloudflareInvoke.text, "cloudflare text");
+  assert.strictEqual(cloudflareInvoke.provider, STT_PROVIDER_CLOUDFLARE);
+  assert.strictEqual(cloudflareInvoke.model, CLOUDFLARE_TRANSCRIBE_MODEL);
+  assert.strictEqual(cloudflareInvoke.neurons, 9.7488);
 
   const invalidInvoke = await invokeSttProvider({
     provider: "unknown",

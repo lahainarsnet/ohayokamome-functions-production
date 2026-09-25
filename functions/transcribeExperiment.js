@@ -1,5 +1,5 @@
 /**
- * Phase 3: Base64 音声 → STT provider（OpenAI / Google / Gemini / Groq）→ text 返却。
+ * Phase 3: Base64 音声 → STT provider（OpenAI / Google / Gemini / Groq / Cloudflare）→ text 返却。
  *
  * - 音声内容や変換結果は保存しない。
  *
@@ -27,6 +27,7 @@ const {
   STT_PROVIDER_GOOGLE,
   STT_PROVIDER_GEMINI,
   STT_PROVIDER_GROQ,
+  STT_PROVIDER_CLOUDFLARE,
   GOOGLE_STT_DEFAULT_MODEL,
   GOOGLE_STT_DEFAULT_LOCATION,
 } = require("./stt/constants");
@@ -36,6 +37,7 @@ const { transcribeWithOpenAI } = require("./stt/openaiProvider");
 const { transcribeWithGoogle } = require("./stt/googleProvider");
 const { transcribeWithGemini } = require("./stt/geminiProvider");
 const { transcribeWithGroq } = require("./stt/groqProvider");
+const { transcribeWithCloudflare } = require("./stt/cloudflareProvider");
 const {
   recordSttLimitExceeded,
   recordSttAttempt,
@@ -46,6 +48,13 @@ const {
 const OPENAI_API_KEY = defineSecret("OPENAI_API_KEY");
 const GEMINI_API_KEY = defineSecret("GEMINI_API_KEY");
 const GROQ_API_KEY = defineSecret("GROQ_API_KEY");
+const CLOUDFLARE_API_TOKEN = defineSecret("CLOUDFLARE_API_TOKEN");
+const CLOUDFLARE_ACCOUNT_ID = defineString("CLOUDFLARE_ACCOUNT_ID", {
+  default: "",
+});
+const CLOUDFLARE_AI_GATEWAY_ID = defineString("CLOUDFLARE_AI_GATEWAY_ID", {
+  default: "",
+});
 const STT_PROVIDER = defineString("STT_PROVIDER", {
   default: STT_PROVIDER_OPENAI,
 });
@@ -460,6 +469,12 @@ function buildProviderTraceExtras(providerResult) {
   if (typeof providerResult?.promptEstimatedTokens === "number") {
     extras.groqPromptEstimatedTokens = providerResult.promptEstimatedTokens;
   }
+  if (typeof providerResult?.neurons === "number") {
+    extras.cloudflareNeurons = providerResult.neurons;
+  }
+  if (providerResult?.cloudflareGatewayId) {
+    extras.cloudflareGatewayId = providerResult.cloudflareGatewayId;
+  }
   return extras;
 }
 
@@ -475,6 +490,7 @@ async function invokeSttProvider({
   googleOptions = {},
   geminiOptions = {},
   groqOptions = {},
+  cloudflareOptions = {},
 }) {
   if (provider === STT_PROVIDER_OPENAI) {
     return transcribeWithOpenAI({
@@ -526,6 +542,21 @@ async function invokeSttProvider({
       logger,
     });
   }
+  if (provider === STT_PROVIDER_CLOUDFLARE) {
+    return transcribeWithCloudflare({
+      audioBuffer,
+      mimeType,
+      language,
+      prompt,
+      apiToken: apiKey,
+      accountId: cloudflareOptions.accountId,
+      gatewayId: cloudflareOptions.gatewayId,
+      receivedBytes,
+      fetchImpl: cloudflareOptions.fetchImpl,
+      timeoutMs: cloudflareOptions.timeoutMs,
+      logger,
+    });
+  }
   return {
     ok: false,
     code: "STT_PROVIDER_INVALID",
@@ -552,7 +583,7 @@ async function runTranscribeAdminGateAfterAuth(request, options = {}) {
 
 exports.transcribeExperiment = onCall(
   {
-    secrets: [OPENAI_API_KEY, GEMINI_API_KEY, GROQ_API_KEY],
+    secrets: [OPENAI_API_KEY, GEMINI_API_KEY, GROQ_API_KEY, CLOUDFLARE_API_TOKEN],
     enforceAppCheck: true,
     maxInstances: 30,
     concurrency: 10,
@@ -981,6 +1012,49 @@ exports.transcribeExperiment = onCall(
         return { ok: false, code: "SECRET_EMPTY" };
       }
     }
+    let cloudflareAccountId = null;
+    let cloudflareGatewayId = null;
+    if (provider === STT_PROVIDER_CLOUDFLARE) {
+      try {
+        apiKey = CLOUDFLARE_API_TOKEN.value();
+        cloudflareAccountId = CLOUDFLARE_ACCOUNT_ID.value();
+        cloudflareGatewayId = CLOUDFLARE_AI_GATEWAY_ID.value();
+      } catch (_) {
+        logger.warn("transcribeExperiment: SECRET_READ_FAILED", {
+          receivedBytes,
+          provider,
+          uidSuffix: uidSuffix(uid),
+        });
+        return { ok: false, code: "SECRET_READ_FAILED" };
+      }
+      if (typeof apiKey !== "string" || apiKey.length === 0) {
+        logger.warn("transcribeExperiment: SECRET_EMPTY", {
+          receivedBytes,
+          provider,
+          uidSuffix: uidSuffix(uid),
+        });
+        return { ok: false, code: "SECRET_EMPTY" };
+      }
+      if (
+        typeof cloudflareAccountId !== "string" ||
+        cloudflareAccountId.trim() === "" ||
+        typeof cloudflareGatewayId !== "string" ||
+        cloudflareGatewayId.trim() === ""
+      ) {
+        logger.warn("transcribeExperiment: CLOUDFLARE_CONFIG_MISSING", {
+          receivedBytes,
+          provider,
+          uidSuffix: uidSuffix(uid),
+          accountIdPresent:
+            typeof cloudflareAccountId === "string" &&
+            cloudflareAccountId.trim() !== "",
+          gatewayIdPresent:
+            typeof cloudflareGatewayId === "string" &&
+            cloudflareGatewayId.trim() !== "",
+        });
+        return { ok: false, code: "CLOUDFLARE_CONFIG_MISSING" };
+      }
+    }
 
     let dailyTranscribeLimit = DEFAULT_DAILY_TRANSCRIBE_LIMIT;
     let dailyTranscribeLimitUsedDefault = true;
@@ -1084,6 +1158,10 @@ exports.transcribeExperiment = onCall(
             process.env.GCLOUD_PROJECT || process.env.GOOGLE_CLOUD_PROJECT,
           location: process.env.STT_GOOGLE_LOCATION || GOOGLE_STT_DEFAULT_LOCATION,
           model: process.env.STT_GOOGLE_MODEL || GOOGLE_STT_DEFAULT_MODEL,
+        },
+        cloudflareOptions: {
+          accountId: cloudflareAccountId,
+          gatewayId: cloudflareGatewayId,
         },
       });
     } catch (invokeError) {

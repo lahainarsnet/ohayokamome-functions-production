@@ -33,6 +33,10 @@ function runTests() {
   assert.strictEqual(groqResolved.ok, true);
   assert.strictEqual(groqResolved.provider, "groq");
 
+  const cloudflareResolved = resolveSttProvider("cloudflare");
+  assert.strictEqual(cloudflareResolved.ok, true);
+  assert.strictEqual(cloudflareResolved.provider, "cloudflare");
+
   const typoResolved = resolveSttProvider("openai2");
   assert.strictEqual(typoResolved.ok, false);
   assert.strictEqual(typoResolved.code, "STT_PROVIDER_INVALID");
