@@ -651,10 +651,17 @@ async function commitUserSubscriptionDualWrite({
 
       let nextIos = beforeIos;
       let nextAndroid = beforeAndroid;
-      let nextStoreState = { ...storeState };
+      let nextStoreState = { ...(normalizedPlatform === "android" ? beforeAndroid : beforeIos), ...storeState };
+      if (normalizedPlatform === "ios") {
+        nextStoreState.transactionIds = [...new Set([...(beforeIos?.transactionIds || []),
+          ...(storeState.transactionIds || []), storeState.transactionId].filter(Boolean))];
+      } else if (Array.isArray(storeState.activePurchaseTokens)) {
+        nextStoreState.activePurchaseTokens = [...new Set([...(beforeAndroid?.activePurchaseTokens || []),
+          ...storeState.activePurchaseTokens].filter(Boolean))];
+      }
 
       if (normalizedPlatform === "android") {
-        if (!Array.isArray(nextStoreState.activePurchaseTokens)) {
+        if (!Array.isArray(storeState.activePurchaseTokens)) {
           nextStoreState.activePurchaseTokens = mergeAndroidActiveTokens(
             beforeAndroid,
             meta.purchaseToken || nextStoreState.primaryPurchaseToken || ""
@@ -695,10 +702,24 @@ async function commitUserSubscriptionDualWrite({
         ...platformSpecificLegacy,
         ...accountLegacy,
         activePurchaseTokens,
-        [`subscriptions.${normalizedPlatform}`]: nextStoreState,
+        subscriptions: { [normalizedPlatform]: nextStoreState },
         entitlementUsable: entitlement.entitlementUsable,
         entitlementSource: entitlement.entitlementSource,
         entitlementUpdatedAt: admin.FieldValue.serverTimestamp(),
+        // Invalidate purchase permission on every verified purchase / notification update.
+        // Retain provenance, never manufacture coverage for a legacy account.
+        billingRevision: Number(data.billingRevision || 0) + 1,
+        billingConfirmation: {
+          ...(data.billingConfirmation || {}),
+          [normalizedPlatform]: {
+            schemaVersion: 1,
+            state: "unknown",
+            reason: "contract_changed_requires_recheck",
+            coverage: data.billingConfirmation?.[normalizedPlatform]?.coverage || "unknown",
+            checkedAt: admin.FieldValue.serverTimestamp(),
+            revision: Number(data.billingRevision || 0) + 1,
+          },
+        },
       };
       if (entitlementExpiryTime) {
         writePayload.entitlementExpiryTime = entitlementExpiryTime;

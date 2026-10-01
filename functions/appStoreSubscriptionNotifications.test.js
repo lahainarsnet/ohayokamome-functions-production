@@ -142,12 +142,8 @@ function applyMerge(target, data) {
       delete next[key];
       continue;
     }
-    if (key.includes(".")) {
-      const [head, tail] = key.split(".");
-      next[head] = { ...(next[head] || {}), [tail]: value };
-      continue;
-    }
-    next[key] = value;
+    next[key] = value && Object.getPrototypeOf(value) === Object.prototype && !value.__type
+      ? applyMerge(next[key], value) : value;
   }
   return next;
 }

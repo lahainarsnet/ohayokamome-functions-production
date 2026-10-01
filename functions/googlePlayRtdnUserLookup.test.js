@@ -20,24 +20,13 @@ function getNested(data, field) {
 function applyMerge(target, payload) {
   const next = { ...(target || {}) };
   for (const [key, value] of Object.entries(payload || {})) {
-    if (key.includes(".")) {
-      const parts = key.split(".");
-      let cursor = next;
-      for (let i = 0; i < parts.length - 1; i += 1) {
-        const part = parts[i];
-        cursor[part] =
-          cursor[part] && typeof cursor[part] === "object" ? { ...cursor[part] } : {};
-        cursor = cursor[part];
-      }
-      cursor[parts[parts.length - 1]] = value;
-      continue;
-    }
     if (value && value.__type === "arrayUnion") {
       const existing = Array.isArray(next[key]) ? next[key] : [];
       next[key] = [...new Set(existing.concat(value.values || []))];
       continue;
     }
-    next[key] = value;
+    next[key] = value && Object.getPrototypeOf(value) === Object.prototype && !value.__type
+      ? applyMerge(next[key], value) : value;
   }
   return next;
 }

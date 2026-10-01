@@ -55,12 +55,8 @@ const admin = {
 function applyMerge(target, data) {
   const next = { ...(target || {}) };
   for (const [key, value] of Object.entries(data || {})) {
-    if (key.includes(".")) {
-      const [head, tail] = key.split(".");
-      next[head] = { ...(next[head] || {}), [tail]: value };
-      continue;
-    }
-    next[key] = value;
+    next[key] = value && Object.getPrototypeOf(value) === Object.prototype && !value.__type
+      ? applyMerge(next[key], value) : value;
   }
   return next;
 }
