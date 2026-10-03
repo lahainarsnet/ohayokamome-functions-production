@@ -46,12 +46,13 @@ function payloadKeys(data) {
   return Object.keys(data).sort();
 }
 
-function createBillingFinalLogger(baseLogger, { traceId, uid, functionName }) {
+function createBillingFinalLogger(baseLogger, { traceId, deviceSwitchTraceId, uid, functionName }) {
   const startedAt = Date.now();
   const emit = (level, step, fields = {}) => {
     baseLogger[level]("KAMOME_BILLING_FINAL_TRACE", {
       step,
       billingTraceId: traceId || null,
+      deviceSwitchTraceId: deviceSwitchTraceId || null,
       uidSuffix: tokenSuffix(uid),
       functionName: functionName || null,
       timestamp: new Date().toISOString(),

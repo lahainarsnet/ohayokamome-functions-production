@@ -302,6 +302,30 @@ function isRevocationNotification(forceExpired, notificationType) {
   return forceExpired || Number(notificationType) === REVOKED_NOTIFICATION_TYPE;
 }
 
+function androidEntitlementBasis(existingData) {
+  const android = existingData?.subscriptions?.android;
+  if (android && typeof android === "object") {
+    return {
+      ...existingData,
+      subscriptionStatus: android.status || "unknown",
+      subscriptionExpiryTime: android.expiryTime || null,
+      googlePlayPrimaryPurchaseToken: android.primaryPurchaseToken || "",
+      activePurchaseTokens: Array.isArray(android.activePurchaseTokens)
+        ? android.activePurchaseTokens : [],
+      googlePlaySubscriptionState: android.subscriptionState || "",
+    };
+  }
+  if (String(existingData?.subscriptionPlatform || "").toLowerCase() === "ios") {
+    return { ...existingData, subscriptionStatus: "unknown", subscriptionExpiryTime: null };
+  }
+  return existingData;
+}
+
+function shouldRequeryNonPrimaryNotification(existingData, purchaseToken, derived) {
+  const primary = String(androidEntitlementBasis(existingData)?.googlePlayPrimaryPurchaseToken || "").trim();
+  return Boolean(primary && primary !== purchaseToken && derived.status !== "active");
+}
+
 function collectTokensForRequery(existingData, notificationPurchaseToken) {
   const tokens = new Set();
   const primary = String(existingData?.googlePlayPrimaryPurchaseToken || "").trim();
@@ -368,7 +392,9 @@ function resolveRevocationUserEntitlement({
   notificationDerived,
   notificationTokenConfirmed,
   tokenResults,
+  protectPrimary = false,
 }) {
+  existingData = androidEntitlementBasis(existingData);
   const usable = pickBestUsableEntitlement(tokenResults);
   if (usable) {
     return {
@@ -389,6 +415,22 @@ function resolveRevocationUserEntitlement({
     !Number.isNaN(existingExpiry.getTime()) &&
     existingExpiry.getTime() > Date.now();
   const tokenCount = tokenResults.length;
+
+  if (protectPrimary) {
+    const primary = String(existingData?.googlePlayPrimaryPurchaseToken || "").trim();
+    const current = tokenResults.find((result) => result.purchaseToken === primary);
+    if (!current?.ok || !["active", "expired", "pending"].includes(current.derived?.status)) {
+      if (existingStatus === "active" && existingExpiryFuture) {
+        return {
+          action: "keep_active_uncertain",
+          derived: buildDerivedFromExistingActiveUser(existingData),
+          primaryPurchaseToken: primary,
+          revokedTokenIgnored: notificationPurchaseToken,
+        };
+      }
+      return { action: "defer", derived: notificationDerived, primaryPurchaseToken: primary };
+    }
+  }
 
   if (
     failed.length > 0 &&
@@ -443,8 +485,14 @@ async function syncEntitlementForToken(packageName, purchaseToken) {
       notificationType: null,
       forceExpired: false,
     });
+    const knownState = [
+      "SUBSCRIPTION_STATE_ACTIVE", "SUBSCRIPTION_STATE_IN_GRACE_PERIOD",
+      "SUBSCRIPTION_STATE_CANCELED", "SUBSCRIPTION_STATE_EXPIRED",
+      "SUBSCRIPTION_STATE_ON_HOLD", "SUBSCRIPTION_STATE_PAUSED",
+      "SUBSCRIPTION_STATE_PENDING", "SUBSCRIPTION_STATE_PENDING_PURCHASE_CANCELED",
+    ].includes(subscription.subscriptionState);
     return {
-      ok: true,
+      ok: knownState && (Boolean(matchedLineItem) || subscription.subscriptionState === "SUBSCRIPTION_STATE_EXPIRED"),
       purchaseToken,
       derived,
     };
@@ -480,7 +528,9 @@ async function resolveUserEntitlementAfterRevocation({
   notificationPurchaseToken,
   notificationDerived,
   notificationTokenConfirmed,
+  protectPrimary = false,
 }) {
+  existingData = androidEntitlementBasis(existingData);
   const tokens = collectTokensForRequery(existingData, notificationPurchaseToken);
   const tokenResults = await Promise.all(
     tokens.map((token) => syncEntitlementForToken(packageName, token)),
@@ -491,6 +541,7 @@ async function resolveUserEntitlementAfterRevocation({
     notificationDerived,
     notificationTokenConfirmed,
     tokenResults,
+    protectPrimary,
   });
 }
 
@@ -994,6 +1045,14 @@ function createGooglePlayRtdnHandler({ getDb, admin, logger }) {
       let matchedLineItem = null;
       let linkedPurchaseToken = "";
 
+      const developerApiStartedAt = Date.now();
+      logger.info(`${NOTIFICATION_TRACE} developer_api.begin`, {
+        eventId,
+        messageId,
+        platform: "android",
+        notificationType,
+        purchaseTokenSuffix: tokenSuffix(purchaseToken),
+      });
       try {
         const synced = await syncGooglePlaySubscriptionByPurchaseToken(
           packageName,
@@ -1004,7 +1063,25 @@ function createGooglePlayRtdnHandler({ getDb, admin, logger }) {
         linkedPurchaseToken = String(
           subscription?.linkedPurchaseToken || "",
         ).trim();
+        logger.info(`${NOTIFICATION_TRACE} developer_api.end`, {
+          eventId,
+          messageId,
+          elapsedMs: Date.now() - developerApiStartedAt,
+          outcome: "success",
+          subscriptionState: subscription?.subscriptionState || "unknown",
+          lineItemMatched: Boolean(matchedLineItem),
+          linkedTokenPresent: Boolean(linkedPurchaseToken),
+        });
       } catch (apiError) {
+        logger.warn(`${NOTIFICATION_TRACE} developer_api.end`, {
+          eventId,
+          messageId,
+          elapsedMs: Date.now() - developerApiStartedAt,
+          outcome: "error",
+          errorType: apiError?.constructor?.name || "Error",
+          errorCode: typeof apiError?.code === "string" ? apiError.code : "unknown",
+          permanentForRevocation: Boolean(forceExpired && isPermanentGooglePlayApiError(apiError)),
+        });
         if (forceExpired && isPermanentGooglePlayApiError(apiError)) {
           subscription = {};
           matchedLineItem = null;
@@ -1087,44 +1164,59 @@ function createGooglePlayRtdnHandler({ getDb, admin, logger }) {
       let applyOptions = {};
       let revocationResolution = null;
 
-      if (isRevocation) {
+      if (isRevocation || derived.status !== "active") {
         const userRef = db.collection("users").doc(userLookup.uid);
         const userSnap = await userRef.get();
         const existingData = userSnap.exists ? userSnap.data() || {} : {};
-        const notificationTokenConfirmed =
-          forceExpired ||
-          Boolean(matchedLineItem) ||
-          derived.status === "expired";
+        const protectPrimary = shouldRequeryNonPrimaryNotification(existingData, purchaseToken, derived);
+        if (isRevocation || protectPrimary) {
+          const notificationTokenConfirmed =
+            forceExpired ||
+            Boolean(matchedLineItem) ||
+            derived.status === "expired";
 
-        revocationResolution = await resolveUserEntitlementAfterRevocation({
-          packageName,
-          existingData,
-          notificationPurchaseToken: purchaseToken,
-          notificationDerived: derived,
-          notificationTokenConfirmed,
-        });
+          revocationResolution = await resolveUserEntitlementAfterRevocation({
+            packageName,
+            existingData,
+            notificationPurchaseToken: purchaseToken,
+            notificationDerived: derived,
+            notificationTokenConfirmed,
+            protectPrimary,
+          });
 
-        finalDerived = revocationResolution.derived;
-        applyOptions = {
-          primaryPurchaseToken: revocationResolution.primaryPurchaseToken,
-          clearPrimaryPurchaseToken:
-            revocationResolution.action === "expire",
-          eventId,
-          logger,
-        };
+          if (revocationResolution.action === "defer") {
+            await writeSubscriptionEvent(db, eventId, {
+              ...baseFields,
+              status: "deferred",
+              uid: userLookup.uid,
+              errorCode: "CURRENT_PRIMARY_ENTITLEMENT_UNKNOWN",
+              revocationAction: "defer",
+            });
+            return;
+          }
 
-        logger.info(`${NOTIFICATION_TRACE} revocation resolved`, {
-          messageId,
-          eventId,
-          uid: userLookup.uid,
-          action: revocationResolution.action,
-          notificationPurchaseTokenSuffix: tokenSuffix(purchaseToken),
-          revokedTokenIgnored: revocationResolution.revokedTokenIgnored
-            ? tokenSuffix(revocationResolution.revokedTokenIgnored)
-            : null,
-          uncertainApiFailures: revocationResolution.uncertainApiFailures || [],
-          finalSubscriptionStatus: finalDerived.status,
-        });
+          finalDerived = revocationResolution.derived;
+          applyOptions = {
+            primaryPurchaseToken: revocationResolution.primaryPurchaseToken,
+            clearPrimaryPurchaseToken:
+              revocationResolution.action === "expire",
+            eventId,
+            logger,
+          };
+
+          logger.info(`${NOTIFICATION_TRACE} revocation resolved`, {
+            messageId,
+            eventId,
+            uid: userLookup.uid,
+            action: revocationResolution.action,
+            notificationPurchaseTokenSuffix: tokenSuffix(purchaseToken),
+            revokedTokenIgnored: revocationResolution.revokedTokenIgnored
+              ? tokenSuffix(revocationResolution.revokedTokenIgnored)
+              : null,
+            uncertainApiFailures: revocationResolution.uncertainApiFailures || [],
+            finalSubscriptionStatus: finalDerived.status,
+          });
+        }
       }
 
       if (!isRevocation) {
@@ -1219,9 +1311,12 @@ module.exports = {
   createGooglePlayRtdnHandler,
   GOOGLE_PLAY_PACKAGE_NAME,
   GOOGLE_PLAY_MONTHLY_PRODUCT_ID,
+  androidEntitlementBasis,
+  shouldRequeryNonPrimaryNotification,
   collectTokensForRequery,
   isUsableGooglePlayEntitlement,
   resolveRevocationUserEntitlement,
+  resolveUserEntitlementAfterRevocation,
   deriveGooglePlayEntitlement,
   parseFirestoreExpiryTime,
   syncGooglePlaySubscriptionByPurchaseToken,

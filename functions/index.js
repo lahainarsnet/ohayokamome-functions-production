@@ -9,8 +9,11 @@ const { onCall, onRequest, HttpsError } = require("firebase-functions/v2/https")
 const { defineSecret, defineString } = require("firebase-functions/params");
 const logger = require("firebase-functions/logger");
 const crypto = require("node:crypto");
+const { readCompletion, completionWrite, createCompletionHandler } = require("./iosPurchaseCompletion");
 const { google } = require("googleapis");
 const admin = require("./firebaseAdmin");
+exports.readIosPurchaseCompletion = onCall({ enforceAppCheck: true, timeoutSeconds: 15 }, createCompletionHandler(admin, "read"));
+exports.markIosPurchaseCompletion = onCall({ enforceAppCheck: true, timeoutSeconds: 15 }, createCompletionHandler(admin, "complete"));
 const { transcribeExperiment } = require("./transcribeExperiment");
 const {
   createAppStoreNotificationHandler,
@@ -56,6 +59,7 @@ const {
   assertSubscriptionNotLinkedToOtherUser,
   ownershipIdentifiersFromAppStoreUpdate,
   ensureAppStoreAppAccountTokenForUser,
+  buildIosOwnershipId,
   claimIosSubscriptionOwnership,
   claimAndroidSubscriptionOwnership,
 } = require("./subscriptionOwnership");
@@ -98,6 +102,7 @@ const {
   resolveGetUserInfoByAccountIdLookup,
 } = require("./accountIdGuard");
 const { onMessagePublished } = require("firebase-functions/v2/pubsub");
+const { createPreChatBillingHandlers, recordNewAuthCreation, seedInitializedAccount, verifiedStoreMetadata } = require("./preChatBillingConfirmation");
 const { runChatMessageCleanup } = require("./deleteOldMessagesHandler");
 const {
   recordMessageSent,
@@ -819,10 +824,12 @@ function buildAppStoreVerifyActiveUpdate({
     appStoreOriginalTransactionId: derived.originalTransactionId || "",
     appStoreWebOrderLineItemId: transactionInfo?.webOrderLineItemId || "",
     appStoreValidationCode: derived.validationCode || "ACTIVE",
+    appStoreVerifiedMetadata: { ...verifiedStoreMetadata("ios", { transaction: transactionInfo }, admin.FieldValue.serverTimestamp()), verificationSource: "app_store_server_api" },
   };
 }
 
 async function writeAppStoreVerifyUserUpdate({
+  completionRecord = null,
   uid,
   update,
   autoRenewing = null,
@@ -839,14 +846,18 @@ async function writeAppStoreVerifyUserUpdate({
     source: "app_store_server_api",
     updatedAt: admin.FieldValue.serverTimestamp(),
   });
+  Object.assign(storeState, update.appStoreVerifiedMetadata || {});
+  storeState.transactionIds = [update.appStoreTransactionId].filter(Boolean);
+  const { appStoreVerifiedMetadata: _metadata, ...legacyUpdate } = update;
   await commitUserSubscriptionDualWrite({
     db: admin.getDb(),
     admin,
     uid,
+    completionWrite: completionRecord,
     source: "apple_verify",
     platform: "ios",
     storeState,
-    legacyUpdate: update,
+    legacyUpdate,
     log,
     meta: {
       eventId: traceId || "",
@@ -1635,6 +1646,14 @@ exports.upsertUserEmailAndAccount = onCall({ enforceAppCheck: true }, async (req
     }
 
     await userRef.set(update, { merge: true });
+    // Only a server Auth creation event can grant new-account billing coverage.
+    try {
+      const authUser = await admin.getAuthClient().getUser(uid);
+      await seedInitializedAccount({ db: admin.getDb(), admin, uid,
+        creationTime: authUser.metadata.creationTime });
+    } catch (_) {
+      logger.info("PRECHAT_BILLING initialization proof unavailable");
+    }
 
     logger.info("upsertUserEmailAndAccount succeeded.", {
       uidSuffix: uidTailForLog(uid),
@@ -1745,9 +1764,14 @@ exports.verifyGooglePlaySubscriptionPurchase = onCall(
   { region: "us-central1", enforceAppCheck: true },
   async (request) => {
     const uid = request.auth && request.auth.uid;
+    const rawDeviceSwitchTraceId = request.data && request.data.deviceSwitchTraceId;
+    const deviceSwitchTraceId = /^ds-[0-9]{1,20}-[0-9]{1,8}$/.test(String(rawDeviceSwitchTraceId || ""))
+      ? String(rawDeviceSwitchTraceId)
+      : null;
     const logUidSuffix = uidTailForLog(uid || "");
     console.info(`${GOOGLE_PLAY_BILLING_TRACE} function called`, {
       hasAuth: Boolean(request.auth),
+      deviceSwitchTraceId,
       uidSuffix: logUidSuffix,
     });
     if (!uid) {
@@ -1772,6 +1796,7 @@ exports.verifyGooglePlaySubscriptionPurchase = onCall(
     const packageName = String(data.packageName || GOOGLE_PLAY_PACKAGE_NAME).trim();
     const source = String(data.source || "google_play_purchase").trim();
     console.info(`${GOOGLE_PLAY_BILLING_TRACE} function payload`, {
+      deviceSwitchTraceId,
       uidSuffix: logUidSuffix,
       productId,
       packageName,
@@ -1782,6 +1807,7 @@ exports.verifyGooglePlaySubscriptionPurchase = onCall(
 
     if (packageName !== GOOGLE_PLAY_PACKAGE_NAME) {
       console.warn(`${GOOGLE_PLAY_BILLING_TRACE} function invalid packageName`, {
+        deviceSwitchTraceId,
         uidSuffix: logUidSuffix,
         packageName,
         expectedPackageName: GOOGLE_PLAY_PACKAGE_NAME,
@@ -1790,6 +1816,7 @@ exports.verifyGooglePlaySubscriptionPurchase = onCall(
     }
     if (productId !== GOOGLE_PLAY_MONTHLY_PRODUCT_ID) {
       console.warn(`${GOOGLE_PLAY_BILLING_TRACE} function invalid productId`, {
+        deviceSwitchTraceId,
         uidSuffix: logUidSuffix,
         productId,
         expectedProductId: GOOGLE_PLAY_MONTHLY_PRODUCT_ID,
@@ -1798,6 +1825,7 @@ exports.verifyGooglePlaySubscriptionPurchase = onCall(
     }
     if (!purchaseToken) {
       console.warn(`${GOOGLE_PLAY_BILLING_TRACE} function missing purchaseToken`, {
+        deviceSwitchTraceId,
         uidSuffix: logUidSuffix,
         productId,
         packageName,
@@ -1806,6 +1834,7 @@ exports.verifyGooglePlaySubscriptionPurchase = onCall(
     }
 
     console.info(`${GOOGLE_PLAY_BILLING_TRACE} google play api auth start`, {
+      deviceSwitchTraceId,
       uidSuffix: logUidSuffix,
       productId,
       packageName,
@@ -1822,6 +1851,7 @@ exports.verifyGooglePlaySubscriptionPurchase = onCall(
     let subscription;
     try {
       console.info(`${GOOGLE_PLAY_BILLING_TRACE} google play api call start`, {
+        deviceSwitchTraceId,
         uidSuffix: logUidSuffix,
         productId,
         packageName,
@@ -1833,6 +1863,7 @@ exports.verifyGooglePlaySubscriptionPurchase = onCall(
       });
       subscription = response.data;
       console.info(`${GOOGLE_PLAY_BILLING_TRACE} google play api call success`, {
+        deviceSwitchTraceId,
         uidSuffix: logUidSuffix,
         productId,
         packageName,
@@ -1841,6 +1872,7 @@ exports.verifyGooglePlaySubscriptionPurchase = onCall(
       });
     } catch (error) {
       console.error(`${GOOGLE_PLAY_BILLING_TRACE} google play api call failed`, {
+        deviceSwitchTraceId,
         uidSuffix: logUidSuffix,
         productId,
         packageName,
@@ -1864,6 +1896,7 @@ exports.verifyGooglePlaySubscriptionPurchase = onCall(
       GOOGLE_PLAY_ACTIVE_STATES.has(subscriptionState) &&
       matchedLineItem !== undefined;
     console.info(`${GOOGLE_PLAY_BILLING_TRACE} google play verification result`, {
+      deviceSwitchTraceId,
       uidSuffix: logUidSuffix,
       productId,
       packageName,
@@ -1887,10 +1920,15 @@ exports.verifyGooglePlaySubscriptionPurchase = onCall(
     const now = admin.FieldValue.serverTimestamp();
 
     try {
+      const verifiedPurchase = await require("./verifiedOwnershipPurchase").verifiedGoogleOwnershipFacts({
+        db: admin.getDb(), uid, purchaseToken, subscription, matchedLineItem,
+        verifyLinked: (token) => require("./googlePlaySubscriptionNotifications").syncGooglePlaySubscriptionByPurchaseToken(GOOGLE_PLAY_PACKAGE_NAME, token),
+      });
       await assertSubscriptionNotLinkedToOtherUser(admin.getDb(), {
         uid,
         platform: "android",
-        identifiers: { purchaseToken },
+        identifiers: { purchaseToken, linkedPurchaseToken: subscription.linkedPurchaseToken || "" },
+        verifiedPurchase,
         log: console,
       });
       const linkedPurchaseToken = String(subscription.linkedPurchaseToken || "").trim();
@@ -1898,11 +1936,13 @@ exports.verifyGooglePlaySubscriptionPurchase = onCall(
         uid,
         purchaseToken,
         linkedPurchaseToken,
+        verifiedPurchase,
         productId: GOOGLE_PLAY_MONTHLY_PRODUCT_ID,
         log: console,
       });
 
       console.info(`${GOOGLE_PLAY_BILLING_TRACE} firestore users update start`, {
+        deviceSwitchTraceId,
         uidSuffix: logUidSuffix,
         productId,
         packageName,
@@ -1933,6 +1973,10 @@ exports.verifyGooglePlaySubscriptionPurchase = onCall(
         source: source || "google_play_purchase",
         updatedAt: now,
       });
+      Object.assign(storeState, verifiedStoreMetadata("android", { subscription }, now));
+      storeState.activePurchaseTokens = [purchaseToken, linkedPurchaseToken].filter(Boolean);
+      legacyUpdate.googlePlayLinkedPurchaseToken = linkedPurchaseToken;
+      legacyUpdate.googlePlayAcknowledgementState = subscription.acknowledgementState || "unknown";
       await commitUserSubscriptionDualWrite({
         db: admin.getDb(),
         admin,
@@ -1947,6 +1991,7 @@ exports.verifyGooglePlaySubscriptionPurchase = onCall(
         },
       });
       console.info(`${GOOGLE_PLAY_BILLING_TRACE} firestore users update success`, {
+        deviceSwitchTraceId,
         uidSuffix: logUidSuffix,
         productId,
         packageName,
@@ -1957,6 +2002,7 @@ exports.verifyGooglePlaySubscriptionPurchase = onCall(
         throw error;
       }
       console.error(`${GOOGLE_PLAY_BILLING_TRACE} firestore users update failed`, {
+        deviceSwitchTraceId,
         uidSuffix: logUidSuffix,
         productId,
         packageName,
@@ -1970,6 +2016,7 @@ exports.verifyGooglePlaySubscriptionPurchase = onCall(
     }
 
     console.info(`${GOOGLE_PLAY_BILLING_TRACE} function success`, {
+      deviceSwitchTraceId,
       uidSuffix: logUidSuffix,
       productId,
       packageName,
@@ -2011,6 +2058,7 @@ exports.verifyAppStoreSubscriptionPurchase = onCall(
     const traceId = extractBillingTraceId(data);
     const finalLog = createBillingFinalLogger(logger, {
       traceId,
+      deviceSwitchTraceId: /^ds-[0-9]{1,20}-[0-9]{1,8}$/.test(String(data.deviceSwitchTraceId || "")) ? String(data.deviceSwitchTraceId) : null,
       uid,
       functionName: "verifyAppStoreSubscriptionPurchase",
     });
@@ -2032,6 +2080,11 @@ exports.verifyAppStoreSubscriptionPurchase = onCall(
       environmentHint: environmentHint || null,
     });
 
+    if (data.exactCompletionTransaction === true) {
+      const existing = await readCompletion(admin.getDb(), uid, { productId: data.productId, transactionId });
+      if (existing.state === "verified") return { success: true, recoveryOnly: true,
+        subscriptionStatus: existing.subscriptionStatus, completionRecord: existing };
+    }
     await assertActiveDeviceAllowed({
       admin,
       uid,
@@ -2070,6 +2123,46 @@ exports.verifyAppStoreSubscriptionPurchase = onCall(
         transactionInfo: summarizeTransactionInfo(result.transactionInfo),
       });
       const validation = validateAppStoreSubscription(result.transactionInfo);
+      if (data.exactCompletionTransaction === true) {
+        const info = result.transactionInfo;
+        if (String(info?.transactionId || "") !== transactionId ||
+            (!validation.active && validation.code !== "SUBSCRIPTION_EXPIRED") ||
+            !Number.isFinite(validation.expiresDate) || validation.expiresDate <= 0) {
+          throw new HttpsError("failed-precondition", "Exact transaction verification failed.");
+        }
+        const update = validation.active ? buildAppStoreVerifyActiveUpdate({
+          derived: { latestTransactionId: transactionId, originalTransactionId: info.originalTransactionId,
+            expiresDate: validation.expiresDate, validationCode: validation.code },
+          environment: result.environment, transactionInfo: info, lookupTransactionId: transactionId,
+        }) : buildAppStoreVerifyInactiveUpdate({ derived: null, environment: result.environment,
+          transactionInfo: info, lookupTransactionId: transactionId, validationCode: validation.code });
+        const owner = await admin.getDb().collection("subscription_ownership").doc(buildIosOwnershipId(info.originalTransactionId || transactionId)).get();
+        const userSnap = await admin.getDb().collection("users").doc(uid).get();
+        const verifiedPurchase = { active: validation.active,
+          uidBound: Boolean(info.appAccountToken) && info.appAccountToken.toLowerCase() ===
+            String(userSnap.get("appStoreAppAccountToken") || "").toLowerCase(), purchasedAt: Number(info.purchaseDate) };
+        if (info.appAccountToken && !verifiedPurchase.uidBound) {
+          throw new HttpsError("failed-precondition", "Transaction account binding mismatch.", { code: "SUBSCRIPTION_TOKEN_MISMATCH" });
+        }
+        if (owner.exists && owner.get("ownerUid") !== uid &&
+            (data.completionMode !== "new_purchase" || !validation.active || !verifiedPurchase.uidBound)) {
+          throw new HttpsError("failed-precondition", "Transaction belongs to another user.", { code: "SUBSCRIPTION_ALREADY_LINKED" });
+        }
+        await assertSubscriptionNotLinkedToOtherUser(admin.getDb(), {
+          uid, platform: "ios", identifiers: ownershipIdentifiersFromAppStoreUpdate(update),
+          verifiedPurchase, log: ownershipLog, traceId,
+        });
+        // Existing owner: bookkeeping recovery never re-claims ownership.
+        // New verified purchases retain the existing bound-token/expired-owner safeguards.
+        if (!owner.exists || owner.get("ownerUid") !== uid) await claimIosSubscriptionOwnership(admin.getDb(), admin, {
+          uid, update, transactionInfo: info, verifiedPurchase, productId: APP_STORE_PRODUCT_ID, log: ownershipLog, traceId,
+        });
+        await writeAppStoreVerifyUserUpdate({ uid, update, log: logger, traceId,
+          completionRecord: completionWrite(admin.getDb(), admin, uid, info, update.subscriptionStatus) });
+        const record = await readCompletion(admin.getDb(), uid, { productId: info.productId, transactionId });
+        return { success: true, subscriptionStatus: update.subscriptionStatus,
+          productId: info.productId, transactionId, completionRecord: record };
+      }
 
       if (!validation.active) {
         finalLog.warn("verify.inactive_transaction", {
@@ -2136,6 +2229,10 @@ exports.verifyAppStoreSubscriptionPurchase = onCall(
                 uid,
                 platform: "ios",
                 identifiers: ownershipIdentifiersFromAppStoreUpdate(update),
+                verifiedPurchase: { active: Number(latest.transactionInfo.expiresDate) > Date.now() && !latest.transactionInfo.revocationDate,
+                  uidBound: Boolean(latest.transactionInfo.appAccountToken) && latest.transactionInfo.appAccountToken.toLowerCase() ===
+                  String((await admin.getDb().collection("users").doc(uid).get()).get("appStoreAppAccountToken") || "").toLowerCase(),
+                  purchasedAt: Number(latest.transactionInfo.purchaseDate) },
                 log: ownershipLog,
                 traceId,
               });
@@ -2143,6 +2240,7 @@ exports.verifyAppStoreSubscriptionPurchase = onCall(
                 uid,
                 update,
                 transactionInfo: latest.transactionInfo,
+                verifiedPurchase: { uidBound: true, purchasedAt: Number(latest.transactionInfo.purchaseDate) },
                 productId: APP_STORE_PRODUCT_ID,
                 log: ownershipLog,
                 traceId,
@@ -2299,6 +2397,10 @@ exports.verifyAppStoreSubscriptionPurchase = onCall(
         uid,
         platform: "ios",
         identifiers: ownershipIdentifiersFromAppStoreUpdate(update),
+        verifiedPurchase: { active: Number(result.transactionInfo.expiresDate) > Date.now() && !result.transactionInfo.revocationDate,
+          uidBound: Boolean(result.transactionInfo.appAccountToken) && result.transactionInfo.appAccountToken.toLowerCase() ===
+          String((await admin.getDb().collection("users").doc(uid).get()).get("appStoreAppAccountToken") || "").toLowerCase(),
+          purchasedAt: Number(result.transactionInfo.purchaseDate) },
         log: ownershipLog,
         traceId,
       });
@@ -2306,6 +2408,7 @@ exports.verifyAppStoreSubscriptionPurchase = onCall(
         uid,
         update,
         transactionInfo: result.transactionInfo,
+        verifiedPurchase: { uidBound: true, purchasedAt: Number(result.transactionInfo.purchaseDate) },
         productId: APP_STORE_PRODUCT_ID,
         log: ownershipLog,
         traceId,
@@ -2624,13 +2727,44 @@ exports.acknowledgeDeviceSwitchNotice = onCall(
 );
 
 exports.inspectSubscriptionSeriesOwnership = onCall(
-  { region: "us-central1", enforceAppCheck: true },
+  { region: "us-central1", enforceAppCheck: true, secrets: [APP_STORE_CONNECT_ISSUER_ID,
+    APP_STORE_CONNECT_KEY_ID, APP_STORE_CONNECT_PRIVATE_KEY] },
   createInspectSubscriptionSeriesOwnershipHandler({
     admin,
     logger,
+    secrets: { issuerSecret: APP_STORE_CONNECT_ISSUER_ID,
+      keyIdSecret: APP_STORE_CONNECT_KEY_ID, privateKeySecret: APP_STORE_CONNECT_PRIVATE_KEY },
+    getAppAppleId: () => APP_STORE_CONNECT_APP_APPLE_ID.value(),
   }),
 );
 
 exports.transcribeExperiment = transcribeExperiment;
 
 exports.scheduledDailyReport = scheduledDailyReport;
+
+
+// Purchase-entry only: one current contract, READ and one-shot safe synchronization.
+// Legacy factory paths remain for fixtures, never for deployed callables.
+const preChatBillingHandlers = createPreChatBillingHandlers({
+  currentContractOnly: true,
+  getDb: admin.getDb, admin, logger,
+  secrets: { issuerSecret: APP_STORE_CONNECT_ISSUER_ID,
+    keyIdSecret: APP_STORE_CONNECT_KEY_ID, privateKeySecret: APP_STORE_CONNECT_PRIVATE_KEY },
+  getAppAppleId: () => APP_STORE_CONNECT_APP_APPLE_ID.value(),
+  // READ must work before the initial device claim and during device reserve.
+  assertRequestAllowed: async (request, platform) => {
+    await assertPurchasingPlatformAllowed(request.auth.uid, platform);
+  },
+  assertSyncAllowed: async (request) => {
+    await assertActiveDeviceAllowed({ admin, uid: request.auth.uid,
+      data: request.data, allowPendingDevice: true });
+  },
+});
+const preChatBillingOptions = { region: "us-central1", enforceAppCheck: true,
+  timeoutSeconds: 30, secrets: [APP_STORE_CONNECT_ISSUER_ID,
+    APP_STORE_CONNECT_KEY_ID, APP_STORE_CONNECT_PRIVATE_KEY] };
+exports.readPreChatBillingConfirmation = onCall(preChatBillingOptions, preChatBillingHandlers.read);
+exports.syncPreChatBillingConfirmation = onCall(preChatBillingOptions, preChatBillingHandlers.sync);
+exports.recordPreChatBillingAuthCreation = require("firebase-functions/v1").auth.user().onCreate(
+  async (user) => recordNewAuthCreation({ db: admin.getDb(), admin, user }),
+);

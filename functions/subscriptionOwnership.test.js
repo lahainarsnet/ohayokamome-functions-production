@@ -252,7 +252,7 @@ async function run() {
       "uid-b": expiredIosUser(),
     }
   );
-  await assertSubscriptionNotLinkedToOtherUser(dbExpiredOther, {
+  await assert.rejects(() => assertSubscriptionNotLinkedToOtherUser(dbExpiredOther, {
     uid: "uid-a",
     platform: "ios",
     identifiers: {
@@ -260,7 +260,7 @@ async function run() {
       transactionId: "2000001203730221",
     },
     log: { info() {}, warn() {} },
-  });
+  }), (error) => error.details.code === SUBSCRIPTION_ALREADY_LINKED_CODE);
 
   const dbActiveAndroidOther = createMockDb(
     {
@@ -293,14 +293,14 @@ async function run() {
       "uid-b": expiredAndroidUser(),
     }
   );
-  await assertSubscriptionNotLinkedToOtherUser(dbExpiredAndroidOther, {
+  await assert.rejects(() => assertSubscriptionNotLinkedToOtherUser(dbExpiredAndroidOther, {
     uid: "uid-a",
     platform: "android",
     identifiers: {
       purchaseToken: "android-token-1",
     },
     log: { info() {}, warn() {} },
-  });
+  }), (error) => error.details.code === SUBSCRIPTION_ALREADY_LINKED_CODE);
 
   const dbSameUid = createMockDb(
     {
@@ -351,9 +351,8 @@ async function run() {
 
   const dbLoadFail = {
     collection(name) {
-      if (name !== "users") {
-        throw new Error(`Unexpected collection: ${name}`);
-      }
+      if (name === "subscription_ownership") return { doc: () => ({ get: async () => ({exists:false}) }) };
+      if (name !== "users") throw new Error(`Unexpected collection: ${name}`);
       return {
         where(field, op, value) {
           const key = `${field}|${op}|${value}`;
@@ -394,7 +393,7 @@ async function run() {
         },
         log: { info() {}, warn() {} },
       }),
-    (error) => error.details.code === SUBSCRIPTION_ALREADY_LINKED_CODE
+    (error) => error.message === "simulated owner load failure"
   );
 
   const crossPlatformOnly = isSubscriptionOwnerCurrentlyUsable(
@@ -472,7 +471,7 @@ async function run() {
   };
   const inactiveConflictDocs = { [ownershipId]: { ownerUid: "uid-b" } };
   const dbInactiveConflict = createMockDb({}, inactiveConflictDocs, previousOwnerUsers);
-  await claimOwnershipDocument(dbInactiveConflict, admin, {
+  await assert.rejects(() => claimOwnershipDocument(dbInactiveConflict, admin, {
     uid: "uid-c",
     ownershipId,
     platform: "ios",
@@ -482,8 +481,8 @@ async function run() {
       appStoreTransactionId: "txn-old-b",
     },
     log: { info() {}, warn() {} },
-  });
-  assert.equal(inactiveConflictDocs[ownershipId].ownerUid, "uid-c");
+  }), (error) => error.details.code === SUBSCRIPTION_ALREADY_LINKED_CODE);
+  assert.equal(inactiveConflictDocs[ownershipId].ownerUid, "uid-b");
 
   const detachNone = buildDetachedAppleIdentifierUpdate(
     { appStoreOriginalTransactionId: "2000001999999999" },
@@ -645,7 +644,7 @@ async function run() {
   const expiredAndroidOwn = {
     [androidId1]: { ownerUid: "uid-b" },
   };
-  await claimAndroidSubscriptionOwnership(
+  await assert.rejects(() => claimAndroidSubscriptionOwnership(
     createMockDb({}, expiredAndroidOwn, {
       "uid-a": {},
       "uid-b": expiredAndroidUser(),
@@ -657,8 +656,8 @@ async function run() {
       productId: "ohayo_kamome_monthly",
       log: { info() {}, warn() {} },
     }
-  );
-  assert.equal(expiredAndroidOwn[androidId1].ownerUid, "uid-a");
+  ), (error) => error.details.code === SUBSCRIPTION_ALREADY_LINKED_CODE);
+  assert.equal(expiredAndroidOwn[androidId1].ownerUid, "uid-b");
 
   const iosUserDocs = { "uid-a": {} };
   const iosOwnDocs = {};
@@ -782,6 +781,7 @@ async function run() {
       uid: "uid-a",
       platform: "android",
       purchaseToken: "android-token-1",
+      verifySeriesState: async () => "active",
       log: { info() {}, warn() {} },
     }
   );
@@ -796,10 +796,11 @@ async function run() {
       uid: "uid-a",
       platform: "android",
       purchaseToken: "android-token-1",
+      verifySeriesState: async () => "ended",
       log: { info() {}, warn() {} },
     }
   );
-  assert.equal(inspectOtherExpired.decision, "mismatch");
+  assert.equal(inspectOtherExpired.decision, "none");
 
   const inspectSameUidOtherSeries = await inspectSubscriptionSeriesOwnership(
     createMockDb({}, {}, {
@@ -838,10 +839,11 @@ async function run() {
       uid: "uid-a",
       platform: "ios",
       originalTransactionId: "2000001194540581",
+      verifySeriesState: async () => "ended",
       log: { info() {}, warn() {} },
     }
   );
-  assert.equal(inspectIosOther.decision, "mismatch");
+  assert.equal(inspectIosOther.decision, "none");
 
   const inspectIosOtherSeries = await inspectSubscriptionSeriesOwnership(
     createMockDb({}, {}, {

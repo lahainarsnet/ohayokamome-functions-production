@@ -486,6 +486,13 @@ function createAppStoreNotificationHandler({
       );
       const notificationUUID = decoded?.notificationUUID || "";
       const baseFields = eventBaseFields(decoded, environment);
+      logger.info(`${NOTIFICATION_TRACE} received`, {
+        operationId: notificationUUID || "missing-notification-id",
+        platform: "ios",
+        notificationType: baseFields.notificationType,
+        subtype: baseFields.subtype,
+        environment: baseFields.environment,
+      });
 
       if (!notificationUUID) {
         await writeSubscriptionEvent(db, `missing-uuid-${Date.now()}`, {
@@ -671,11 +678,35 @@ function createAppStoreNotificationHandler({
         return;
       }
 
-      const apiResult = await fetchAppStoreAllSubscriptionStatuses(
-        originalTransactionId,
-        notificationEnvironment,
-        secrets
-      );
+      const apiStartedAt = Date.now();
+      logger.info(`${NOTIFICATION_TRACE} app_store_api.begin`, {
+        operationId: notificationUUID,
+        notificationType: baseFields.notificationType,
+        environment: notificationEnvironment,
+      });
+      let apiResult;
+      try {
+        apiResult = await fetchAppStoreAllSubscriptionStatuses(
+          originalTransactionId,
+          notificationEnvironment,
+          secrets
+        );
+        logger.info(`${NOTIFICATION_TRACE} app_store_api.end`, {
+          operationId: notificationUUID,
+          elapsedMs: Date.now() - apiStartedAt,
+          outcome: "success",
+          groupCount: apiResult.body?.data?.length || 0,
+        });
+      } catch (apiError) {
+        logger.warn(`${NOTIFICATION_TRACE} app_store_api.end`, {
+          operationId: notificationUUID,
+          elapsedMs: Date.now() - apiStartedAt,
+          outcome: "error",
+          errorType: apiError?.constructor?.name || "Error",
+          errorCode: apiError?.status || apiError?.code || "unknown",
+        });
+        throw apiError;
+      }
       const latestEntry = await pickLatestTransactionEntry(
         apiResult.body,
         (signedInfo) => verifier.verifyAndDecodeTransaction(signedInfo)
@@ -729,18 +760,44 @@ function createAppStoreNotificationHandler({
         }
       }
 
-      await applyUserSubscriptionUpdate(
-        db,
-        admin,
-        userLookup.uid,
-        derived,
-        "app_store_notification_v2",
-        {
-          autoRenewing: autoRenewingFromRenewalInfo(latestRenewalInfo),
-          notificationUUID,
-          logger,
-        }
-      );
+      const firestoreUpdateStartedAt = Date.now();
+      logger.info(`${NOTIFICATION_TRACE} firestore_update.begin`, {
+        operationId: notificationUUID,
+        uidSuffix: tokenSuffix(userLookup.uid),
+        platform: "ios",
+        storeStatus: derived.status,
+      });
+      try {
+        await applyUserSubscriptionUpdate(
+          db,
+          admin,
+          userLookup.uid,
+          derived,
+          "app_store_notification_v2",
+          {
+            autoRenewing: autoRenewingFromRenewalInfo(latestRenewalInfo),
+            notificationUUID,
+            logger,
+          }
+        );
+        logger.info(`${NOTIFICATION_TRACE} firestore_update.end`, {
+          operationId: notificationUUID,
+          uidSuffix: tokenSuffix(userLookup.uid),
+          elapsedMs: Date.now() - firestoreUpdateStartedAt,
+          outcome: "success",
+          storeStatus: derived.status,
+        });
+      } catch (writeError) {
+        logger.warn(`${NOTIFICATION_TRACE} firestore_update.end`, {
+          operationId: notificationUUID,
+          uidSuffix: tokenSuffix(userLookup.uid),
+          elapsedMs: Date.now() - firestoreUpdateStartedAt,
+          outcome: "error",
+          errorType: writeError?.constructor?.name || "Error",
+          errorCode: typeof writeError?.code === "string" ? writeError.code : "unknown",
+        });
+        throw writeError;
+      }
 
       if (userLookup.resolution === "ownership_document") {
         try {

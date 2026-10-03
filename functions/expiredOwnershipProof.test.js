@@ -1,0 +1,15 @@
+'use strict';
+const assert=require('node:assert/strict');
+const { fingerprint, permitsExpiredReassignment }=require('./expiredOwnershipProof');
+const now=Date.now();
+const owner={exists:true,data:()=>({ownerUid:'old',status:'active'})};
+const proof={ownershipId:'android_id',ownerUid:'old',fingerprint:fingerprint(owner),ownerUserFingerprint:fingerprint(owner),expiryMs:now-10000};
+const confirmation={state:'eligible',reason:'verified_current_series_ended',checkedAt:new Date(now-1000),expiredForeignSeries:[proof]};
+const args={userData:{billingConfirmation:{android:confirmation}},platform:'android',purchase:{uidBound:true,active:true,purchasedAt:now-500},ownershipId:'android_id',ownerUid:'old',ownerSnapshot:owner,ownerUserSnapshot:owner,now};
+assert.equal(permitsExpiredReassignment(args),true);
+for(const purchase of [{uidBound:false,purchasedAt:now},{uidBound:true,active:true,purchasedAt:now-2000},{uidBound:true,active:true,purchasedAt:NaN},{uidBound:true,active:true,purchasedAt:now+1}]) assert.equal(permitsExpiredReassignment({...args,purchase}),false);
+assert.equal(permitsExpiredReassignment({...args,ownerUid:'other'}),false);
+assert.equal(permitsExpiredReassignment({...args,ownerSnapshot:{exists:true,data:()=>({ownerUid:'old',status:'active',updatedAt:now})}}),false);
+assert.equal(permitsExpiredReassignment({...args,now:now+16*60*1000}),false);
+for(const state of ['active','unknown','blocked']) assert.equal(permitsExpiredReassignment({...args,userData:{billingConfirmation:{android:{...confirmation,state}}}}),false);
+console.log('Expired ownership proof: 12 safety assertions PASS');

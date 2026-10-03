@@ -383,17 +383,24 @@ async function runTests() {
   const dbTransfer = createOwnershipMockDb(ownershipDocs, {
     "uid-4b": expiredIosUser(),
   });
-  await claimOwnershipDocument(dbTransfer, admin, {
-    uid: "uid-1b",
-    ownershipId,
-    platform: "ios",
-    ownershipFields: {
-      productId: "ohayo_kamome_monthly",
-      appStoreOriginalTransactionId: "2000001224021466",
-    },
-    log: { info() {}, warn() {} },
-  });
-  assert.equal(ownershipDocs[ownershipId].ownerUid, "uid-1b");
+  await assert.rejects(
+    () => claimOwnershipDocument(dbTransfer, admin, {
+      uid: "uid-1b",
+      ownershipId,
+      platform: "ios",
+      ownershipFields: {
+        productId: "ohayo_kamome_monthly",
+        appStoreOriginalTransactionId: "2000001224021466",
+      },
+      log: { info() {}, warn() {} },
+    }),
+    (error) => {
+      assert.equal(error instanceof HttpsError, true);
+      assert.equal(error.details.code, SUBSCRIPTION_ALREADY_LINKED_CODE);
+      return true;
+    }
+  );
+  assert.equal(ownershipDocs[ownershipId].ownerUid, "uid-4b");
 
   const activeDocs = { [ownershipId]: { ownerUid: "uid-4b" } };
   const dbActive = createOwnershipMockDb(activeDocs, {

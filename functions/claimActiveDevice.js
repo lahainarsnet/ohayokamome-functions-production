@@ -88,6 +88,9 @@ function validateClaimActiveDeviceInput(data) {
     claimReason: normalizeClaimReason(data.claimReason),
     claimGeneration: normalizeClaimGeneration(data.claimGeneration),
     mode: normalizeClaimMode(data),
+    deviceSwitchTraceId: /^ds-[0-9]{1,20}-[0-9]{1,8}$/.test(String(data.deviceSwitchTraceId || ""))
+      ? String(data.deviceSwitchTraceId)
+      : null,
   };
 }
 
@@ -106,6 +109,7 @@ function createClaimActiveDeviceHandler({ admin, logger }) {
     const newDeviceIdSuffix = tokenSuffix(input.deviceId);
     logger.info(CLAIM_ACTIVE_DEVICE_TAG, {
       event: "claim_active_device.start",
+      deviceSwitchTraceId: input.deviceSwitchTraceId,
       uidSuffix,
       newDeviceIdSuffix,
       reason: input.claimReason,
@@ -201,6 +205,7 @@ function createClaimActiveDeviceHandler({ admin, logger }) {
         if (!sameDeviceRefresh && !pendingMatches) {
           logger.info(CLAIM_ACTIVE_DEVICE_TAG, {
             event: "claim_active_device.confirmed_rejected_stale",
+          deviceSwitchTraceId: input.deviceSwitchTraceId,
             uidSuffix,
             newDeviceIdSuffix,
             previousDeviceIdSuffix: previousActiveDeviceId
@@ -285,6 +290,7 @@ function createClaimActiveDeviceHandler({ admin, logger }) {
     if (result.reserved) {
       logger.info(CLAIM_ACTIVE_DEVICE_TAG, {
         event: "claim_active_device.reserve_accepted",
+        deviceSwitchTraceId: input.deviceSwitchTraceId,
         uidSuffix,
         newDeviceIdSuffix,
         previousDeviceIdSuffix: result.previousActiveDeviceId
@@ -300,6 +306,7 @@ function createClaimActiveDeviceHandler({ admin, logger }) {
     if (result.confirmedAccepted) {
       logger.info(CLAIM_ACTIVE_DEVICE_TAG, {
         event: "claim_active_device.confirmed_accepted",
+        deviceSwitchTraceId: input.deviceSwitchTraceId,
         uidSuffix,
         newDeviceIdSuffix,
         previousDeviceIdSuffix: result.previousActiveDeviceId
@@ -317,6 +324,7 @@ function createClaimActiveDeviceHandler({ admin, logger }) {
 
     logger.info(CLAIM_ACTIVE_DEVICE_TAG, {
       event: "claim_active_device.success",
+      deviceSwitchTraceId: input.deviceSwitchTraceId,
       uidSuffix,
       newDeviceIdSuffix,
       previousDeviceIdSuffix: result.previousActiveDeviceId

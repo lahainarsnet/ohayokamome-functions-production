@@ -621,6 +621,7 @@ async function commitUserSubscriptionDualWrite({
   legacyUpdate,
   log = console,
   meta = {},
+  completionWrite = null,
 }) {
   const normalizedPlatform = String(platform || "")
     .trim()
@@ -642,6 +643,15 @@ async function commitUserSubscriptionDualWrite({
     const result = await db.runTransaction(async (tx) => {
       const snap = await tx.get(userRef);
       const data = snap.exists ? snap.data() || {} : {};
+      let completionExisting = null;
+      if (completionWrite) {
+        completionExisting = await tx.get(completionWrite.ref);
+        const owner = await tx.get(db.collection("subscription_ownership").doc(completionWrite.data.ownershipId));
+        if (!owner.exists || owner.get("ownerUid") !== uid ||
+            (completionExisting.exists && completionExisting.get("ownerUid") && completionExisting.get("ownerUid") !== uid)) {
+          throw new Error("Completion ownership changed before commit");
+        }
+      }
       const subscriptions =
         data.subscriptions && typeof data.subscriptions === "object"
           ? data.subscriptions
@@ -727,13 +737,36 @@ async function commitUserSubscriptionDualWrite({
         writePayload.entitlementExpiryTime = null;
       }
 
-      tx.set(userRef, writePayload, { merge: true });
+      // A delayed older transaction may be recorded for finishing, but must
+      // never replace a newer platform entitlement.
+      const oldIos = subscriptions.ios || {};
+      const oldTransaction = oldIos.transactionId || data.appStoreTransactionId || "";
+      const oldExpiry = parseExpiryToDate(oldIos.expiryTime ||
+        (String(data.subscriptionPlatform || "").toLowerCase() === "ios" ? data.subscriptionExpiryTime : null))?.getTime() || 0;
+      const incomingExpiry = parseExpiryToDate(storeState.expiryTime)?.getTime() || 0;
+      const preserveNewerIos = completionWrite && normalizedPlatform === "ios" &&
+        oldTransaction && oldTransaction !== storeState.transactionId &&
+        (!oldExpiry || !incomingExpiry || oldExpiry > incomingExpiry);
+      const previousCompletion = completionExisting?.exists ? completionExisting.data() || {} : {};
+      const preserveCompleted = completionWrite && previousCompletion.schema === 1 &&
+        previousCompletion.verified === true && previousCompletion.ownerUid === uid &&
+        previousCompletion.transactionHash === completionWrite.data.transactionHash &&
+        previousCompletion.productId === completionWrite.data.productId &&
+        previousCompletion.ownershipId === completionWrite.data.ownershipId &&
+        previousCompletion.completionState === "completed";
+      if (!preserveNewerIos) tx.set(userRef, writePayload, { merge: true });
+      if (completionWrite) tx.set(completionWrite.ref, {
+        ...completionWrite.data,
+        completionState: preserveCompleted ? "completed" : "pending",
+        ...(!preserveCompleted ? { completedAt: admin.FieldValue.delete() } : {}),
+      }, { merge: true });
 
       return {
         beforeIos,
         beforeAndroid,
-        afterIos: nextIos,
-        afterAndroid: nextAndroid,
+        afterIos: preserveNewerIos ? beforeIos : nextIos,
+        afterAndroid: preserveNewerIos ? beforeAndroid : nextAndroid,
+        completionRecordOnly: Boolean(preserveNewerIos),
         entitlement,
         entitlementExpiryTime,
         accountLegacy,
@@ -750,6 +783,7 @@ async function commitUserSubscriptionDualWrite({
       transactionIdTail: idTail(meta.transactionId),
       originalTransactionIdTail: idTail(meta.originalTransactionId),
       purchaseTokenTail: idTail(meta.purchaseToken),
+      completionRecordOnly: result.completionRecordOnly || false,
       beforeIos: summarizeStoreState(result.beforeIos),
       afterIos: summarizeStoreState(result.afterIos),
       beforeAndroid: summarizeStoreState(result.beforeAndroid),
