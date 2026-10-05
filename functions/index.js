@@ -1611,7 +1611,12 @@ exports.upsertUserEmailAndAccount = onCall({ enforceAppCheck: true }, async (req
   }
 
   const uid = request.auth.uid;
-  const { email } = request.data || {};
+  const { email, expectedUid } = request.data || {};
+
+  // Older clients omit expectedUid; guarded clients bind the write to its owner.
+  if (expectedUid !== undefined && expectedUid !== uid) {
+    throw new HttpsError("failed-precondition", "Profile initialization user changed.");
+  }
 
   if (typeof email !== "string" || email.length === 0) {
     throw new HttpsError("invalid-argument", "Parameter 'email' is required.");
