@@ -6,11 +6,13 @@ const {
   buildAndroidStoreState,
   commitUserSubscriptionDualWrite,
   inferAndroidAutoRenewing,
+  isStoreEntitlementUsable,
 } = require("./subscriptionEntitlement");
 
 const GOOGLE_PLAY_PACKAGE_NAME = "com.lahainarsnet.ohayokamome.live";
 const GOOGLE_PLAY_MONTHLY_PRODUCT_ID = "ohayo_kamome_monthly";
 const NOTIFICATION_TRACE = "GOOGLE_PLAY_RTDN_TRACE";
+const ANDROID_STALE_TRACE = "KAMOME_ANDROID_STALE_TRACE";
 const PROCESSING_STALE_MS = 10 * 60 * 1000;
 
 const SUBSCRIPTION_NOTIFICATION_TYPE_NAMES = {
@@ -682,22 +684,194 @@ async function findUserByPurchaseToken(db, purchaseToken, linkedPurchaseToken) {
   };
 }
 
-function shouldSkipStaleActiveUpdate(existingData, derived) {
+function formatExpiryIso(value) {
+  if (!value) {
+    return null;
+  }
+  const date =
+    value instanceof Date ? value : parseFirestoreExpiryTime(value);
+  if (!date || Number.isNaN(date.getTime())) {
+    return null;
+  }
+  return date.toISOString();
+}
+
+function uidSuffixForStaleTrace(uid) {
+  const normalized = String(uid || "").trim();
+  if (!normalized) {
+    return "none";
+  }
+  return normalized.length <= 4 ? normalized : normalized.slice(-4);
+}
+
+function normalizeStaleTraceSource(options = {}) {
+  const raw = String(
+    options.staleTraceSource ||
+      options.subscriptionSource ||
+      options.dualWriteSource ||
+      "google_rtdn",
+  ).toLowerCase();
+  if (raw.includes("probe")) {
+    return "google_probe";
+  }
+  if (raw.includes("verify")) {
+    return "google_verify";
+  }
+  if (raw.includes("rtdn")) {
+    return "google_rtdn";
+  }
+  return raw.replace("google_play_", "google_");
+}
+
+function logAndroidStaleTrace(log, payload) {
+  if (log && typeof log.info === "function") {
+    log.info(ANDROID_STALE_TRACE, payload);
+  } else {
+    console.info(ANDROID_STALE_TRACE, payload);
+  }
+}
+
+function readStoredAndroidExpiry(existingData) {
+  const androidStore = existingData?.subscriptions?.android;
+  if (androidStore && typeof androidStore === "object") {
+    return parseFirestoreExpiryTime(androidStore.expiryTime);
+  }
+  return null;
+}
+
+function readIosStoreExpiry(existingData) {
+  const iosStore = existingData?.subscriptions?.ios;
+  if (iosStore && typeof iosStore === "object") {
+    return parseFirestoreExpiryTime(iosStore.expiryTime);
+  }
+  return null;
+}
+
+function readLegacySubscriptionExpiry(existingData) {
+  return parseFirestoreExpiryTime(existingData?.subscriptionExpiryTime);
+}
+
+/**
+ * Baseline expiry for Android active RTDN/probe stale checks.
+ * Never compares incoming Android updates against another OS legacy expiry.
+ */
+function resolveAndroidStaleComparisonExpiry(existingData) {
+  const androidExpiry = readStoredAndroidExpiry(existingData);
+  if (androidExpiry) {
+    return androidExpiry;
+  }
+
+  const platform = String(existingData?.subscriptionPlatform || "")
+    .trim()
+    .toLowerCase();
+  if (platform !== "android") {
+    return null;
+  }
+
+  if (isStoreEntitlementUsable(existingData?.subscriptions?.ios).usable) {
+    return null;
+  }
+
+  return readLegacySubscriptionExpiry(existingData);
+}
+
+function classifyAndroidStaleBaseline(existingData) {
+  const storedAndroidExpiry = readStoredAndroidExpiry(existingData);
+  const iosExpiry = readIosStoreExpiry(existingData);
+  const legacyExpiry = readLegacySubscriptionExpiry(existingData);
+  let baselineSource = "none";
+  let baselineExpiry = null;
+
+  if (storedAndroidExpiry) {
+    baselineSource = "androidStore";
+    baselineExpiry = storedAndroidExpiry;
+  } else {
+    const platform = String(existingData?.subscriptionPlatform || "")
+      .trim()
+      .toLowerCase();
+    if (
+      platform === "android" &&
+      !isStoreEntitlementUsable(existingData?.subscriptions?.ios).usable
+    ) {
+      const legacy = readLegacySubscriptionExpiry(existingData);
+      if (legacy) {
+        baselineSource = "legacyAndroidOnly";
+        baselineExpiry = legacy;
+      }
+    }
+  }
+
+  return {
+    baselineSource,
+    baselineExpiry,
+    storedAndroidExpiry,
+    iosExpiry,
+    legacyExpiry,
+  };
+}
+
+function evaluateAndroidStaleActiveUpdate(existingData, derived) {
+  const baseline = classifyAndroidStaleBaseline(existingData);
+  const incomingAndroidExpiry = derived.expiryDate || null;
+
   if (derived.status !== "active") {
-    return false;
+    return {
+      skipped: false,
+      reason: "not_active_status",
+      ...baseline,
+      incomingAndroidExpiry,
+      baselineExpiry: baseline.baselineExpiry,
+    };
   }
-  const existingExpiry = parseFirestoreExpiryTime(
-    existingData?.subscriptionExpiryTime,
-  );
-  const newExpiry = derived.expiryDate;
-  if (
-    existingExpiry &&
-    newExpiry &&
-    newExpiry.getTime() < existingExpiry.getTime()
-  ) {
-    return true;
+
+  const existingExpiry = baseline.baselineExpiry;
+  if (!existingExpiry || !incomingAndroidExpiry) {
+    return {
+      skipped: false,
+      reason:
+        baseline.baselineSource === "none"
+          ? "no_android_baseline"
+          : "missing_expiry_for_compare",
+      ...baseline,
+      incomingAndroidExpiry,
+      baselineExpiry: existingExpiry,
+    };
   }
-  return false;
+
+  if (incomingAndroidExpiry.getTime() < existingExpiry.getTime()) {
+    return {
+      skipped: true,
+      reason: "incoming_older_than_android",
+      ...baseline,
+      incomingAndroidExpiry,
+      baselineExpiry: existingExpiry,
+    };
+  }
+
+  return {
+    skipped: false,
+    reason: "incoming_newer_than_android",
+    ...baseline,
+    incomingAndroidExpiry,
+    baselineExpiry: existingExpiry,
+  };
+}
+
+function shouldSkipStaleActiveUpdate(existingData, derived) {
+  return evaluateAndroidStaleActiveUpdate(existingData, derived).skipped;
+}
+
+function buildAndroidStaleTraceFields(evaluation) {
+  return {
+    baselineSource: evaluation.baselineSource,
+    storedAndroidExpiry: formatExpiryIso(evaluation.storedAndroidExpiry),
+    legacyExpiry: formatExpiryIso(evaluation.legacyExpiry),
+    iosExpiry: formatExpiryIso(evaluation.iosExpiry),
+    incomingAndroidExpiry: formatExpiryIso(evaluation.incomingAndroidExpiry),
+    baselineExpiry: formatExpiryIso(evaluation.baselineExpiry),
+    skipped: evaluation.skipped,
+    reason: evaluation.reason,
+  };
 }
 
 async function applyGoogleSubscriptionUpdateToUser(
@@ -711,10 +885,39 @@ async function applyGoogleSubscriptionUpdateToUser(
   const userRef = db.collection("users").doc(uid);
   const userSnap = await userRef.get();
   const existingData = userSnap.exists ? userSnap.data() || {} : {};
+  const staleSource = normalizeStaleTraceSource(options);
+  const evaluation = evaluateAndroidStaleActiveUpdate(existingData, derived);
+  const staleFields = buildAndroidStaleTraceFields(evaluation);
 
-  if (shouldSkipStaleActiveUpdate(existingData, derived)) {
+  logAndroidStaleTrace(options.logger, {
+    step: "stale_evaluate",
+    source: staleSource,
+    uidSuffix: uidSuffixForStaleTrace(uid),
+    derivedStatus: derived.status || "",
+    ...staleFields,
+  });
+
+  if (evaluation.skipped) {
+    logAndroidStaleTrace(options.logger, {
+      step: "stale_skip",
+      source: staleSource,
+      uidSuffix: uidSuffixForStaleTrace(uid),
+      result: "stale_active_expiry",
+      ...staleFields,
+      summary: `storedAndroid=${staleFields.storedAndroidExpiry || "null"} incoming=${staleFields.incomingAndroidExpiry || "null"} baseline=${staleFields.baselineExpiry || "null"} skipped=true reason=${evaluation.reason}`,
+    });
     return { applied: false, reason: "stale_active_expiry" };
   }
+
+  logAndroidStaleTrace(options.logger, {
+    step: "apply_start",
+    source: staleSource,
+    uidSuffix: uidSuffixForStaleTrace(uid),
+    beforeAndroidExpiry: formatExpiryIso(readStoredAndroidExpiry(existingData)),
+    incomingAndroidExpiry: formatExpiryIso(derived.expiryDate),
+    beforeIosExpiry: formatExpiryIso(readIosStoreExpiry(existingData)),
+    ...staleFields,
+  });
 
   const update = {
     subscriptionStatus: derived.status,
@@ -787,6 +990,21 @@ async function applyGoogleSubscriptionUpdateToUser(
       purchaseToken: purchaseToken || "",
     },
   });
+
+  logAndroidStaleTrace(options.logger, {
+    step: "apply_success",
+    source: staleSource,
+    uidSuffix: uidSuffixForStaleTrace(uid),
+    result: "user_updated",
+    beforeAndroidExpiry: formatExpiryIso(readStoredAndroidExpiry(existingData)),
+    incomingAndroidExpiry: formatExpiryIso(derived.expiryDate),
+    afterAndroidExpiry: derived.expiryTime || null,
+    beforeIosExpiry: formatExpiryIso(readIosStoreExpiry(existingData)),
+    afterIosExpiry: formatExpiryIso(readIosStoreExpiry(existingData)),
+    iosPreserved: true,
+    ...staleFields,
+  });
+
   return { applied: true };
 }
 
@@ -1262,6 +1480,13 @@ function createGooglePlayRtdnHandler({ getDb, admin, logger }) {
         result: applyResult.applied ? "user_updated" : applyResult.reason,
         revocationAction: revocationResolution?.action || null,
       });
+      logger.info(ANDROID_STALE_TRACE, {
+        step: "rtdn_processed",
+        source: "google_rtdn",
+        uidSuffix: uidSuffixForStaleTrace(userLookup.uid),
+        result: applyResult.applied ? "user_updated" : applyResult.reason,
+        expiryTime: finalDerived.expiryTime || null,
+      });
     } catch (error) {
       const fallbackEventId =
         eventId ||
@@ -1312,6 +1537,11 @@ module.exports = {
   GOOGLE_PLAY_PACKAGE_NAME,
   GOOGLE_PLAY_MONTHLY_PRODUCT_ID,
   androidEntitlementBasis,
+  resolveAndroidStaleComparisonExpiry,
+  evaluateAndroidStaleActiveUpdate,
+  classifyAndroidStaleBaseline,
+  shouldSkipStaleActiveUpdate,
+  ANDROID_STALE_TRACE,
   shouldRequeryNonPrimaryNotification,
   collectTokensForRequery,
   isUsableGooglePlayEntitlement,

@@ -1995,6 +1995,14 @@ exports.verifyGooglePlaySubscriptionPurchase = onCall(
           purchaseToken,
         },
       });
+      console.info("KAMOME_ANDROID_STALE_TRACE", {
+        step: "verify_dual_write",
+        source: "google_verify",
+        uidSuffix: logUidSuffix,
+        staleHelperBypassed: true,
+        incomingAndroidExpiry: expiryTime || null,
+        tokenSuffix: tokenSuffix(purchaseToken),
+      });
       console.info(`${GOOGLE_PLAY_BILLING_TRACE} firestore users update success`, {
         deviceSwitchTraceId,
         uidSuffix: logUidSuffix,

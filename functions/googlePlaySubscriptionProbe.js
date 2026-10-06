@@ -178,6 +178,13 @@ function createGooglePlaySubscriptionProbeHandler({
         firestoreApplied: applyResult.applied === true,
         skipReason: applyResult.reason || "",
       });
+      logger.info("KAMOME_ANDROID_STALE_TRACE", {
+        step: "probe_processed",
+        source: "google_probe",
+        uidSuffix,
+        result: applyResult.applied ? "user_updated" : applyResult.reason || "",
+        expiryTime: derived.expiryTime || null,
+      });
 
       return {
         outcome: "active",
