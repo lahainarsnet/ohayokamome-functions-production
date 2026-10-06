@@ -1108,5 +1108,84 @@ async function test(name, run) { await run(); passed += 1; console.log(`ok ${pas
     assert.equal(unknown.reason, "server_read_unavailable");
   });
 
+  await test("Build403 iOS pointer conflict + Apple EXPIRED reaches eligible (not UNKNOWN)", async () => {
+    const deviceOriginal = "device-current-original";
+    const nestedOriginal = "firebase-nested-original";
+    const legacyOriginal = "firebase-legacy-original";
+    const expiry = Date.now() - 86400000;
+    const ownerId = buildIosOwnershipId(deviceOriginal);
+    const db = mockDb({ "users/user": managed({
+      subscriptions: { ios: { status: "active", originalTransactionId: nestedOriginal, transactionId: "tx-nested" } },
+      appStoreOriginalTransactionId: legacyOriginal,
+      appStoreTransactionId: "tx-legacy",
+    }), [`subscription_ownership/${ownerId}`]: { ownerUid: "user", platform: "ios" } });
+    const input = payload("ios", { selectionMode: "current_contract_only",
+      storeCandidates: [{ originalTransactionId: deviceOriginal }], storeState: "expired" });
+    const api = handlers(db, { inspectOwner: inspectSubscriptionSeriesOwnership,
+      verifyApple: async (identity) => {
+        assert.equal(identity, deviceOriginal);
+        return [{ state: "ended", transaction: { ...apple(expiry), originalTransactionId: deviceOriginal },
+          originalTransactionId: deviceOriginal, expiryMs: expiry }];
+      } });
+    const read = await api.read(input);
+    assert.equal(read.state, "eligible");
+    assert.equal(read.storeStatus, "expired");
+    assert.equal(read.storeVerified, true);
+    assert.notEqual(read.reason, "current_contract_pointer_conflict");
+    assert.equal(read.syncRequired, true);
+  });
+
+  await test("Build403 iOS pointer conflict + Apple ACTIVE same UID stays active", async () => {
+    const deviceOriginal = "device-active-original";
+    const nestedOriginal = "firebase-nested-original";
+    const legacyOriginal = "firebase-legacy-original";
+    const expiry = Date.now() + 86400000;
+    const ownerId = buildIosOwnershipId(deviceOriginal);
+    const db = mockDb({ "users/user": managed({
+      subscriptions: { ios: { status: "active", originalTransactionId: nestedOriginal, productId: APP_STORE_PRODUCT_ID,
+        expiryTime: new Date(expiry), verifiedAt: new Date(), bundleId: APP_STORE_BUNDLE_ID,
+        verificationSource: "app_store_signed_status" } },
+      appStoreOriginalTransactionId: legacyOriginal,
+      billingConfirmation: { ios: { state: "active", schemaVersion: 1, coverage: "verified_current_series_v1" } },
+    }), [`subscription_ownership/${ownerId}`]: { ownerUid: "user", platform: "ios", status: "active" } });
+    const input = payload("ios", { selectionMode: "current_contract_only",
+      storeCandidates: [{ originalTransactionId: deviceOriginal }], storeState: "purchased" });
+    const read = await handlers(db, { inspectOwner: inspectSubscriptionSeriesOwnership,
+      verifyApple: async (identity) => {
+        assert.equal(identity, deviceOriginal);
+        return [{ state: "active", transaction: { ...apple(expiry), originalTransactionId: deviceOriginal },
+          originalTransactionId: deviceOriginal, expiryMs: expiry, identities: [seriesIdentity("ios", deviceOriginal)] }];
+      } }).read(input);
+    assert.equal(read.state, "active");
+    assert.equal(read.storeVerified, true);
+  });
+
+  await test("Build403 iOS pointer conflict + Apple ACTIVE other UID blocks", async () => {
+    const deviceOriginal = "device-other-owner-original";
+    const expiry = Date.now() + 86400000;
+    const ownerId = buildIosOwnershipId(deviceOriginal);
+    const db = mockDb({ "users/user": managed({
+      subscriptions: { ios: { originalTransactionId: "nested-a" } },
+      appStoreOriginalTransactionId: "legacy-b",
+    }), [`subscription_ownership/${ownerId}`]: { ownerUid: "other-user", platform: "ios", status: "active" } });
+    const input = payload("ios", { selectionMode: "current_contract_only",
+      storeCandidates: [{ originalTransactionId: deviceOriginal }], storeState: "purchased" });
+    const read = await handlers(db, { inspectOwner: inspectSubscriptionSeriesOwnership,
+      verifyApple: async () => [{ state: "active", transaction: { ...apple(expiry), originalTransactionId: deviceOriginal },
+        originalTransactionId: deviceOriginal, expiryMs: expiry }] }).read(input);
+    assert.equal(read.state, "blocked");
+    assert.equal(read.reason, "owner_mismatch");
+    assert.equal(db.writes.length, 0);
+  });
+
+  await test("Build403 multiple current store contracts remains UNKNOWN before Apple", async () => {
+    const db = mockDb({ "users/user": managed() });
+    const read = await handlers(db).read(payload("ios", { selectionMode: "current_contract_only",
+      storeCandidates: [{ originalTransactionId: "a" }, { originalTransactionId: "b" }], storeState: "expired" }));
+    assert.equal(read.state, "unknown");
+    assert.equal(read.reason, "multiple_current_store_contracts");
+    assert.equal(read.storeVerified, false);
+  });
+
   console.log(`preChatBillingConfirmation.test.js: ${passed} tests passed`);
 })().catch((error) => { console.error(error); process.exitCode = 1; });

@@ -377,6 +377,13 @@ function observationRevision(data, historyReads, ownerReads, platform) {
   return hash(JSON.stringify([platformBillingRevision(data, platform), historyReads.map((read) => read.fingerprint),
     ownerReads.map((read) => [read.id, read.fingerprint]).sort((a, b) => a[0].localeCompare(b[0]))]));
 }
+function summarizeAppleVerification(entries = []) {
+  if (!entries.length) return "skipped";
+  if (entries.some((entry) => entry.state === "active")) return "active";
+  if (entries.length && entries.every((entry) => entry.state === "ended")) return "expired";
+  if (entries.some((entry) => entry.state === "blocked")) return "blocked";
+  return "unknown";
+}
 const snapshotFingerprint = (snap) => hash(JSON.stringify(stable({ exists: snap.exists, data: snap.exists ? snap.data() : null })));
 function createPreChatBillingHandlers({ getDb, admin, secrets, getAppAppleId, currentContractOnly = false, assertRequestAllowed = async () => {}, assertSyncAllowed = async () => {},
   verifyGoogle = syncGooglePlaySubscriptionByPurchaseToken, verifyApple = verifyAppleSeries,
@@ -390,6 +397,8 @@ function createPreChatBillingHandlers({ getDb, admin, secrets, getAppAppleId, cu
     const data = snap.data() || {};
     const ownerReads = [];
     const currentOnly = input.selectionMode === "current_contract_only";
+    let currentContractSelectionReason = "";
+    let currentContractPointerConflict = false;
     let activePointer = !currentOnly && verifiedActivePointer(data, input.platform);
     if (activePointer) {
       const identity = input.platform === "android"
@@ -445,17 +454,28 @@ function createPreChatBillingHandlers({ getDb, admin, secrets, getAppAppleId, cu
         : Boolean(data.appStoreTransactionId || data.subscriptions?.ios?.transactionId);
       let selectionReason = "";
       if (supplied.length > 1) selectionReason = "multiple_current_store_contracts";
-      else if (contradictoryPointers || (supplied.length === 1 && primary && supplied[0] !== primary)) selectionReason = "current_contract_pointer_conflict";
-      else if (!supplied.length && !primary && storedTokenEvidence) selectionReason = "current_contract_pointer_missing";
+      else if (contradictoryPointers || (supplied.length === 1 && primary && supplied[0] !== primary)) {
+        selectionReason = "current_contract_pointer_conflict";
+        currentContractPointerConflict = true;
+      } else if (!supplied.length && !primary && storedTokenEvidence) selectionReason = "current_contract_pointer_missing";
+      currentContractSelectionReason = selectionReason;
       candidates = supplied.length === 1 ? supplied : primary ? [primary] : [];
+      const blockBeforeAppleVerify = selectionReason === "multiple_current_store_contracts" ||
+        selectionReason === "current_contract_pointer_missing" ||
+        (selectionReason && candidates.length === 0);
       diagnosticLog(logger, selectionReason ? "warn" : "info", "PURCHASE_CURRENT_CONTRACT selection", {
         ...diagnostic, operationId, candidateCount: candidates.length,
         selection: supplied.length ? "native_current_contract" : primary ? "firebase_current_pointer" : "managed_no_contract",
         reason: selectionReason || "single_current_contract", historicalFallback: false,
+        pointerConflict: selectionReason === "current_contract_pointer_conflict",
+        continueToAppleVerify: Boolean(selectionReason === "current_contract_pointer_conflict" && candidates.length),
+        blockBeforeAppleVerify,
+        currentSeriesCandidateRef: candidates[0] ? seriesIdentity(input.platform, candidates[0]).slice(0, 16) : null,
       });
-      if (selectionReason) return { result: { state: "unknown", reason: selectionReason,
+      if (blockBeforeAppleVerify) return { result: { state: "unknown", reason: selectionReason,
         revision: platformBillingRevision(data, input.platform), series: [], syncRequired: false,
-        storeVerified: false, storeStatus: "unknown" }, entries: [], data, ownerReads, historyReads };
+        storeVerified: false, storeStatus: "unknown" }, entries: [], data, ownerReads, historyReads,
+        selectionReason: currentContractSelectionReason, pointerConflict: currentContractPointerConflict };
     }
     diagnosticLog(logger, "info", "PRECHAT_BILLING candidate.plan", {
       operationId, platform: input.platform,
@@ -637,7 +657,9 @@ function createPreChatBillingHandlers({ getDb, admin, secrets, getAppAppleId, cu
         storeVerified: false, storeStatus: "unknown" });
     }
     result.revision = observationRevision(data, historyReads, ownerReads, input.platform);
-    return { result, entries, data, ownerReads, historyReads };
+    return { result, entries, data, ownerReads, historyReads,
+      selectionReason: currentContractSelectionReason,
+      pointerConflict: currentContractPointerConflict };
   }
   async function read(request) {
     const parsed = loggedAuthAndPayload(request, logger, "read");
@@ -652,9 +674,11 @@ function createPreChatBillingHandlers({ getDb, admin, secrets, getAppAppleId, cu
       deviceSwitchTraceId: /^ds-[0-9]{1,20}-[0-9]{1,8}$/.test(String(data.deviceSwitchTraceId || "")) ? String(data.deviceSwitchTraceId) : null, attemptId: data.attemptId, remainingMs: budget };
     diagnosticLog(logger, "info", "PRECHAT_BILLING read.begin", diagnostic);
     try {
+      let readEvaluation = null;
       const observe = async () => {
         await diagnosticAwait(logger, operationId, "request.guard", () => assertRequestAllowed(request, data.platform), diagnostic);
         const evaluation = await evaluate(uid, data, operationId);
+        readEvaluation = evaluation;
         const op = await diagnosticAwait(logger, operationId, "firestore.operation.read", () =>
           operationRef(getDb(), uid, data.attemptId).get(), diagnostic);
         return { ...evaluation.result, firestoreRevision: Number(evaluation.data.billingRevision || 0),
@@ -667,7 +691,11 @@ function createPreChatBillingHandlers({ getDb, admin, secrets, getAppAppleId, cu
         ? await observe() : await bounded(observe, budget);
       diagnosticLog(logger, "info", "PRECHAT_BILLING read.end", { ...diagnostic, elapsedMs: Date.now() - startedAt,
         state: result.state, reason: result.reason || "none", revision: result.revision, storeStatus: result.storeStatus || "unknown",
-        syncRequired: result.syncRequired, storeVerified: result.storeVerified });
+        syncRequired: result.syncRequired, storeVerified: result.storeVerified,
+        appleVerificationOutcome: summarizeAppleVerification(readEvaluation?.entries),
+        pointerConflict: Boolean(readEvaluation?.pointerConflict ||
+          readEvaluation?.selectionReason === "current_contract_pointer_conflict"),
+        currentSeriesCandidateCount: (data.storeCandidates || []).length });
       return result;
     } catch (error) {
       if (error instanceof HttpsError) throw error;
@@ -848,7 +876,8 @@ function createPreChatBillingHandlers({ getDb, admin, secrets, getAppAppleId, cu
         return { state: "completed" };
       }), diagnostic);
       diagnosticLog(logger, "info", "PRECHAT_BILLING sync.end", { ...diagnostic, elapsedMs: Date.now() - syncStartedAt,
-        outcome: committed.state, revision: result.revision, storeState: result.state });
+        outcome: committed.state, revision: result.revision, storeState: result.state, reason: result.reason || "none",
+        expiredForeignSeriesCount: entries.filter((entry) => entry.owner === "foreign_ended" && entry.state === "ended").length });
       return committed;
     } catch (error) {
       // This operation stays consumed; the client READs the result instead of replaying the write.

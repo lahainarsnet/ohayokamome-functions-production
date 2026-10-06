@@ -324,6 +324,7 @@ function createClaimActiveDeviceHandler({ admin, logger }) {
 
     logger.info(CLAIM_ACTIVE_DEVICE_TAG, {
       event: "claim_active_device.success",
+      outcome: "success",
       deviceSwitchTraceId: input.deviceSwitchTraceId,
       uidSuffix,
       newDeviceIdSuffix,
