@@ -15,6 +15,7 @@ const { onCall } = require("firebase-functions/v2/https");
 const { defineSecret, defineString } = require("firebase-functions/params");
 const admin = require("./firebaseAdmin");
 const { loadAppConfig, assertAccessNotBlocked } = require("./appConfig");
+const { assertUidChatNotBlocked } = require("./chatBlockGuard");
 const { platformFromAppCheckAppId } = require("./appCheckPlatform");
 const { evaluatePlatformEntitlement } = require("./platformEntitlement");
 const { SENDER_SUBSCRIPTION_UNAVAILABLE } = require("./sendMessageGuardCodes");
@@ -577,6 +578,11 @@ async function runTranscribeAdminGateAfterAuth(request, options = {}) {
   const accessGate = await assertAccessNotBlocked(options);
   if (accessGate.blocked) {
     return { ok: false, code: accessGate.code, uid };
+  }
+  const getDb = options.getDb || (() => admin.getDb());
+  const chatBlock = await assertUidChatNotBlocked(getDb(), uid, "stt");
+  if (!chatBlock.ok) {
+    return { ok: false, code: chatBlock.code, uid };
   }
   return { ok: true, uid };
 }

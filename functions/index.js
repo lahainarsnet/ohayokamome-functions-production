@@ -215,6 +215,13 @@ async function fetchLatestFcmTokenForRecipient(recipientId, fallbackToken = "") 
 }
 
 const { loadAppConfig, assertAccessNotBlocked } = require("./appConfig");
+const {
+  CHAT_BLOCKED_SENDER_CODE,
+  CHAT_BLOCKED_RECIPIENT_CODE,
+  isUserChatBlocked,
+  logChatBlockTrace,
+  readUserChatBlocked,
+} = require("./chatBlockGuard");
 
 function logIdentifierSuffix(value) {
   const normalized = String(value || "").trim();
@@ -1223,6 +1230,17 @@ exports.sendMessageWithLimit = onCall(
     return { success: false, code: accessGate.code };
   }
 
+  const senderChatBlock = await readUserChatBlocked(admin.getDb(), senderId);
+  if (senderChatBlock.blocked) {
+    logChatBlockTrace({
+      uidSuffix: uidTailForLog(senderId),
+      operation: "send",
+      outcome: "blocked",
+      reason: "chat_blocked",
+    });
+    return { success: false, code: CHAT_BLOCKED_SENDER_CODE };
+  }
+
   const { dailyLimit: LIMIT } = await loadAppConfig();
 
   const contactsSnap = await admin
@@ -1254,6 +1272,15 @@ exports.sendMessageWithLimit = onCall(
     .doc(recipientId)
     .get();
   let recipientData = recipientDoc.exists ? recipientDoc.data() || {} : {};
+  if (isUserChatBlocked(recipientData)) {
+    logChatBlockTrace({
+      uidSuffix: uidTailForLog(recipientId),
+      operation: "receive_target",
+      outcome: "blocked",
+      reason: "chat_blocked",
+    });
+    return { success: false, code: CHAT_BLOCKED_RECIPIENT_CODE };
+  }
   let subscriptionStatus = recipientData.subscriptionStatus;
   const subscriptionPlatform = recipientData.subscriptionPlatform;
   const rawExpiry = recipientData.subscriptionExpiryTime;
@@ -1357,17 +1384,31 @@ exports.sendMessageWithLimit = onCall(
 
   const today = getJstDateKey(new Date());
   const userRef = admin.getDb().collection("users").doc(senderId);
+  const recipientUserRef = admin.getDb().collection("users").doc(recipientId);
   let senderSubscriptionBlocked = false;
+  let senderChatBlockedInTx = false;
+  let recipientChatBlockedInTx = false;
   let createdMessageId = null;
 
   try {
     await admin.getDb().runTransaction(async (transaction) => {
       const userDoc = await transaction.get(userRef);
+      const recipientUserDoc = await transaction.get(recipientUserRef);
       let dailyCount = 0;
       let lastSentDate = today;
 
       if (userDoc.exists) {
         const senderData = userDoc.data() || {};
+        if (isUserChatBlocked(senderData)) {
+          senderChatBlockedInTx = true;
+          return;
+        }
+        if (isUserChatBlocked(
+          recipientUserDoc.exists ? recipientUserDoc.data() || {} : null,
+        )) {
+          recipientChatBlockedInTx = true;
+          return;
+        }
         const senderSubscriptionStatus = senderData.subscriptionStatus;
         const senderUsability = evaluatePlatformEntitlement(
           senderData,
@@ -1451,6 +1492,25 @@ exports.sendMessageWithLimit = onCall(
       };
       transaction.set(msgRef, messageData);
     });
+
+    if (senderChatBlockedInTx) {
+      logChatBlockTrace({
+        uidSuffix: uidTailForLog(senderId),
+        operation: "send",
+        outcome: "blocked",
+        reason: "chat_blocked",
+      });
+      return { success: false, code: CHAT_BLOCKED_SENDER_CODE };
+    }
+    if (recipientChatBlockedInTx) {
+      logChatBlockTrace({
+        uidSuffix: uidTailForLog(recipientId),
+        operation: "receive_target",
+        outcome: "blocked",
+        reason: "chat_blocked",
+      });
+      return { success: false, code: CHAT_BLOCKED_RECIPIENT_CODE };
+    }
 
     if (senderSubscriptionBlocked) {
       logger.info(
