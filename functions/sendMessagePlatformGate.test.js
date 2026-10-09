@@ -13,7 +13,11 @@ const sendSource = indexSource.slice(sendStart, sendEnd);
 assert.match(sendSource, /evaluateActiveDeviceGateForRequest/);
 assert.match(sendSource, /platformFromAppCheckAppId\(/);
 assert.match(sendSource, /request\.app && request\.app\.appId/);
-assert.match(sendSource, /evaluatePlatformEntitlement\(/);
+assert.match(sendSource, /readActiveDevicePlatformInfo/);
+assert.match(sendSource, /resolveRecipientChatEntitlement/);
+assert.match(sendSource, /resolveRecipientChatEntitlement\(\s*recipientData, activeDeviceInfo,/);
+assert.match(sendSource, /resolveRecipientChatEntitlement\(\s*currentRecipientData, currentDeviceInfo,/);
+assert.doesNotMatch(sendSource, /resolveRecipientChatEntitlement\(\s*recipientData,\s*senderPlatform/);
 assert.match(sendSource, /describeAccountAccessUsability\(recipientData/);
 assert.doesNotMatch(
   sendSource,

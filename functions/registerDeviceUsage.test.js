@@ -6,6 +6,11 @@ const {
   createRegisterDeviceUsageHandler,
   validateRegisterDeviceUsageInput,
 } = require("./registerDeviceUsage");
+const {
+  IOS_FIREBASE_APP_ID,
+  ANDROID_FIREBASE_APP_ID,
+} = require("./appCheckPlatform");
+const { PLATFORM_APP_CHECK_VERIFIED_FIELD } = require("./devicePlatformAppCheck");
 
 const VALID_DEVICE_ID = "550e8400-e29b-41d4-a716-446655440000";
 const OTHER_UID = "other-uid-001";
@@ -77,7 +82,8 @@ function createTestLogger() {
   const entries = [];
   return {
     entries,
-    info: (tag, payload) => entries.push({ tag, payload }),
+    info: (tag, payload) => entries.push({ tag, payload, level: "info" }),
+    warn: (tag, payload) => entries.push({ tag, payload, level: "warn" }),
   };
 }
 
@@ -130,8 +136,23 @@ async function run() {
   assert.equal(unauth.ok, false);
   assert.equal(unauth.error.code, "unauthenticated");
 
+  const mismatch = await runHandler(handler, {
+    auth: { uid: OWNER_UID },
+    app: { appId: IOS_FIREBASE_APP_ID },
+    data: {
+      deviceId: VALID_DEVICE_ID,
+      platform: "android",
+      modelName: "Google Pixel 8a",
+      appVersion: "6.0.0",
+      buildNumber: "251",
+    },
+  });
+  assert.equal(mismatch.ok, false);
+  assert.equal(mismatch.error.code, "failed-precondition");
+
   const created = await runHandler(handler, {
     auth: { uid: OWNER_UID },
+    app: { appId: ANDROID_FIREBASE_APP_ID },
     data: {
       deviceId: VALID_DEVICE_ID,
       platform: "android",
@@ -144,11 +165,14 @@ async function run() {
   assert.equal(created.result.created, true);
   const createdDoc = admin.docs.get(`users/${OWNER_UID}/devices/${VALID_DEVICE_ID}`);
   assert.equal(createdDoc.deviceId, VALID_DEVICE_ID);
+  assert.equal(createdDoc.platform, "android");
+  assert.equal(createdDoc[PLATFORM_APP_CHECK_VERIFIED_FIELD], true);
   assert.ok(createdDoc.firstUsedAt);
   assert.ok(createdDoc.lastUsedAt);
 
   const updated = await runHandler(handler, {
     auth: { uid: OWNER_UID },
+    app: { appId: ANDROID_FIREBASE_APP_ID },
     data: {
       deviceId: VALID_DEVICE_ID,
       platform: "android",
@@ -172,6 +196,7 @@ async function run() {
   });
   const otherUser = await runHandler(otherHandler, {
     auth: { uid: OTHER_UID },
+    app: { appId: IOS_FIREBASE_APP_ID },
     data: {
       deviceId: VALID_DEVICE_ID,
       platform: "ios",

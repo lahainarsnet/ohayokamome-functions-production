@@ -3,6 +3,7 @@ const {
   CHAT_BLOCKED_CODE,
   CHAT_BLOCKED_SENDER_CODE,
   CHAT_BLOCKED_RECIPIENT_CODE,
+  logChatBlockTrace,
   isUserChatBlocked,
   readUserChatBlocked,
   assertUidChatNotBlocked,
@@ -71,3 +72,12 @@ async function runAsyncTests() {
 runAsyncTests().then(() => {
   console.log("chatBlockGuard.test.js: ok");
 });
+
+const logger = require("firebase-functions/logger");
+const originalInfo = logger.info;
+const capturedLogs = [];
+logger.info = (...args) => capturedLogs.push(args);
+logChatBlockTrace({ uidSuffix: "sensitive-user-123456", operation: "stt", outcome: "allowed" });
+logger.info = originalInfo;
+assert.equal(capturedLogs[0][1].uidSuffix, "123456");
+assert.equal(JSON.stringify(capturedLogs).includes("sensitive-user"), false);

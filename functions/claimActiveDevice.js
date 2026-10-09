@@ -2,9 +2,14 @@
 
 const { HttpsError } = require("firebase-functions/v2/https");
 const { tokenSuffix } = require("./billingFinalTrace");
+const { evaluatePlatformEntitlement } = require("./platformEntitlement");
 const {
   validateRegisterDeviceUsageInput,
 } = require("./registerDeviceUsage");
+const {
+  resolveVerifiedClientPlatform,
+  verifiedDevicePlatformFields,
+} = require("./devicePlatformAppCheck");
 const {
   MAX_FCM_TOKEN_LENGTH,
   MIN_FCM_TOKEN_LENGTH,
@@ -104,8 +109,18 @@ function createClaimActiveDeviceHandler({ admin, logger }) {
       throw new HttpsError("failed-precondition", "App Check required.");
     }
 
+    // Bind newer clients' captured UID before any transaction/write. Older
+    // clients remain supported and still operate only on request.auth.uid.
+    if (request.data && request.data.expectedUid != null && request.data.expectedUid !== uid) {
+      throw new HttpsError("failed-precondition", "DEVICE_SWITCH_UID_CHANGED", {code:"DEVICE_SWITCH_UID_CHANGED"});
+    }
     const input = validateClaimActiveDeviceInput(request.data);
-    const uidSuffix = tokenSuffix(uid);
+    const verifiedPlatform = resolveVerifiedClientPlatform(
+      request,
+      input.platform,
+    );
+    const platformFields = verifiedDevicePlatformFields(verifiedPlatform);
+    const uidSuffix = String(uid).length <= 6 ? "(short-id)" : tokenSuffix(uid);
     const newDeviceIdSuffix = tokenSuffix(input.deviceId);
     logger.info(CLAIM_ACTIVE_DEVICE_TAG, {
       event: "claim_active_device.start",
@@ -136,6 +151,14 @@ function createClaimActiveDeviceHandler({ admin, logger }) {
       const pendingActiveClaimGeneration = normalizeClaimGeneration(
         userData.pendingActiveClaimGeneration
       );
+      // Source OS is diagnostic only; entitlement always uses verified destination OS.
+      const sourceDeviceSnap = previousActiveDeviceId
+        ? await tx.get(userRef.collection("devices").doc(previousActiveDeviceId)) : null;
+      const sourceData = sourceDeviceSnap && sourceDeviceSnap.exists ? sourceDeviceSnap.data() || {} : {};
+      const sourcePlatform = ["ios", "android"].includes(sourceData.platform) ? sourceData.platform : "unresolved";
+      logger.info(CLAIM_ACTIVE_DEVICE_TAG, { event: "claim_active_device.transfer_context",
+        uidSuffix, newDeviceIdSuffix, sourcePlatform, targetPlatform: verifiedPlatform,
+        deviceSwitchTraceId: input.deviceSwitchTraceId, mode: input.mode });
       const created = !deviceSnap.exists;
       const switched =
         Boolean(previousActiveDeviceId) &&
@@ -156,7 +179,7 @@ function createClaimActiveDeviceHandler({ admin, logger }) {
         tx.set(userRef, userUpdate, { merge: true });
         const deviceUpdate = {
           deviceId: input.deviceId,
-          platform: input.platform,
+          ...platformFields,
           modelName: input.modelName,
           appVersion: input.appVersion,
           buildNumber: input.buildNumber,
@@ -227,6 +250,27 @@ function createClaimActiveDeviceHandler({ admin, logger }) {
             previousActiveDeviceId,
           };
         }
+        // Final claim uses this authenticated UID's destination-OS contract.
+        // Chat-only provisional access never authorizes device transfer.
+        if (switched) {
+          const entitlement = evaluatePlatformEntitlement(userData, verifiedPlatform, new Date());
+          logger.info(CLAIM_ACTIVE_DEVICE_TAG, {
+            event: "claim_active_device.contract_checked",
+            uidSuffix, newDeviceIdSuffix, platform: verifiedPlatform,
+            deviceSwitchTraceId: input.deviceSwitchTraceId,
+            usable: entitlement.usable, decisionSource: entitlement.decisionSource,
+            contractState: entitlement.usable ? "active"
+              : ["legacy_other_platform", "invalid_platform", "legacy_platform_mismatch"].includes(entitlement.denyReason) ? "dedicatedStop"
+              : entitlement.status === "none" ? "noPurchase"
+              : ["expired", "paused", "refunded", "revoked"].includes(entitlement.status) ||
+                ["expiry_not_future", "expiry_expired"].includes(entitlement.denyReason) ? "expired" : "unknown",
+          });
+          if (!entitlement.usable) {
+            throw new HttpsError("failed-precondition", "DEVICE_SWITCH_CONTRACT_NOT_ACTIVE", {
+              code: "DEVICE_SWITCH_CONTRACT_NOT_ACTIVE",
+            });
+          }
+        }
       }
 
       const userUpdate = {
@@ -242,7 +286,7 @@ function createClaimActiveDeviceHandler({ admin, logger }) {
 
       const deviceUpdate = {
         deviceId: input.deviceId,
-        platform: input.platform,
+        ...platformFields,
         modelName: input.modelName,
         appVersion: input.appVersion,
         buildNumber: input.buildNumber,

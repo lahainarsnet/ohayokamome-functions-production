@@ -622,6 +622,7 @@ async function commitUserSubscriptionDualWrite({
   log = console,
   meta = {},
   completionWrite = null,
+  writeGuard = null,
 }) {
   const normalizedPlatform = String(platform || "")
     .trim()
@@ -658,6 +659,25 @@ async function commitUserSubscriptionDualWrite({
           : {};
       const beforeIos = subscriptions.ios || null;
       const beforeAndroid = subscriptions.android || null;
+
+      if (typeof writeGuard === "function") {
+        const guardDecision = writeGuard(data, storeState, meta);
+        if (guardDecision?.skip) {
+          return {
+            beforeIos,
+            beforeAndroid,
+            afterIos: beforeIos,
+            afterAndroid: beforeAndroid,
+            completionRecordOnly: false,
+            reconcileWriteSkipped: true,
+            skipReason: String(guardDecision.reason || "write_guard_skip"),
+            entitlement: computeAccountEntitlement(beforeIos, beforeAndroid),
+            entitlementExpiryTime: null,
+            accountLegacy: {},
+            activePurchaseTokens: data.activePurchaseTokens || [],
+          };
+        }
+      }
 
       let nextIos = beforeIos;
       let nextAndroid = beforeAndroid;
@@ -773,6 +793,26 @@ async function commitUserSubscriptionDualWrite({
         activePurchaseTokens,
       };
     });
+
+    if (result.reconcileWriteSkipped) {
+      const skipPayload = {
+        step: "dual_write.skipped",
+        source: String(source || ""),
+        platform: normalizedPlatform,
+        uidTail: uidTail(uid),
+        skipReason: result.skipReason || "write_guard_skip",
+        eventIdTail: idTail(meta.eventId),
+        transactionIdTail: idTail(meta.transactionId),
+        originalTransactionIdTail: idTail(meta.originalTransactionId),
+        elapsedMs: Date.now() - startedAt,
+      };
+      if (typeof log.info === "function") {
+        log.info(ENTITLEMENT_TRACE, skipPayload);
+      } else {
+        console.info(ENTITLEMENT_TRACE, skipPayload);
+      }
+      return result;
+    }
 
     const logPayload = {
       step: "dual_write.success",

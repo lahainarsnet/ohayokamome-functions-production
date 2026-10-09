@@ -215,6 +215,47 @@ async function runTests() {
   assert.strictEqual(skippedResult.outcome, "skipped");
   assert.strictEqual(skippedResult.reason, "no_purchase_token");
 
+  syncCalls = 0;
+  applyCalls = 0;
+  const reconcileExpiredHandler = createGooglePlaySubscriptionProbeHandler({
+    getDb: () =>
+      createDbWithUser({
+        googlePlayPrimaryPurchaseToken: "stored-token-123456",
+      }),
+    admin: createMockAdmin(),
+    logger,
+    syncSubscriptionByPurchaseToken: async () => {
+      syncCalls++;
+      return {
+        subscription: { subscriptionState: "SUBSCRIPTION_STATE_EXPIRED" },
+        matchedLineItem: {
+          productId: "ohayo_kamome_monthly",
+          expiryTime: "2026-07-01T00:00:00.000Z",
+        },
+      };
+    },
+    deriveEntitlement: () => ({
+      status: "expired",
+      expiryTime: "2026-07-01T00:00:00.000Z",
+      expiryDate: new Date("2026-07-01T00:00:00.000Z"),
+      subscriptionState: "SUBSCRIPTION_STATE_EXPIRED",
+    }),
+    isUsableEntitlement: () => false,
+    applySubscriptionUpdateToUser: async () => {
+      applyCalls++;
+      return { applied: true };
+    },
+  });
+
+  const reconcileExpiredResult = await reconcileExpiredHandler({
+    auth: { uid: "user-abc123456789" },
+    data: { purpose: "reconcile", phase: "pre_chat" },
+  });
+  assert.strictEqual(reconcileExpiredResult.outcome, "inactive");
+  assert.strictEqual(reconcileExpiredResult.firestoreApplied, true);
+  assert.strictEqual(syncCalls, 1);
+  assert.strictEqual(applyCalls, 1);
+
   console.log("googlePlaySubscriptionProbe.test.js: all tests passed");
 }
 

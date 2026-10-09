@@ -13,7 +13,7 @@ function isUserChatBlocked(userData) {
 
 function logChatBlockTrace({ uidSuffix, operation, outcome, reason }) {
   logger.info("KAMOME_CHAT_BLOCK_TRACE", {
-    uidSuffix: uidSuffix || "empty",
+    uidSuffix: uidSuffix ? String(uidSuffix).slice(-6) : "empty",
     operation: operation || "unknown",
     outcome: outcome || "unknown",
     reason: reason || "chat_blocked",

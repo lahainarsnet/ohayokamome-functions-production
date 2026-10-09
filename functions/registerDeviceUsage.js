@@ -1,5 +1,11 @@
 const { HttpsError } = require("firebase-functions/v2/https");
 const { tokenSuffix } = require("./billingFinalTrace");
+const {
+  resolveVerifiedClientPlatform,
+  verifiedDevicePlatformFields,
+  PLATFORM_APP_CHECK_MISMATCH,
+  UNKNOWN_APP_ID,
+} = require("./devicePlatformAppCheck");
 
 const REGISTER_DEVICE_USAGE_TAG = "KAMOME_DEVICE_REGISTRY";
 const UUID_PATTERN =
@@ -73,7 +79,32 @@ function createRegisterDeviceUsageHandler({ admin, logger }) {
       throw new HttpsError("unauthenticated", "Authentication required.");
     }
 
+    if (!request.app) {
+      throw new HttpsError("failed-precondition", "App Check required.");
+    }
     const input = validateRegisterDeviceUsageInput(request.data);
+    let verifiedPlatform;
+    try {
+      verifiedPlatform = resolveVerifiedClientPlatform(request, input.platform);
+    } catch (error) {
+      if (error instanceof HttpsError) {
+        const detailCode = error.details && error.details.code;
+        if (
+          detailCode === PLATFORM_APP_CHECK_MISMATCH ||
+          detailCode === UNKNOWN_APP_ID
+        ) {
+          logger.warn(REGISTER_DEVICE_USAGE_TAG, {
+            uidSuffix: tokenSuffix(uid),
+            deviceIdSuffix: tokenSuffix(input.deviceId),
+            event: "platform_app_check_rejected",
+            reason: detailCode,
+            declaredPlatform: input.platform,
+            appCheckPlatform: error.details.appCheckPlatform || null,
+          });
+        }
+      }
+      throw error;
+    }
     const db = admin.getDb();
     const deviceRef = db
       .collection("users")
@@ -84,10 +115,11 @@ function createRegisterDeviceUsageHandler({ admin, logger }) {
     const now = admin.FieldValue.serverTimestamp();
     const created = !snap.exists;
 
+    const platformFields = verifiedDevicePlatformFields(verifiedPlatform);
     if (created) {
       await deviceRef.set({
         deviceId: input.deviceId,
-        platform: input.platform,
+        ...platformFields,
         modelName: input.modelName,
         appVersion: input.appVersion,
         buildNumber: input.buildNumber,
@@ -96,7 +128,7 @@ function createRegisterDeviceUsageHandler({ admin, logger }) {
       });
     } else {
       await deviceRef.update({
-        platform: input.platform,
+        ...platformFields,
         modelName: input.modelName,
         appVersion: input.appVersion,
         buildNumber: input.buildNumber,
@@ -107,7 +139,9 @@ function createRegisterDeviceUsageHandler({ admin, logger }) {
     logger.info(REGISTER_DEVICE_USAGE_TAG, {
       uidSuffix: tokenSuffix(uid),
       deviceIdSuffix: tokenSuffix(input.deviceId),
-      platform: input.platform,
+      platform: verifiedPlatform,
+      declaredPlatform: input.platform,
+      platformAppCheckVerified: true,
       modelName: input.modelName,
       appVersion: input.appVersion,
       buildNumber: input.buildNumber,

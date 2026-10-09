@@ -9,7 +9,7 @@ const {
   APP_STORE_BUNDLE_ID,
   APP_STORE_PRODUCT_ID,
   peekJwsPayload,
-  fetchAppStoreAllSubscriptionStatuses,
+  fetchAppStoreAllSubscriptionStatusesWithRetry,
   loadAppleRootCertificates,
   deriveSubscriptionState,
   pickLatestTransactionEntry,
@@ -435,11 +435,11 @@ async function applyUserSubscriptionUpdate(
     updatedAt: admin.FieldValue.serverTimestamp(),
   });
 
-  await commitUserSubscriptionDualWrite({
+  const dualWriteResult = await commitUserSubscriptionDualWrite({
     db,
     admin,
     uid,
-    source: "apple_notification",
+    source: options.dualWriteSource || "apple_notification",
     platform: "ios",
     storeState,
     legacyUpdate: update,
@@ -449,7 +449,15 @@ async function applyUserSubscriptionUpdate(
       transactionId: derived.latestTransactionId || "",
       originalTransactionId: derived.originalTransactionId || "",
     },
+    writeGuard: options.writeGuard || null,
   });
+  if (dualWriteResult?.reconcileWriteSkipped) {
+    return {
+      applied: false,
+      skipReason: dualWriteResult.skipReason || "write_guard_skip",
+    };
+  }
+  return { applied: true };
 }
 
 function isTestNotification(decodedNotification) {
@@ -686,16 +694,27 @@ function createAppStoreNotificationHandler({
       });
       let apiResult;
       try {
-        apiResult = await fetchAppStoreAllSubscriptionStatuses(
+        apiResult = await fetchAppStoreAllSubscriptionStatusesWithRetry(
           originalTransactionId,
           notificationEnvironment,
-          secrets
+          secrets,
+          {
+            maxHttpAttempts: 6,
+            deadlineMs: 45_000,
+            httpTimeoutMs: 8_000,
+            retryBackoffMs: 1_000,
+            trace: {
+              logger,
+              operationId: notificationUUID || "missing-notification-id",
+            },
+          }
         );
         logger.info(`${NOTIFICATION_TRACE} app_store_api.end`, {
           operationId: notificationUUID,
           elapsedMs: Date.now() - apiStartedAt,
           outcome: "success",
           groupCount: apiResult.body?.data?.length || 0,
+          httpAttempts: apiResult.httpAttempts || null,
         });
       } catch (apiError) {
         logger.warn(`${NOTIFICATION_TRACE} app_store_api.end`, {
@@ -704,6 +723,8 @@ function createAppStoreNotificationHandler({
           outcome: "error",
           errorType: apiError?.constructor?.name || "Error",
           errorCode: apiError?.status || apiError?.code || "unknown",
+          lookupErrors: apiError?.lookupErrors || null,
+          httpAttempts: apiError?.httpAttempts || null,
         });
         throw apiError;
       }

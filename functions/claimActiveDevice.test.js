@@ -10,6 +10,10 @@ const {
   CLAIM_ACTIVE_DEVICE_NEEDS_CONFIRMATION,
   CLAIM_ACTIVE_DEVICE_STALE_CLAIM,
 } = require("./claimActiveDevice");
+const {
+  IOS_FIREBASE_APP_ID,
+  ANDROID_FIREBASE_APP_ID,
+} = require("./appCheckPlatform");
 
 const DEVICE_A = "550e8400-e29b-41d4-a716-446655440000";
 const DEVICE_B = "6ba7b810-9dad-11d1-80b4-00c04fd430c8";
@@ -119,7 +123,8 @@ function createTestLogger() {
   const entries = [];
   return {
     entries,
-    info: (tag, payload) => entries.push({ tag, payload }),
+    info: (tag, payload) => entries.push({ tag, payload, level: "info" }),
+    warn: (tag, payload) => entries.push({ tag, payload, level: "warn" }),
   };
 }
 
@@ -132,10 +137,16 @@ async function runHandler(handler, request) {
   }
 }
 
-function authedRequest(uid, data) {
+function authedRequest(uid, data, options = {}) {
+  const declaredPlatform = String(data?.platform ?? "ios").toLowerCase();
+  const appId =
+    options.appId ??
+    (declaredPlatform === "android"
+      ? ANDROID_FIREBASE_APP_ID
+      : IOS_FIREBASE_APP_ID);
   return {
     auth: { uid },
-    app: { appId: "1:test:ios:claim" },
+    app: { appId },
     data,
   };
 }
@@ -186,7 +197,7 @@ async function run() {
     createClaimActiveDeviceHandler({ admin: unauthAdmin, logger }),
     {
       auth: null,
-      app: { appId: "1:test:ios:claim" },
+      app: { appId: IOS_FIREBASE_APP_ID },
       data: devicePayload(DEVICE_A),
     }
   );
@@ -307,6 +318,7 @@ async function run() {
     [`users/${OWNER_UID}`]: {
       email: "owner@example.com",
       activeDeviceId: DEVICE_A,
+      subscriptions: { android: { status: "active", expiryTime: new Date(Date.now() + 86400000) } },
       dailyCount: 3,
     },
     [`users/${OWNER_UID}/devices/${DEVICE_A}`]: {
@@ -429,6 +441,7 @@ async function run() {
       [`users/${OWNER_UID}`]: {
         email: "owner@example.com",
         activeDeviceId: DEVICE_A,
+      subscriptions: { android: { status: "active", expiryTime: new Date(Date.now() + 86400000) } },
         pendingActiveDeviceId: DEVICE_B,
         pendingActiveClaimGeneration: 1,
       },
@@ -483,6 +496,7 @@ async function run() {
     [`users/${OWNER_UID}`]: {
       email: "owner@example.com",
       activeDeviceId: DEVICE_A,
+      subscriptions: { ios: { status: "active", expiryTime: new Date(Date.now() + 86400000) } },
     },
     [`users/${OWNER_UID}/devices/${DEVICE_A}`]: {
       deviceId: DEVICE_A,
@@ -564,6 +578,7 @@ async function run() {
   const aToBToAToAAdmin = createMockAdmin({
     [`users/${OWNER_UID}`]: {
       activeDeviceId: DEVICE_B,
+      subscriptions: { ios: { status: "active", expiryTime: new Date(Date.now() + 86400000) } },
       pendingActiveDeviceId: DEVICE_A,
       pendingActiveClaimGeneration: 3,
     },
@@ -602,6 +617,7 @@ async function run() {
   const tripleSwitchAdmin = createMockAdmin({
     [`users/${OWNER_UID}`]: {
       activeDeviceId: DEVICE_A,
+      subscriptions: { ios: { status: "active", expiryTime: new Date(Date.now() + 86400000) } },
     },
   });
   const reserveB = await runHandler(

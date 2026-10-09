@@ -111,6 +111,52 @@ function environmentOrder(environmentHint = "") {
     : [production, sandbox];
 }
 
+function sleep(ms) {
+  return new Promise((resolve) => setTimeout(resolve, ms));
+}
+
+function isRetryableAppleHttpStatus(status) {
+  return status === 429 || (Number.isFinite(status) && status >= 500);
+}
+
+function isAppleWrongEnvironmentError(status, appleErrorCode) {
+  return status === 404 && Number(appleErrorCode) === 4040010;
+}
+
+async function fetchAppStoreHttpGet(url, headers, httpTimeoutMs) {
+  const controller = new AbortController();
+  const timer = setTimeout(() => controller.abort(), httpTimeoutMs);
+  try {
+    return await fetch(url, {
+      method: "GET",
+      headers,
+      signal: controller.signal,
+    });
+  } catch (error) {
+    if (error?.name === "AbortError") {
+      const timeoutError = new Error("APP_STORE_HTTP_TIMEOUT");
+      timeoutError.code = "TIMEOUT";
+      throw timeoutError;
+    }
+    throw error;
+  } finally {
+    clearTimeout(timer);
+  }
+}
+
+async function parseAppleSubscriptionResponse(response) {
+  const responseText = await response.text();
+  let responseBody = null;
+  if (responseText) {
+    try {
+      responseBody = JSON.parse(responseText);
+    } catch (error) {
+      responseBody = { raw: responseText.slice(0, 500) };
+    }
+  }
+  return responseBody;
+}
+
 async function fetchAppStoreAllSubscriptionStatuses(
   anyTransactionId,
   environmentHint,
@@ -129,15 +175,7 @@ async function fetchAppStoreAllSubscriptionStatuses(
       },
     });
 
-    const responseText = await response.text();
-    let responseBody = null;
-    if (responseText) {
-      try {
-        responseBody = JSON.parse(responseText);
-      } catch (error) {
-        responseBody = { raw: responseText.slice(0, 500) };
-      }
-    }
+    const responseBody = await parseAppleSubscriptionResponse(response);
 
     if (response.ok && responseBody?.data) {
       return {
@@ -156,6 +194,206 @@ async function fetchAppStoreAllSubscriptionStatuses(
 
   const error = new Error("APP_STORE_SUBSCRIPTION_LOOKUP_FAILED");
   error.lookupErrors = errors;
+  throw error;
+}
+
+const DEFAULT_APP_STORE_RETRY = {
+  maxHttpAttempts: 6,
+  deadlineMs: 52_000,
+  httpTimeoutMs: 8_000,
+  retryBackoffMs: 1_000,
+};
+
+const APP_STORE_API_RETRY_TRACE = "APP_STORE_API_RETRY_TRACE";
+
+function emitAppStoreRetryTrace(trace, payload) {
+  if (!trace?.logger || typeof trace.logger.info !== "function") {
+    return;
+  }
+  trace.logger.info(APP_STORE_API_RETRY_TRACE, {
+    operationId: trace.operationId || null,
+    ...payload,
+  });
+}
+
+/**
+ * Retries Apple subscription status GETs without treating HTTP errors as expired.
+ * Each HTTP call (including Sandbox/Production switch) counts toward maxHttpAttempts.
+ */
+async function fetchAppStoreAllSubscriptionStatusesWithRetry(
+  anyTransactionId,
+  environmentHint,
+  secrets,
+  options = {}
+) {
+  const {
+    maxHttpAttempts = DEFAULT_APP_STORE_RETRY.maxHttpAttempts,
+    deadlineMs = DEFAULT_APP_STORE_RETRY.deadlineMs,
+    httpTimeoutMs = DEFAULT_APP_STORE_RETRY.httpTimeoutMs,
+    retryBackoffMs = DEFAULT_APP_STORE_RETRY.retryBackoffMs,
+    trace = null,
+  } = options;
+
+  const jwt = createAppStoreServerApiJwt(secrets);
+  const path = `/inApps/v1/subscriptions/${encodeURIComponent(anyTransactionId)}`;
+  const headers = {
+    Authorization: `Bearer ${jwt}`,
+    Accept: "application/json",
+  };
+  const [primaryEnvironment, secondaryEnvironment] =
+    environmentOrder(environmentHint);
+  let activeEnvironment = primaryEnvironment;
+  const errors = [];
+  const startedAt = Date.now();
+  let httpAttempts = 0;
+
+  while (
+    httpAttempts < maxHttpAttempts &&
+    Date.now() - startedAt < deadlineMs
+  ) {
+    const attemptNumber = httpAttempts + 1;
+    const attemptStartedAt = Date.now();
+    let response;
+    let responseBody = null;
+    try {
+      response = await fetchAppStoreHttpGet(
+        `${activeEnvironment.baseUrl}${path}`,
+        headers,
+        httpTimeoutMs
+      );
+      responseBody = await parseAppleSubscriptionResponse(response);
+    } catch (error) {
+      httpAttempts += 1;
+      const errorKind = error?.code || "NETWORK_ERROR";
+      errors.push({
+        environment: activeEnvironment.name,
+        status: null,
+        appleErrorCode: errorKind,
+        appleErrorMessage: error?.message || String(error),
+      });
+      emitAppStoreRetryTrace(trace, {
+        step: "http_attempt",
+        attemptNumber,
+        environment: activeEnvironment.name,
+        httpElapsedMs: Date.now() - attemptStartedAt,
+        httpStatus: null,
+        errorKind,
+        outcome: "error",
+      });
+      activeEnvironment = primaryEnvironment;
+      if (
+        httpAttempts >= maxHttpAttempts ||
+        Date.now() - startedAt + retryBackoffMs >= deadlineMs
+      ) {
+        break;
+      }
+      emitAppStoreRetryTrace(trace, {
+        step: "retry_scheduled",
+        attemptNumber,
+        retryReason: "network_or_timeout",
+        waitMs: retryBackoffMs,
+      });
+      await sleep(retryBackoffMs);
+      continue;
+    }
+
+    httpAttempts += 1;
+    emitAppStoreRetryTrace(trace, {
+      step: "http_attempt",
+      attemptNumber,
+      environment: activeEnvironment.name,
+      httpElapsedMs: Date.now() - attemptStartedAt,
+      httpStatus: response.status,
+      errorKind: response.ok ? null : responseBody?.errorCode || "HTTP_ERROR",
+      outcome: response.ok && responseBody?.data ? "success" : "error",
+    });
+
+    if (response.ok && responseBody?.data) {
+      emitAppStoreRetryTrace(trace, {
+        step: "completed",
+        outcome: "success",
+        httpAttempts,
+        totalElapsedMs: Date.now() - startedAt,
+      });
+      return {
+        environment: activeEnvironment.name,
+        body: responseBody,
+        httpAttempts,
+        elapsedMs: Date.now() - startedAt,
+      };
+    }
+
+    const appleErrorCode = responseBody?.errorCode ?? null;
+    errors.push({
+      environment: activeEnvironment.name,
+      status: response.status,
+      appleErrorCode,
+      appleErrorMessage: responseBody?.errorMessage || null,
+    });
+
+    if (response.status === 401 || response.status === 403) {
+      emitAppStoreRetryTrace(trace, {
+        step: "completed",
+        outcome: "auth_failed",
+        httpAttempts,
+        totalElapsedMs: Date.now() - startedAt,
+      });
+      const authError = new Error("APP_STORE_SUBSCRIPTION_LOOKUP_FAILED");
+      authError.lookupErrors = errors;
+      authError.nonRetryable = true;
+      throw authError;
+    }
+
+    if (
+      isAppleWrongEnvironmentError(response.status, appleErrorCode) &&
+      httpAttempts < maxHttpAttempts &&
+      Date.now() - startedAt < deadlineMs
+    ) {
+      emitAppStoreRetryTrace(trace, {
+        step: "retry_scheduled",
+        attemptNumber,
+        retryReason: "wrong_environment_switch",
+        waitMs: 0,
+        nextEnvironment:
+          activeEnvironment.name === primaryEnvironment.name
+            ? secondaryEnvironment.name
+            : primaryEnvironment.name,
+      });
+      activeEnvironment =
+        activeEnvironment.name === primaryEnvironment.name
+          ? secondaryEnvironment
+          : primaryEnvironment;
+      continue;
+    }
+
+    activeEnvironment = primaryEnvironment;
+    if (
+      isRetryableAppleHttpStatus(response.status) &&
+      httpAttempts < maxHttpAttempts &&
+      Date.now() - startedAt + retryBackoffMs < deadlineMs
+    ) {
+      emitAppStoreRetryTrace(trace, {
+        step: "retry_scheduled",
+        attemptNumber,
+        retryReason: `retryable_http_${response.status}`,
+        waitMs: retryBackoffMs,
+      });
+      await sleep(retryBackoffMs);
+      continue;
+    }
+    break;
+  }
+
+  emitAppStoreRetryTrace(trace, {
+    step: "completed",
+    outcome: "failed",
+    httpAttempts,
+    totalElapsedMs: Date.now() - startedAt,
+  });
+  const error = new Error("APP_STORE_SUBSCRIPTION_LOOKUP_FAILED");
+  error.lookupErrors = errors;
+  error.httpAttempts = httpAttempts;
+  error.elapsedMs = Date.now() - startedAt;
   throw error;
 }
 
@@ -297,7 +535,11 @@ module.exports = {
   APP_STORE_BUNDLE_ID,
   peekJwsPayload,
   createAppStoreServerApiJwt,
+  environmentOrder,
   fetchAppStoreAllSubscriptionStatuses,
+  fetchAppStoreAllSubscriptionStatusesWithRetry,
+  APP_STORE_API_RETRY_TRACE,
+  DEFAULT_APP_STORE_RETRY,
   loadAppleRootCertificates,
   deriveSubscriptionState,
   pickLatestTransactionEntry,

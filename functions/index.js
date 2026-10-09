@@ -19,6 +19,9 @@ const {
   createAppStoreNotificationHandler,
 } = require("./appStoreSubscriptionNotifications");
 const {
+  createReconcileIosSubscriptionHandler,
+} = require("./iosSubscriptionReconcile");
+const {
   createGooglePlayRtdnHandler,
 } = require("./googlePlaySubscriptionNotifications");
 const {
@@ -87,6 +90,16 @@ const {
 } = require("./accountAccessUsability");
 const { platformFromAppCheckAppId } = require("./appCheckPlatform");
 const { evaluatePlatformEntitlement } = require("./platformEntitlement");
+const {
+  LOG_TAG: CHAT_UNKNOWN_PROVISIONAL_LOG_TAG,
+  resolveChatEntitlementWithUnknownProvisional,
+  createRecordChatUnknownProvisionalHandler,
+  createClearChatUnknownProvisionalHandler,
+} = require("./chatUnknownProvisional");
+const {
+  resolveRecipientChatEntitlement,
+  readActiveDevicePlatformInfo,
+} = require("./recipientChatPlatform");
 const {
   createAcknowledgeCrossPlatformSwitchHandler,
 } = require("./crossPlatformSwitchAck");
@@ -1362,15 +1375,68 @@ exports.sendMessageWithLimit = onCall(
     denyReason: usability.denyReason,
   };
 
-  if (usability.subscriptionUsable) {
+  let activeDeviceInfo = null;
+  try {
+    activeDeviceInfo = await readActiveDevicePlatformInfo({ admin, recipientId, recipientData });
+  } catch (error) {
+    logger.warn(CHAT_UNKNOWN_PROVISIONAL_LOG_TAG, {
+      scope: "sendMessageWithLimit", action: "recipientPlatformReadFailed",
+      recipientUidTail: uidTailForLog(recipientId), errorType: error?.constructor?.name || typeof error,
+    });
+  }
+  const recipientChatEntitlement = resolveRecipientChatEntitlement(
+    recipientData, activeDeviceInfo, new Date(),
+    { parseExpiryWithMeta: parseSubscriptionExpiryTimeWithMeta },
+  );
+  logger.info(CHAT_UNKNOWN_PROVISIONAL_LOG_TAG, {
+    scope: "sendMessageWithLimit", action: "recipientPlatformResolved",
+    recipientUidTail: uidTailForLog(recipientId), senderPlatform,
+    recipientPlatform: recipientChatEntitlement.platform,
+    recipientPlatformSource: recipientChatEntitlement.platformSource,
+    activeDevicePlatformVerified: activeDeviceInfo?.platformAppCheckVerified === true,
+    chatAllowed: recipientChatEntitlement.allowed,
+    chatProvisionalUsed: recipientChatEntitlement.provisionalUsed === true,
+    chatContractState: recipientChatEntitlement.contractState,
+    denyReason: recipientChatEntitlement.denyReason || null,
+  });
+
+  if (recipientChatEntitlement.allowed && !recipientChatEntitlement.provisionalUsed) {
     logRecipientSubscriptionGuard({
       ...guardLogBase,
       action: "allowSend",
     });
+  } else if (recipientChatEntitlement && recipientChatEntitlement.allowed) {
+    logRecipientSubscriptionGuard({
+      ...guardLogBase,
+      action: "allowSend",
+      chatProvisionalUsed: recipientChatEntitlement.provisionalUsed === true,
+      chatContractState: recipientChatEntitlement.contractState,
+      chatDenyReason: recipientChatEntitlement.denyReason || null,
+    });
+    if (recipientChatEntitlement.provisionalUsed) {
+      logger.info(CHAT_UNKNOWN_PROVISIONAL_LOG_TAG, {
+        scope: "sendMessageWithLimit",
+        action: "allowRecipientViaProvisional",
+        recipientUidTail: uidTailForLog(recipientId),
+        denyReason: recipientChatEntitlement.denyReason || null,
+        provisionalUntilIso:
+          recipientChatEntitlement.provisionalUntil instanceof Date
+            ? recipientChatEntitlement.provisionalUntil.toISOString()
+            : null,
+      });
+    }
   } else {
     logRecipientSubscriptionGuard({
       ...guardLogBase,
       action: "blockSend",
+      chatContractState:
+        recipientChatEntitlement && recipientChatEntitlement.contractState
+          ? recipientChatEntitlement.contractState
+          : null,
+      chatDenyReason:
+        recipientChatEntitlement && recipientChatEntitlement.denyReason
+          ? recipientChatEntitlement.denyReason
+          : guardLogBase.denyReason,
     });
     logger.info(
       `[sendMessageWithLimit] subscriptionGuardBlocked senderUidTail=${uidTailForLog(senderId)} ` +
@@ -1388,6 +1454,7 @@ exports.sendMessageWithLimit = onCall(
   let senderSubscriptionBlocked = false;
   let senderChatBlockedInTx = false;
   let recipientChatBlockedInTx = false;
+  let recipientSubscriptionBlockedInTx = false;
   let createdMessageId = null;
 
   try {
@@ -1409,30 +1476,62 @@ exports.sendMessageWithLimit = onCall(
           recipientChatBlockedInTx = true;
           return;
         }
+        const currentRecipientData = recipientUserDoc.exists ? recipientUserDoc.data() || {} : {};
+        const currentDeviceInfo = await readActiveDevicePlatformInfo({
+          admin, recipientId, recipientData: currentRecipientData,
+          readDocument: (ref) => transaction.get(ref),
+        });
+        const currentRecipientEntitlement = resolveRecipientChatEntitlement(
+          currentRecipientData, currentDeviceInfo, new Date(),
+          { parseExpiryWithMeta: parseSubscriptionExpiryTimeWithMeta },
+        );
+        if (!currentRecipientEntitlement.allowed) {
+          recipientSubscriptionBlockedInTx = true;
+          logger.info(CHAT_UNKNOWN_PROVISIONAL_LOG_TAG, {
+            scope: "sendMessageWithLimit", action: "recipientRejectedInTransaction",
+            recipientUidTail: uidTailForLog(recipientId),
+            recipientPlatform: currentRecipientEntitlement.platform,
+            contractState: currentRecipientEntitlement.contractState,
+            denyReason: currentRecipientEntitlement.denyReason,
+          });
+          return;
+        }
         const senderSubscriptionStatus = senderData.subscriptionStatus;
-        const senderUsability = evaluatePlatformEntitlement(
+        const senderChatEntitlement = resolveChatEntitlementWithUnknownProvisional(
           senderData,
           senderPlatform,
           new Date(),
           { parseExpiryWithMeta: parseSubscriptionExpiryTimeWithMeta }
         );
-        if (!senderUsability.usable) {
+        if (!senderChatEntitlement.allowed) {
           logSenderSubscriptionGuard({
             senderUidTail: uidTailForLog(senderId),
             senderPlatform,
-            decisionSource: senderUsability.decisionSource,
+            decisionSource: senderChatEntitlement.decision.decisionSource,
             entitlementUsable: senderData.entitlementUsable ?? null,
             entitlementExpiryIsFuture: false,
             subscriptionStatus: senderSubscriptionStatus,
             legacyStatusAllowsAccess: false,
             legacyExpiryIsFuture: false,
-            subscriptionUsable: senderUsability.usable,
-            denyReason: senderUsability.denyReason,
+            subscriptionUsable: false,
+            denyReason: senderChatEntitlement.denyReason,
             action: "blockSend",
             code: SENDER_SUBSCRIPTION_UNAVAILABLE,
           });
           senderSubscriptionBlocked = true;
           return;
+        }
+        if (senderChatEntitlement.provisionalUsed) {
+          logger.info(CHAT_UNKNOWN_PROVISIONAL_LOG_TAG, {
+            scope: "sendMessageWithLimit",
+            action: "allowViaProvisional",
+            senderUidTail: uidTailForLog(senderId),
+            denyReason: senderChatEntitlement.denyReason || null,
+            provisionalUntilIso:
+              senderChatEntitlement.provisionalUntil instanceof Date
+                ? senderChatEntitlement.provisionalUntil.toISOString()
+                : null,
+          });
         }
 
         dailyCount = userDoc.get("dailyCount") || 0;
@@ -1510,6 +1609,11 @@ exports.sendMessageWithLimit = onCall(
         reason: "chat_blocked",
       });
       return { success: false, code: CHAT_BLOCKED_RECIPIENT_CODE };
+    }
+
+    if (recipientSubscriptionBlockedInTx) {
+      recordMessageBlocked("subscription", { logger });
+      return { success: false, code: RECIPIENT_SUBSCRIPTION_UNAVAILABLE };
     }
 
     if (senderSubscriptionBlocked) {
@@ -2722,6 +2826,30 @@ exports.handleAppStoreServerNotification = onRequest(
   })
 );
 
+exports.reconcileIosSubscriptionFromApple = onCall(
+  {
+    region: "us-central1",
+    enforceAppCheck: true,
+    timeoutSeconds: 60,
+    secrets: [
+      APP_STORE_CONNECT_ISSUER_ID,
+      APP_STORE_CONNECT_KEY_ID,
+      APP_STORE_CONNECT_PRIVATE_KEY,
+    ],
+  },
+  createReconcileIosSubscriptionHandler({
+    getDb: admin.getDb,
+    admin,
+    logger,
+    secrets: {
+      issuerSecret: APP_STORE_CONNECT_ISSUER_ID,
+      keyIdSecret: APP_STORE_CONNECT_KEY_ID,
+      privateKeySecret: APP_STORE_CONNECT_PRIVATE_KEY,
+    },
+    getAppAppleId: () => APP_STORE_CONNECT_APP_APPLE_ID.value(),
+  })
+);
+
 /* =========================================================
  * Subscription: Google Play RTDN (phase 1)
  *  - 自動更新・解約・期限切れ・返金などを受信し Firestore を同期
@@ -2751,6 +2879,21 @@ exports.probeGooglePlaySubscriptionEntitlement = onCall(
     admin,
     logger,
   }),
+);
+
+exports.recordChatUnknownProvisional = onCall(
+  { region: "us-central1", enforceAppCheck: true },
+  createRecordChatUnknownProvisionalHandler({
+    admin,
+    logger,
+    platformFromAppCheckAppId,
+    parseExpiryWithMeta: parseSubscriptionExpiryTimeWithMeta,
+  }),
+);
+
+exports.clearChatUnknownProvisional = onCall(
+  { region: "us-central1", enforceAppCheck: true },
+  createClearChatUnknownProvisionalHandler({ admin, logger }),
 );
 
 /* =========================================================

@@ -861,6 +861,116 @@ function shouldSkipStaleActiveUpdate(existingData, derived) {
   return evaluateAndroidStaleActiveUpdate(existingData, derived).skipped;
 }
 
+function resolveStoredPrimaryPurchaseTokenForUser(userData) {
+  const primary = String(userData?.googlePlayPrimaryPurchaseToken || "").trim();
+  if (primary) {
+    return primary;
+  }
+  const nested = String(
+    userData?.subscriptions?.android?.primaryPurchaseToken || "",
+  ).trim();
+  if (nested) {
+    return nested;
+  }
+  for (const token of Array.isArray(userData?.activePurchaseTokens)
+    ? userData.activePurchaseTokens
+    : []) {
+    const normalized = String(token || "").trim();
+    if (normalized) {
+      return normalized;
+    }
+  }
+  return "";
+}
+
+/**
+ * Reconcile-mode probe: avoid applying stale Google answers after token/expiry moved.
+ */
+function evaluateAndroidStaleReconcileApply(existingData, derived, context = {}) {
+  const baseline = classifyAndroidStaleBaseline(existingData);
+  const incomingAndroidExpiry = derived.expiryDate || null;
+  const baselinePrimaryToken = String(context.baselinePrimaryToken || "").trim();
+  const freshPrimaryToken = resolveStoredPrimaryPurchaseTokenForUser(existingData);
+  if (
+    baselinePrimaryToken &&
+    freshPrimaryToken &&
+    freshPrimaryToken !== baselinePrimaryToken
+  ) {
+    return {
+      skipped: true,
+      reason: "primary_token_changed_during_probe",
+      ...baseline,
+      incomingAndroidExpiry,
+      baselineExpiry: baseline.baselineExpiry,
+    };
+  }
+
+  if (derived.status === "active") {
+    return evaluateAndroidStaleActiveUpdate(existingData, derived);
+  }
+
+  const androidStore = existingData?.subscriptions?.android;
+  const storedUsable = isStoreEntitlementUsable(androidStore);
+  if (storedUsable.usable) {
+    return {
+      skipped: true,
+      reason: "stored_android_usable_after_refresh",
+      ...baseline,
+      incomingAndroidExpiry,
+      baselineExpiry: baseline.baselineExpiry,
+    };
+  }
+
+  const storedAndroidExpiry = baseline.storedAndroidExpiry;
+  if (
+    storedAndroidExpiry &&
+    incomingAndroidExpiry &&
+    storedAndroidExpiry.getTime() > incomingAndroidExpiry.getTime()
+  ) {
+    const storedStatus = String(androidStore?.status || existingData?.subscriptionStatus || "")
+      .trim()
+      .toLowerCase();
+    if (storedStatus === "active" || storedStatus === "grace") {
+      return {
+        skipped: true,
+        reason: "stored_expiry_newer_than_google_incoming",
+        ...baseline,
+        incomingAndroidExpiry,
+        baselineExpiry: storedAndroidExpiry,
+      };
+    }
+  }
+
+  return {
+    skipped: false,
+    reason: "reconcile_apply_verified_non_active",
+    ...baseline,
+    incomingAndroidExpiry,
+    baselineExpiry: baseline.baselineExpiry,
+  };
+}
+
+const GOOGLE_PROBE_RECONCILE_DUAL_WRITE_SOURCE = "google_probe_reconcile";
+
+function buildGoogleProbeReconcileWriteGuard(derived, options = {}) {
+  if (options.dualWriteSource !== GOOGLE_PROBE_RECONCILE_DUAL_WRITE_SOURCE) {
+    return undefined;
+  }
+  const baselinePrimaryToken = String(options.baselinePrimaryToken || "").trim();
+  return (data) => {
+    const evaluation = evaluateAndroidStaleReconcileApply(data, derived, {
+      baselinePrimaryToken,
+    });
+    if (evaluation.skipped) {
+      return {
+        skip: true,
+        reason: evaluation.reason || "reconcile_tx_stale_skip",
+      };
+    }
+    return null;
+  };
+}
+
 function buildAndroidStaleTraceFields(evaluation) {
   return {
     baselineSource: evaluation.baselineSource,
@@ -976,7 +1086,8 @@ async function applyGoogleSubscriptionUpdateToUser(
     updatedAt: admin.FieldValue.serverTimestamp(),
   });
 
-  await commitUserSubscriptionDualWrite({
+  const reconcileWriteGuard = buildGoogleProbeReconcileWriteGuard(derived, options);
+  const dualWriteResult = await commitUserSubscriptionDualWrite({
     db,
     admin,
     uid,
@@ -989,7 +1100,22 @@ async function applyGoogleSubscriptionUpdateToUser(
       eventId: options.eventId || "",
       purchaseToken: purchaseToken || "",
     },
+    writeGuard: reconcileWriteGuard,
   });
+
+  if (dualWriteResult?.reconcileWriteSkipped) {
+    const skipReason = dualWriteResult.skipReason || "reconcile_tx_stale_skip";
+    logAndroidStaleTrace(options.logger, {
+      step: "reconcile_tx_stale_skip",
+      source: staleSource,
+      uidSuffix: uidSuffixForStaleTrace(uid),
+      derivedStatus: derived.status || "",
+      result: skipReason,
+      beforeAndroidExpiry: formatExpiryIso(readStoredAndroidExpiry(existingData)),
+      incomingAndroidExpiry: formatExpiryIso(derived.expiryDate),
+    });
+    return { applied: false, reason: skipReason };
+  }
 
   logAndroidStaleTrace(options.logger, {
     step: "apply_success",
@@ -1539,8 +1665,12 @@ module.exports = {
   androidEntitlementBasis,
   resolveAndroidStaleComparisonExpiry,
   evaluateAndroidStaleActiveUpdate,
+  evaluateAndroidStaleReconcileApply,
+  buildGoogleProbeReconcileWriteGuard,
+  GOOGLE_PROBE_RECONCILE_DUAL_WRITE_SOURCE,
   classifyAndroidStaleBaseline,
   shouldSkipStaleActiveUpdate,
+  resolveStoredPrimaryPurchaseTokenForUser,
   ANDROID_STALE_TRACE,
   shouldRequeryNonPrimaryNotification,
   collectTokensForRequery,

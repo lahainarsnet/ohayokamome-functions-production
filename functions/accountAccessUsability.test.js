@@ -155,7 +155,8 @@ assert.ok(
   describeCalls.length >= 1,
   `sendMessageWithLimit recipient guard should still call describeAccountAccessUsability, found ${describeCalls.length}`
 );
-assert.match(indexSource, /evaluatePlatformEntitlement\(/);
+assert.match(indexSource, /resolveChatEntitlementWithUnknownProvisional\(/);
+assert.match(indexSource, /resolveRecipientChatEntitlement\(/);
 assert.match(indexSource, /platformFromAppCheckAppId\(/);
 
 console.log("accountAccessUsability.test.js: ok");

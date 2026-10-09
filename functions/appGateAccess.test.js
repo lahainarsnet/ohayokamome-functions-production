@@ -35,6 +35,9 @@ function createMockDb(appGateMode, options = {}) {
                 field === "app_access_mode" ? configAppAccessMode : undefined,
             };
           }
+          if (collectionName === "users") {
+            return { exists: true, data: () => ({ chatBlocked: false }) };
+          }
           throw new Error(`unexpected read: ${collectionName}/${docId}`);
         },
       }),

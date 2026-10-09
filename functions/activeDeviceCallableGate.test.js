@@ -29,7 +29,8 @@ function exportBlock(source, exportName) {
 function assertGateBefore(source, laterNeedle, label) {
   const gateIdx = source.indexOf("evaluateActiveDeviceGateForRequest");
   const assertIdx = source.indexOf("assertActiveDeviceAllowed");
-  const gatePos = gateIdx >= 0 ? gateIdx : assertIdx;
+  const txGateIdx = source.indexOf("evaluateActiveDeviceGate");
+  const gatePos = gateIdx >= 0 ? gateIdx : (assertIdx >= 0 ? assertIdx : txGateIdx);
   const laterPos = source.indexOf(laterNeedle);
   assert.ok(gatePos >= 0, `${label} must call activeDevice gate`);
   assert.ok(laterPos >= 0, `${label} must contain ${laterNeedle}`);
@@ -39,10 +40,39 @@ function assertGateBefore(source, laterNeedle, label) {
   );
 }
 
+const chatProvisionalSource = fs.readFileSync(
+  path.join(__dirname, "chatUnknownProvisional.js"),
+  "utf8"
+);
+const recordHandler = chatProvisionalSource.slice(
+  chatProvisionalSource.indexOf("function createRecordChatUnknownProvisionalHandler"),
+  chatProvisionalSource.indexOf("function createClearChatUnknownProvisionalHandler")
+);
+assert.match(recordHandler, /evaluateActiveDeviceGate/);
+assert.match(recordHandler, /classifyChatPlatformEntitlement/);
+assertGateBefore(
+  recordHandler,
+  "classifyChatPlatformEntitlement",
+  "createRecordChatUnknownProvisionalHandler"
+);
+assert.match(
+  exportBlock(indexSource, "recordChatUnknownProvisional"),
+  /createRecordChatUnknownProvisionalHandler/
+);
+
 const sendSource = exportBlock(indexSource, "sendMessageWithLimit");
 assert.match(sendSource, /evaluateActiveDeviceGateForRequest/);
 assertGateBefore(sendSource, "platformFromAppCheckAppId", "sendMessageWithLimit");
-assertGateBefore(sendSource, "evaluatePlatformEntitlement", "sendMessageWithLimit");
+assertGateBefore(
+  sendSource,
+  "resolveChatEntitlementWithUnknownProvisional",
+  "sendMessageWithLimit"
+);
+assert.match(sendSource, /resolveRecipientChatEntitlement/);
+assert.match(
+  sendSource,
+  /resolveRecipientChatEntitlement\(/
+);
 assert.ok(
   sendSource.indexOf("SENDER_AUTH_MISMATCH") <
     sendSource.indexOf("evaluateActiveDeviceGateForRequest")
@@ -124,6 +154,23 @@ for (const exportName of ungated) {
   assert.doesNotMatch(
     block,
     /assertActiveDeviceAllowed|evaluateActiveDeviceGateForRequest/
+  );
+}
+
+const upsertEmail = exportBlock(indexSource, "upsertUserEmailAndAccount");
+assert.match(upsertEmail, /expectedUid !== uid/);
+assert.match(upsertEmail, /new HttpsError\("failed-precondition"/);
+const uidGuardPosition = upsertEmail.indexOf("expectedUid !== uid");
+for (const writePath of [
+  'collection("users")',
+  "resolveAccountIdForUpsert(",
+  "userRef.set(",
+]) {
+  const writePosition = upsertEmail.indexOf(writePath);
+  assert.ok(writePosition >= 0, `upsert must contain ${writePath}`);
+  assert.ok(
+    uidGuardPosition < writePosition,
+    `expectedUid guard must run before ${writePath}`
   );
 }
 

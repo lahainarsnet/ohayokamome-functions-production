@@ -18,6 +18,10 @@ const { loadAppConfig, assertAccessNotBlocked } = require("./appConfig");
 const { assertUidChatNotBlocked } = require("./chatBlockGuard");
 const { platformFromAppCheckAppId } = require("./appCheckPlatform");
 const { evaluatePlatformEntitlement } = require("./platformEntitlement");
+const {
+  LOG_TAG: CHAT_UNKNOWN_PROVISIONAL_LOG_TAG,
+  resolveChatEntitlementWithUnknownProvisional,
+} = require("./chatUnknownProvisional");
 const { SENDER_SUBSCRIPTION_UNAVAILABLE } = require("./sendMessageGuardCodes");
 const { evaluateActiveDeviceGateForRequest } = require("./activeDeviceGate");
 const {
@@ -114,13 +118,14 @@ async function assertCallerSubscriptionUsable(uid, options = {}) {
   const now = options.now instanceof Date ? options.now : new Date();
   const userDoc = await getDb().collection("users").doc(uid).get();
   const userData = userDoc.exists ? userDoc.data() || {} : {};
-  const usability = evaluateCallerSubscriptionAccess(userData, now, {
-    ...(parseExpiryWithMeta ? { parseExpiryWithMeta } : {}),
-    platform: options.platform,
-    appId: options.appId,
-  });
-
-  if (!usability.subscriptionUsable) {
+  const platform =
+    options.platform || platformFromAppCheckAppId(options.appId);
+  if (platform !== "ios" && platform !== "android") {
+    const usability = evaluateCallerSubscriptionAccess(userData, now, {
+      ...(parseExpiryWithMeta ? { parseExpiryWithMeta } : {}),
+      platform: options.platform,
+      appId: options.appId,
+    });
     logger.warn("transcribeExperiment: SENDER_SUBSCRIPTION_UNAVAILABLE", {
       uidSuffix: uidSuffix(uid),
       decisionSource: usability.decisionSource,
@@ -131,11 +136,58 @@ async function assertCallerSubscriptionUsable(uid, options = {}) {
     return { ok: false, code: SENDER_SUBSCRIPTION_UNAVAILABLE, usability };
   }
 
+  const chatEntitlement = resolveChatEntitlementWithUnknownProvisional(
+    userData,
+    platform,
+    now,
+    parseExpiryWithMeta ? { parseExpiryWithMeta } : {},
+  );
+  const usability = {
+    subscriptionUsable: chatEntitlement.allowed,
+    decisionSource: chatEntitlement.decision.decisionSource,
+    denyReason: chatEntitlement.denyReason || chatEntitlement.decision.denyReason,
+    entitlementUsable:
+      userData && userData.entitlementUsable != null
+        ? userData.entitlementUsable
+        : null,
+    entitlementExpiryIsFuture: false,
+    legacyStatusAllowsAccess: chatEntitlement.decision.decisionSource === "legacyFallback",
+    legacyExpiryIsFuture: chatEntitlement.decision.expiryDate instanceof Date,
+    platform,
+    provisionalUsed: chatEntitlement.provisionalUsed === true,
+  };
+
+  if (!chatEntitlement.allowed) {
+    logger.warn("transcribeExperiment: SENDER_SUBSCRIPTION_UNAVAILABLE", {
+      uidSuffix: uidSuffix(uid),
+      decisionSource: usability.decisionSource,
+      entitlementUsable: usability.entitlementUsable,
+      entitlementExpiryIsFuture: usability.entitlementExpiryIsFuture,
+      denyReason: usability.denyReason,
+      definitiveDeny: chatEntitlement.definitiveDeny === true,
+    });
+    return { ok: false, code: SENDER_SUBSCRIPTION_UNAVAILABLE, usability };
+  }
+
+  if (chatEntitlement.provisionalUsed) {
+    logger.info(CHAT_UNKNOWN_PROVISIONAL_LOG_TAG, {
+      scope: "transcribeExperiment",
+      action: "allowViaProvisional",
+      uidSuffix: uidSuffix(uid),
+      denyReason: usability.denyReason || null,
+      provisionalUntilIso:
+        chatEntitlement.provisionalUntil instanceof Date
+          ? chatEntitlement.provisionalUntil.toISOString()
+          : null,
+    });
+  }
+
   logger.info("transcribeExperiment: subscription guard passed", {
     uidSuffix: uidSuffix(uid),
     decisionSource: usability.decisionSource,
     entitlementUsable: usability.entitlementUsable,
     entitlementExpiryIsFuture: usability.entitlementExpiryIsFuture,
+    provisionalUsed: usability.provisionalUsed,
   });
   return { ok: true, usability };
 }
