@@ -829,6 +829,14 @@ function emitReassignmentDecision(log, traceId, uid, context, args, result) {
       decision: result.proof ? "allow" : "reject",
       decisionCode: result.code,
       evidenceSource: result.source || null,
+      frameStage: "ownership_proof",
+      // Describe Proof A without logging its identifiers or re-running the proof.
+      prePurchaseRecordPresent: Boolean(args.userData?.billingConfirmation?.[args.platform]),
+      prePurchaseRecordEligible: args.userData?.billingConfirmation?.[args.platform]?.state === "eligible",
+      prePurchaseRecordReasonMatches: args.userData?.billingConfirmation?.[args.platform]?.reason === "verified_current_series_ended",
+      prePurchaseForeignSeriesPresent: Array.isArray(args.userData?.billingConfirmation?.[args.platform]?.expiredForeignSeries)
+        && args.userData.billingConfirmation[args.platform].expiredForeignSeries.length > 0,
+      nextAction: result.proof ? "ownership_commit" : "reject_preserve_owner",
       ...(result.facts || {}),
     });
   } catch (_) { /* diagnostics only */ }
@@ -1008,6 +1016,10 @@ async function claimOwnershipDocument(
       if (hasOwnershipLogger(log)) {
         safeLogInfo(log, "Subscription ownership created.", {
           platform,
+          traceId: traceId || null,
+          event: "ownership.created",
+          uidRelation: "new_ownership_record",
+          frameStage: "ownership_commit",
           requestUidSuffix: identifierSuffix(uid),
           ownershipIdSuffix: identifierSuffix(ownershipId),
         });
@@ -1017,6 +1029,13 @@ async function claimOwnershipDocument(
 
     const existingOwnerUid = String(snap.get("ownerUid") || "").trim();
     if (!existingOwnerUid || existingOwnerUid === uid) {
+      safeLogInfo(log, "Subscription ownership retained.", {
+        event: "ownership.retained", frameStage: "ownership_commit",
+        traceId: traceId || null, platform,
+        requestUidSuffix: identifierSuffix(uid),
+        existingOwnerPresent: Boolean(existingOwnerUid),
+        uidRelation: existingOwnerUid === uid ? "same_owner_uid" : "owner_unset",
+      });
       for (const previous of linkedLegacyUpdates) tx.set(previous.ref, previous.update, { merge: true });
       tx.set(
         ref,

@@ -436,8 +436,9 @@ function createReconcileIosSubscriptionHandler({
           step: "apple_api.failed",
           reconcileTraceId,
           uidSuffix: tokenSuffix(uid),
-          errorMessage: apiError?.message || String(apiError),
-          lookupErrors: apiError?.lookupErrors || null,
+          errorReason: "apple_api_failed",
+          errorType: apiError?.constructor?.name || typeof apiError,
+          hasLookupErrors: Boolean(apiError?.lookupErrors),
           httpAttempts: apiError?.httpAttempts || null,
           elapsedMs: Date.now() - startedAt,
         });
@@ -622,7 +623,8 @@ function createReconcileIosSubscriptionHandler({
             step: "lock_release_failed",
             reconcileTraceId,
             uidSuffix: tokenSuffix(uid),
-            errorMessage: releaseError?.message || String(releaseError),
+            errorReason: "lock_release_failed",
+            errorType: releaseError?.constructor?.name || typeof releaseError,
           });
         }
       }

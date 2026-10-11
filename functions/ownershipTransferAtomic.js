@@ -264,6 +264,13 @@ function createTransferHandler({ admin, logger = console, adapter, nowMs = () =>
         // (sent by the app only after the "use this phone" dialog). Without it NOTHING is changed.
         const activeDeviceId = String(yData.activeDeviceId || "").trim();
         const otherActiveDevice = Boolean(activeDeviceId) && activeDeviceId !== deviceId;
+        if (otherActiveDevice && !confirmDeviceReplacement) log("warn", "device_confirmation_decision", { frameStage: "judgment",
+          uidRelation: alreadyOwner ? "already_owner" : "different_owner_uid",
+          hasRegisteredDevice: Boolean(activeDeviceId),
+          localMatchesRegistered: activeDeviceId === deviceId,
+          requiresDeviceReplacementConsent: otherActiveDevice,
+          consentProvided: confirmDeviceReplacement,
+          nextAction: otherActiveDevice && !confirmDeviceReplacement ? "refuse" : "atomic_commit" });
         if (otherActiveDevice && !confirmDeviceReplacement) throw refuse(CODES.deviceConfirmationRequired);
 
         const now = admin.FieldValue.serverTimestamp();

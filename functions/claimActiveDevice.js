@@ -158,7 +158,13 @@ function createClaimActiveDeviceHandler({ admin, logger }) {
       const sourcePlatform = ["ios", "android"].includes(sourceData.platform) ? sourceData.platform : "unresolved";
       logger.info(CLAIM_ACTIVE_DEVICE_TAG, { event: "claim_active_device.transfer_context",
         uidSuffix, newDeviceIdSuffix, sourcePlatform, targetPlatform: verifiedPlatform,
-        deviceSwitchTraceId: input.deviceSwitchTraceId, mode: input.mode });
+        deviceSwitchTraceId: input.deviceSwitchTraceId, mode: input.mode,
+        frameStage: "entry", uidRelation: "same_authenticated_uid",
+        hasRegisteredDevice: Boolean(previousActiveDeviceId),
+        localMatchesRegistered: previousActiveDeviceId === input.deviceId,
+        hasPendingDevice: Boolean(pendingActiveDeviceId),
+        pendingMatchesRequested: pendingActiveDeviceId === input.deviceId,
+        pendingGenerationMatches: pendingActiveClaimGeneration === input.claimGeneration });
       const created = !deviceSnap.exists;
       const switched =
         Boolean(previousActiveDeviceId) &&
@@ -259,6 +265,9 @@ function createClaimActiveDeviceHandler({ admin, logger }) {
             uidSuffix, newDeviceIdSuffix, platform: verifiedPlatform,
             deviceSwitchTraceId: input.deviceSwitchTraceId,
             usable: entitlement.usable, decisionSource: entitlement.decisionSource,
+            frameStage: "final_confirmation",
+            denyReason: entitlement.denyReason || null,
+            observedStatus: entitlement.status || null,
             // Case 13: the Android contract that an iPhone transfer relied on (null for the iPhone's own contract).
             sourcePlatform: entitlement.sourcePlatform || null,
             contractState: entitlement.usable ? "active"

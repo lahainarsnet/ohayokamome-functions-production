@@ -505,7 +505,8 @@ function createGooglePlaySubscriptionProbeHandler({
       logger.warn(`${PROBE_TRACE} failed`, {
         uidSuffix,
         tokenSuffix: tokenSuffix(purchaseToken),
-        reason: error?.message || String(error),
+        reason: "google_api_error",
+        clientTraceId: clientTraceId || "",
         errorType: error?.constructor?.name || typeof error,
         reconcileMode,
         phase: phase || "",
