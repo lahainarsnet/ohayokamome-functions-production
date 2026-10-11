@@ -53,15 +53,18 @@ for (const os of ['ios', 'android']) {
     stored(f).subscriptionPlatform = os === 'ios' ? 'android' : 'ios';
     const own = stored(f).subscriptions[os]; delete stored(f).subscriptions[os];
     stored(f).subscriptionStatus = 'active'; stored(f).subscriptionExpiryTime = at(300);
-    assert.equal((await f.record(request(os))).outcome, 'dedicatedStop');
+    // Cases 13 and 14: an Active contract of the other OS under the same UID is carried, so there is nothing to stop.
+    assert.notEqual((await f.record(request(os))).outcome, 'dedicatedStop');
     await f.clear(request(os));
-    assert.equal(date(stored(f).chatUnknownProvisionalStartedAt).getTime(), BASE.getTime());
+    assert.equal(stored(f).chatUnknownProvisionalStartedAt, undefined, 'a carried Active resets the provisional anchor');
     stored(f).subscriptions[os] = {status: 'active', expirySource: 'grace', normalExpiryTime: at(-1), graceExpiryTime: at(300)};
     now = at(144);
     assert.equal(resolve(stored(f), os, now).allowed, true, 'Store grace is not the Unknown rescue');
     await f.clear(request(os));
     assert.equal(stored(f).chatUnknownProvisionalStartedAt, undefined);
     assert.equal(stored(f).subscriptions[os].graceExpiryTime.getTime(), at(300).getTime());
+    // The other-OS legacy Active (carried, cases 13 and 14) is removed so the own Unknown is observed on its own.
+    delete stored(f).subscriptionStatus; delete stored(f).subscriptionExpiryTime; delete stored(f).subscriptionPlatform;
     stored(f).subscriptions[os] = own;
     now = at(168);
     assert.equal((await f.record(request(os))).outcome, 'unknownRecorded');

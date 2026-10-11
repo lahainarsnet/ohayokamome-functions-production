@@ -42,7 +42,7 @@ const CODES = {
   rateLimited: "OWNERSHIP_TRANSFER_RATE_LIMITED",
 };
 
-// Per-UID failure limiter (iPhone only): transaction numbers are enumerable, so repeated refusals are throttled.
+// Per-UID failure limiter (both OS): repeated refusals are throttled.
 // 5 refusals inside 15 minutes lock the UID for 15 minutes; the lock lifts by itself, a success clears the counter.
 const FAILURE_COLLECTION = "ownership_transfer_failures";
 const FAILURE_LIMIT = 5;
@@ -313,6 +313,9 @@ function createAndroidAdapter({ admin, verifyGoogle = null }) {
   const googlePlay = () => require("./googlePlaySubscriptionNotifications");
   return {
     platform: "android",
+    // Same per-UID failure limiter as the iPhone adapter (the purchase token is the only evidence on Android).
+    failureLimit: true,
+    countedFailureCodes: new Set([CODES.notActive, CODES.notApplicable, "PROOF_REFUSED"]),
     parse(data) {
       const purchaseToken = String(data.purchaseToken || "").trim();
       if (!purchaseToken) throw new HttpsError("invalid-argument", "purchaseToken is required.");

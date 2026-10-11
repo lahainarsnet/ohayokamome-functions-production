@@ -135,7 +135,13 @@ function evaluateOwnershipTransferProof({ platform, purchase, ownerUid, ownerSna
     if (purchase.proofVerified !== true) return reject("REJECT_TRANSFER_DEVICE_PROOF_MISSING");
     if (purchase.ownershipType !== "PURCHASED") return reject("REJECT_TRANSFER_NOT_PURCHASED");
     if (!ownerAccountTagMatches({ platform, purchase, ownerUid, ownerSnapshot, ownerUserSnapshot })) return reject("REJECT_TRANSFER_ACCOUNT_TAG_MISMATCH");
-  } else if (purchase.uidBound !== true && !ownerAccountTagMatches({ platform, purchase, ownerUid, ownerSnapshot, ownerUserSnapshot })) return reject("REJECT_TRANSFER_ACCOUNT_TAG_MISMATCH");
+  } else if (String(purchase.accountTag || "").trim() !== "" && purchase.uidBound !== true &&
+      !ownerAccountTagMatches({ platform, purchase, ownerUid, ownerSnapshot, ownerUserSnapshot })) {
+    // Android: Google Play does not prove WHO holds the purchase. The evidence is the Google-verified ACTIVE purchase token
+    // plus the recorded ownership (checked by the caller). An account tag, when present, must be the requester's or the
+    // current owner's; a tag bound to a third UID refuses. No tag (contracts made without one) is not a reason to refuse.
+    return reject("REJECT_TRANSFER_ACCOUNT_TAG_MISMATCH");
+  }
   return { proof: { expiryMs: now, source: "ownership_transferred_active" }, code: "ALLOW_OWNERSHIP_TRANSFER_ACTIVE", facts };
 }
 function getServerDerivedEndedProof(args) { return evaluateServerDerivedEndedProof(args).proof; }
@@ -144,11 +150,8 @@ function evaluateExpiredReassignment(args) {
   const confirmed = getClientConfirmedProof(args);
   if (confirmed) return { proof: confirmed, code: "ALLOW_CLIENT_CONFIRMED_PROOF", source: "client_confirmed", facts: {} };
   const derived = evaluateServerDerivedEndedProof(args);
-  // iOS: moving an ACTIVE contract between UIDs is only done by the dedicated transfer path (client-side StoreKit proof).
-  if (!derived.proof && args.platform !== "ios") {
-    const transfer = evaluateOwnershipTransferProof(args);
-    if (transfer.proof) return { ...transfer, source: transfer.proof.source, facts: { ...derived.facts, ...transfer.facts, clientConfirmedProof: "absent_or_invalid" } };
-  }
+  // Moving an ACTIVE contract between UIDs (either OS) is only done by the dedicated transfer path
+  // (transferActiveContractOwnership, after the user's approval). This shared decision never does it.
   return { ...derived, source: derived.proof ? derived.proof.source : null, facts: { ...derived.facts, clientConfirmedProof: "absent_or_invalid" } };
 }
 function getExpiredReassignmentProof(args) {

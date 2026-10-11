@@ -306,16 +306,16 @@ const iosDb = (ownerUser) => makeDb({
     usersQuery: { [`appStoreOriginalTransactionId|==|${ORIGINAL}`]: ["uid-a"] } });
   await rejectsAlreadyLinked(assertSubscriptionNotLinkedToOtherUser(tScan(), { ...scanArgs, verifiedPurchase: iosPurchase({ uidBound: false, accountTag: OWNER_TAG }) }), "transfer scan: owner tag alone");
   await rejectsAlreadyLinked(assertSubscriptionNotLinkedToOtherUser(tScan(), { ...scanArgs, verifiedPurchase: iosPurchase({ uidBound: false, accountTag: FOREIGN_TAG }) }), "transfer scan: foreign tag");
-  // Android: a restore tagged with the previous owner's account id moves; any other tag is refused.
+  // Android (Build 453): the shared claim never moves an ACTIVE contract between UIDs, whatever the tag (dedicated transfer only).
   const crypto = require("node:crypto");
   const tagOf = (uid) => crypto.createHash("sha256").update(`kamome-account:${uid}`).digest("hex");
   const sameTokenDb = () => makeDb({ users: { "uid-a": { ...androidOwnerUser({ status: "active", expiryTime: iso(now + 24 * HOUR), primaryPurchaseToken: NEW_TOKEN, activePurchaseTokens: [NEW_TOKEN] }), googlePlayPrimaryPurchaseToken: NEW_TOKEN }, "uid-b": {} },
     ownership: { [NEW_ID]: { ownerUid: "uid-a", platform: "android", status: "active" } } });
   const sameTokenClaim = (d, purchase) => claimOwnershipDocument(d, admin, { uid: "uid-b", ownershipId: NEW_ID, platform: "android", ownershipFields: {}, log, verifiedPurchase: purchase });
   db = sameTokenDb();
-  await sameTokenClaim(db, { uidBound: false, active: true, purchasedAt: now - HOUR, accountTag: tagOf("uid-a") });
-  assert.equal(db.ownership[NEW_ID].ownerUid, "uid-b", "Android transfer: ownership moves");
-  assert.equal(db.users["uid-a"].subscriptions.android.status, "expired", "Android transfer: previous owner is stopped");
+  await rejectsAlreadyLinked(sameTokenClaim(db, { uidBound: false, active: true, purchasedAt: now - HOUR, accountTag: tagOf("uid-a") }), "Android shared claim: owner tag does not move an active contract");
+  assert.equal(db.ownership[NEW_ID].ownerUid, "uid-a", "Android shared claim: ownership stays with the owner");
+  assert.equal(db.users["uid-a"].subscriptions.android.status, "active", "Android shared claim: previous owner keeps the contract");
   for (const purchase of [{ uidBound: false, active: true, accountTag: tagOf("uid-x") }, { uidBound: false, active: true }, { uidBound: false, active: false, accountTag: tagOf("uid-a") }]) {
     db = sameTokenDb();
     await rejectsAlreadyLinked(sameTokenClaim(db, { purchasedAt: now - HOUR, ...purchase }), `Android transfer refused: ${JSON.stringify(purchase)}`);

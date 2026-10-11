@@ -89,7 +89,6 @@ const rejects = async (promise, code, label) => {
     ["other product", googleObserved({ matchedLineItem: { productId: "other" } }), OWNERSHIP_TRANSFER_CODES.notActive],
     ["linked token", googleObserved({ subscription: { linkedPurchaseToken: "older-token" } }), OWNERSHIP_TRANSFER_CODES.linkedUnsupported],
     ["tag of a third party", googleObserved({ subscription: { externalAccountIdentifiers: { obfuscatedExternalAccountId: tagOf("user-third-abcdefghij0123456789") } } }), SUBSCRIPTION_ALREADY_LINKED_CODE],
-    ["no tag", googleObserved({ subscription: { externalAccountIdentifiers: {} } }), SUBSCRIPTION_ALREADY_LINKED_CODE],
   ];
   for (const [label, observed, code] of refusals) {
     db = makeDb(baseDocs());
@@ -233,6 +232,60 @@ const rejects = async (promise, code, label) => {
   assert.ok(/evaluateOwnershipTransferProof\(/.test(moduleSource) && /googleState\(/.test(moduleSource), "⑨ ownership proof and Store verification are still required");
   const claimSource = fs.readFileSync(require.resolve("./claimActiveDevice.js"), "utf8");
   assert.ok(/confirmed_rejected_stale/.test(claimSource), "⑨ normal device claims keep their stale-request protection");
+
+  // ⑪ Case 3 (Build 453): the evidence is the Google-verified ACTIVE token + the recorded ownership. An account tag is
+  // optional; when present it must be the requester's or the current owner's.
+  const X = "user-x-abcdefghij0123456789"; const Y = "user-y-abcdefghij0123456789"; const THIRD = "user-third-abcdefghij0123456789";
+  const ownerOf = (d) => d.docs.get(`subscription_ownership/${OWN_ID}`).ownerUid;
+  for (const [label, ids] of [["no tag", {}], ["owner's tag", { obfuscatedExternalAccountId: tagOf(X) }], ["requester's tag", { obfuscatedExternalAccountId: tagOf(Y) }]]) {
+    db = makeDb(baseDocs());
+    const moved = await handlerFor(db, googleObserved({ subscription: { externalAccountIdentifiers: ids } }))(request());
+    assert.equal(moved.transferred, true, `⑪ ${label}: transfer succeeds`);
+    assert.equal(ownerOf(db), Y, `⑪ ${label}: ownership moved to Y`);
+    assert.equal(db.docs.get(`users/${X}`).subscriptions.android.status, "expired", `⑪ ${label}: X marked transferred`);
+    assert.equal(db.docs.get(`users/${Y}`).activeDeviceId, DEVICE_B, `⑪ ${label}: B is Y's device`);
+  }
+  // a tag bound to a third UID refuses; nothing changes
+  db = makeDb(baseDocs()); before = snapshotOf(db);
+  await rejects(handlerFor(db, googleObserved({ subscription: { externalAccountIdentifiers: { obfuscatedExternalAccountId: tagOf(THIRD) } } }))(request()), SUBSCRIPTION_ALREADY_LINKED_CODE, "⑪ third-party tag");
+  assert.equal(snapshotOf(db), before);
+  // failed transfer: X keeps the contract and the old device A (C in this fixture)
+  db = makeDb(baseDocs(), { failCommit: true }); before = snapshotOf(db);
+  await assert.rejects(handlerFor(db, googleObserved({ subscription: { externalAccountIdentifiers: {} } }))(request()));
+  assert.equal(snapshotOf(db), before, "⑪ failed commit changes nothing");
+  assert.equal(db.docs.get(`users/${X}`).activeDeviceId, DEVICE_C, "⑪ X's old device is kept");
+
+  // ⑫ failure limiter (same mechanism as the iPhone): 5 refusals lock, the lock lifts by itself, success clears the counter.
+  let clock = NOW;
+  const limited = (d, observed) => handlerFor(d, observed, { nowMs: () => clock });
+  const notActive = googleObserved({ subscription: { subscriptionState: "SUBSCRIPTION_STATE_EXPIRED" } });
+  db = makeDb(baseDocs());
+  for (let i = 0; i < 5; i += 1) await rejects(limited(db, notActive)(request()), OWNERSHIP_TRANSFER_CODES.notActive, `⑫ refusal ${i + 1}`);
+  await rejects(limited(db, googleObserved())(request()), OWNERSHIP_TRANSFER_CODES.rateLimited, "⑫ paused while locked");
+  assert.equal(ownerOf(db), X, "⑫ nothing moved while locked");
+  clock = NOW + 16 * 60 * 1000;
+  await limited(db, googleObserved())(request());
+  assert.equal(ownerOf(db), Y, "⑫ the lock lifts by itself");
+  assert.equal(db.docs.has(`ownership_transfer_failures/${Y}`), false, "⑫ success clears the counter");
+  clock = NOW;
+  db = makeDb(baseDocs());
+  for (let i = 0; i < 4; i += 1) await rejects(limited(db, notActive)(request()), OWNERSHIP_TRANSFER_CODES.notActive, "⑫ below the limit");
+  await limited(db, googleObserved())(request());
+  assert.equal(ownerOf(db), Y, "⑫ 4 refusals do not lock a legitimate user");
+  // device consent is not a refusal of the evidence and is not counted
+  db = makeDb(withC());
+  for (let i = 0; i < 6; i += 1) await rejects(limited(db, googleObserved())(request()), OWNERSHIP_TRANSFER_CODES.deviceConfirmationRequired, "⑫ consent");
+  assert.equal(db.docs.has(`ownership_transfer_failures/${Y}`), false, "⑫ device consent is not counted");
+
+  // ⑬ the shared (normal purchase / contract) decision never moves an ACTIVE Android contract between UIDs.
+  const { evaluateExpiredReassignment } = require("./expiredOwnershipProof");
+  const ownRec = { exists: true, data: () => ({ ownerUid: X, status: "active" }) };
+  const ownUser = { exists: true, data: () => ({ subscriptions: { android: { status: "active", expiryTime: iso(NOW + HOUR) } } }) };
+  for (const accountTag of [tagOf(X), tagOf(Y), ""]) {
+    const shared = evaluateExpiredReassignment({ platform: "android", userData: {}, ownerUid: X, ownerSnapshot: ownRec, ownerUserSnapshot: ownUser,
+      ownershipId: OWN_ID, purchase: { active: true, uidBound: accountTag === tagOf(Y), accountTag, purchasedAt: NOW - 1000 }, now: NOW });
+    assert.equal(shared.proof, null, "⑬ shared decision does not move an active Android contract");
+  }
 
   console.log("ownershipTransferAtomic: case-3 atomic transfer checks PASS");
 })().catch((error) => { console.error(error); process.exit(1); });

@@ -10,11 +10,12 @@ assert.equal(permitsExpiredReassignment(args),true);
 // Not bound to the requesting UID (and no matching tag), or not reported active by the Store: never accepted.
 for(const purchase of [{uidBound:false,active:true,purchasedAt:now},{uidBound:true,active:false,purchasedAt:now-500}]) assert.equal(permitsExpiredReassignment({...args,purchase}),false);
 assert.equal(permitsExpiredReassignment({...args,ownerUid:'other'}),false);
-// "Latest holder wins": a Store-active, UID-bound purchase moves the series even if the old owner's record says active.
-assert.equal(permitsExpiredReassignment({...args,ownerSnapshot:{exists:true,data:()=>({ownerUid:'old',status:'active',updatedAt:now})}}),true);
-// The 15-minute client-confirmation window no longer gates the transfer.
-assert.equal(permitsExpiredReassignment({...args,now:now+16*60*1000}),true);
-for(const state of ['active','unknown','blocked']) assert.equal(permitsExpiredReassignment({...args,userData:{billingConfirmation:{android:{...confirmation,state}}}}),true);
+// Build 453: the shared decision never moves a series whose old owner's record still says active (dedicated transfer only).
+assert.equal(permitsExpiredReassignment({...args,ownerSnapshot:{exists:true,data:()=>({ownerUid:'old',status:'active',updatedAt:now})}}),false);
+// Build 453: with the Android active-transfer fallback removed, the 15-minute client-confirmation window gates the shared decision again.
+assert.equal(permitsExpiredReassignment({...args,now:now+16*60*1000}),false);
+// Build 453: without the 'eligible' ended-contract confirmation the shared decision does not move an Android series (dedicated transfer only).
+for(const state of ['active','unknown','blocked']) assert.equal(permitsExpiredReassignment({...args,userData:{billingConfirmation:{android:{...confirmation,state}}}}),false);
 // iPhone: the shared expired-reassignment decision never moves an ACTIVE contract (dedicated transfer only).
 {
   const { evaluateOwnershipTransferProof, evaluateExpiredReassignment }=require('./expiredOwnershipProof');

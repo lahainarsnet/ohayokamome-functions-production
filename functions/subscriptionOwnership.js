@@ -1078,8 +1078,7 @@ async function claimOwnershipDocument(
     }
 
     if (existingOwnerSnap.exists) {
-      const update = expiredPreviousOwnerUpdate(existingOwnerSnap.data() || {}, platform, ownershipId, proof.expiryMs, admin,
-        { transferred: proof.source === "ownership_transferred_active" });
+      const update = expiredPreviousOwnerUpdate(existingOwnerSnap.data() || {}, platform, ownershipId, proof.expiryMs, admin);
       if (update) tx.set(existingOwnerRef, update, { merge: true });
     }
     for (const previous of linkedLegacyUpdates) tx.set(previous.ref, previous.update, { merge: true });
