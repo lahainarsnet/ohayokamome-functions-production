@@ -33,6 +33,47 @@ function legacyDenyReason(subscriptionStatus, legacyUsability, legacyExpiry) {
 }
 
 /**
+ * ケース⑬（Android → iPhone）・ケース⑭（iPhone → Android）: 同じUIDの、他OSの有効な契約を引き継ぐ向き。
+ * キー = 利用するOS、値 = 契約を引き継げる他のOS。
+ */
+const CROSS_PLATFORM_CARRY = Object.freeze({ ios: "android", android: "ios" });
+
+/**
+ * 指定OSのストア契約で利用権を判定する。現在のOSの契約が利用できないときだけ、
+ * [CROSS_PLATFORM_CARRY] の他OSの契約が現在利用できるかを見る（同じ判定を他OSに対して行うだけで、
+ * 記録のコピーはしない）。引き継いだ場合の判定元は `cross_platform`。
+ * `options.crossPlatform === false` で、他OSを見ない従来の判定になる。
+ */
+function evaluatePlatformEntitlement(
+  userData,
+  platform,
+  now = new Date(),
+  options = {}
+) {
+  const own = evaluateSinglePlatformEntitlement(userData, platform, now, options);
+  if (own.usable || options.crossPlatform === false) {
+    return own;
+  }
+  const carry = CROSS_PLATFORM_CARRY[own.platform];
+  if (!carry) {
+    return own;
+  }
+  const other = evaluateSinglePlatformEntitlement(userData, carry, now, options);
+  if (!other.usable) {
+    return own;
+  }
+  return {
+    ...other,
+    usable: true,
+    subscriptionUsable: true,
+    decisionSource: "cross_platform",
+    denyReason: null,
+    platform: own.platform,
+    sourcePlatform: carry,
+  };
+}
+
+/**
  * X案: 指定OSのストア契約だけを利用権として判定する。
  *
  * 正本: subscriptions.{ios|android}
@@ -41,7 +82,7 @@ function legacyDenyReason(subscriptionStatus, legacyUsability, legacyExpiry) {
  *
  * entitlementUsable / entitlementSource は見ない。
  */
-function evaluatePlatformEntitlement(
+function evaluateSinglePlatformEntitlement(
   userData,
   platform,
   now = new Date(),
@@ -120,6 +161,7 @@ function evaluatePlatformEntitlement(
 }
 
 module.exports = {
+  CROSS_PLATFORM_CARRY,
   hasStoreMap,
   evaluatePlatformEntitlement,
 };

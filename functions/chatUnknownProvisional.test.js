@@ -106,8 +106,9 @@ const crossPlatformWithProvisional = resolveChatEntitlementWithUnknownProvisiona
   "android",
   now,
 );
-assert.equal(crossPlatformWithProvisional.allowed, false);
-assert.equal(crossPlatformWithProvisional.dedicatedStop, true);
+// Case 14: an Active iPhone contract of the same UID is usable on the Android device.
+assert.equal(crossPlatformWithProvisional.allowed, true);
+assert.equal(crossPlatformWithProvisional.provisionalUsed, false);
 
 const unknownWithProvisional = resolveChatEntitlementWithUnknownProvisional(
   {

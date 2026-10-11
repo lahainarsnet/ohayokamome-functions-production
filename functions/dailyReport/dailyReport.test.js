@@ -12,10 +12,12 @@ const {
   incrementDailyReport,
   recordMessageSent,
   recordSttFailure,
+  isCancellationEvent,
   recordSubscriptionEventActivity,
 } = require("./increment");
 const {
   isDeletedUser,
+  classifyUser,
   trimTopBuckets,
   finalizeDailyReport,
 } = require("./eodSnapshot");
@@ -123,6 +125,17 @@ test("isDeletedUser accepts accountDeletionState and legacy deleted", () => {
   assert.equal(isDeletedUser({ accountDeletionState: "deleted" }), true);
   assert.equal(isDeletedUser({ deleted: true }), true);
   assert.equal(isDeletedUser({ accountDeletionState: "active" }), false);
+});
+
+test("daily snapshots separate account availability from trial and paid usage", () => {
+  assert.deepEqual(classifyUser({ subscriptionStatus: "trial", entitlementUsable: true }), {
+    deleted: false,
+    accountActive: true,
+    trial: true,
+    paidUsable: false,
+  });
+  assert.equal(classifyUser({ subscriptionStatus: "active", entitlementUsable: true }).paidUsable, true);
+  assert.equal(classifyUser({ accountDeletionState: "deleted", entitlementUsable: true }).accountActive, false);
 });
 
 test("trimTopBuckets keeps top N and other", () => {
@@ -284,4 +297,10 @@ test("recordSubscriptionEventActivity uses sanitized keys only", async () => {
   await new Promise((resolve) => setTimeout(resolve, 10));
   const json = JSON.stringify(store.get("2026-09-11") || {});
   assert.equal(json.includes("purchaseToken"), false);
+});
+
+test("only explicit store cancellation notices count as cancellations", () => {
+  assert.equal(isCancellationEvent({ notificationTypeName: "SUBSCRIPTION_CANCELED" }), true);
+  assert.equal(isCancellationEvent({ notificationType: "DID_CHANGE_RENEWAL_STATUS", subtype: "AUTO_RENEW_DISABLED" }), true);
+  assert.equal(isCancellationEvent({ notificationTypeName: "SUBSCRIPTION_EXPIRED" }), false);
 });

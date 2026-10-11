@@ -4,9 +4,9 @@ const { HttpsError } = require("firebase-functions/v2/https");
 const { SignedDataVerifier, Environment } = require("@apple/app-store-server-library");
 const { inspectSubscriptionSeriesOwnership, buildIosOwnershipId, buildAndroidOwnershipId } = require("./subscriptionOwnership");
 const { syncGooglePlaySubscriptionByPurchaseToken, GOOGLE_PLAY_PACKAGE_NAME,
-  GOOGLE_PLAY_MONTHLY_PRODUCT_ID } = require("./googlePlaySubscriptionNotifications");
+  GOOGLE_PLAY_MONTHLY_PRODUCT_ID, deriveGooglePlayEntitlement } = require("./googlePlaySubscriptionNotifications");
 const { fetchAppStoreAllSubscriptionStatuses, loadAppleRootCertificates,
-  APP_STORE_PRODUCT_ID, APP_STORE_BUNDLE_ID } = require("./appStoreServerCommon");
+  APP_STORE_PRODUCT_ID, APP_STORE_BUNDLE_ID, deriveSubscriptionState } = require("./appStoreServerCommon");
 const { buildAndroidStoreState, buildIosStoreState, computeAccountEntitlement,
   deriveLegacyAccountFields } = require("./subscriptionEntitlement");
 const { normalizeSubscriptionPlatform } = require("./accountAccessUsability");
@@ -137,25 +137,21 @@ function candidateSources(platform, data, supplied = []) {
 }
 function googleState(subscription, item, now = Date.now()) {
   if (!item || item.productId !== GOOGLE_PLAY_MONTHLY_PRODUCT_ID) return "unknown";
-  const state = subscription.subscriptionState;
-  const expiry = Date.parse(item.expiryTime);
-  if (["SUBSCRIPTION_STATE_ACTIVE", "SUBSCRIPTION_STATE_IN_GRACE_PERIOD",
-    "SUBSCRIPTION_STATE_CANCELED"].includes(state) && expiry > now) return "active";
-  if (["SUBSCRIPTION_STATE_PENDING", "SUBSCRIPTION_STATE_ON_HOLD",
-    "SUBSCRIPTION_STATE_PAUSED"].includes(state)) return "blocked";
-  if (state === "SUBSCRIPTION_STATE_EXPIRED" && Number.isFinite(expiry) && expiry <= now) return "ended";
+  const derived = deriveGooglePlayEntitlement({ subscription, matchedLineItem: item, now: new Date(now) });
+  if (derived.status === "active") return "active";
+  if (derived.status === "paused") return "blocked";
+  if (derived.status === "expired" && derived.expiryDate && derived.expiryDate.getTime() <= now) return "ended";
   return "unknown";
 }
 function appleState(status, transaction, renewal, now = Date.now()) {
-  if (transaction.bundleId !== APP_STORE_BUNDLE_ID || transaction.productId !== APP_STORE_PRODUCT_ID) return "unknown";
-  const expires = Number(transaction.expiresDate);
-  if (status === 1 && expires > now && !transaction.revocationDate) return "active";
-  if (status === 4 && Number(renewal?.gracePeriodExpiresDate) > now && !transaction.revocationDate) return "active";
-  if (status === 3) return "blocked";
-  if (status === 2 && Number.isFinite(expires) && expires > 0 && expires <= now) return "ended";
-  if (status === 5 && Number(transaction.revocationDate) > 0 && expires > 0) return "ended";
+  const derived = deriveSubscriptionState(transaction, now, { appleStatus: status, renewalInfo: renewal });
+  if (derived.status === "active") return "active";
+  if (derived.status === "paused") return "blocked";
+  if (derived.status === "revoked" && !(Number(transaction.revocationDate) > 0)) return "unknown";
+  if (["expired", "revoked"].includes(derived.status) && Number(transaction.expiresDate) > 0) return "ended";
   return "unknown";
 }
+
 function activeSeriesRepresentatives(entries, observed = []) {
   const groups = [];
   for (const entry of entries) {
@@ -242,7 +238,7 @@ async function verifyAppleSeries(identity, { secrets, getAppAppleId }) {
       if (transaction.productId !== APP_STORE_PRODUCT_ID) continue;
       const renewal = item.signedRenewalInfo ? await verifier.verifyAndDecodeRenewalInfo(item.signedRenewalInfo) : null;
       if (renewal && renewal.originalTransactionId !== transaction.originalTransactionId) throw new Error("renewal_series_mismatch");
-      entries.push({ state: appleState(Number(item.status), transaction, renewal), transaction, renewal,
+      entries.push({ state: appleState(Number(item.status), transaction, renewal), transaction, renewal, appleStatus: Number(item.status), storeObservedAtMs: response.storeObservedAtMs,
         originalTransactionId: transaction.originalTransactionId,
         expiryMs: Number(item.status) === 4 ? Number(renewal?.gracePeriodExpiresDate) : Number(transaction.expiresDate) });
     }
@@ -540,7 +536,7 @@ function createPreChatBillingHandlers({ getDb, admin, secrets, getAppAppleId, cu
             purchaseSeriesRef: candidateRef,
             candidateRole: currentOnly ? "current_contract" : activePointer ? "verified_active_platform_pointer" : "legacy_or_store_candidate",
             candidateSources: [...(candidateOrigins.get(identity) || [])].sort() };
-          const { subscription, matchedLineItem } = await diagnosticAwait(logger, operationId, "google_play.developer_api.verify", () =>
+          const { subscription, matchedLineItem, storeObservedAtMs } = await diagnosticAwait(logger, operationId, "google_play.developer_api.verify", () =>
             verifyGoogle(GOOGLE_PLAY_PACKAGE_NAME, identity), googleApiContext);
           const accountId = subscription.externalAccountIdentifiers?.obfuscatedExternalAccountId;
           const uidProof = typeof accountId === "string" && accountId === hash(`kamome-account:${uid}`);
@@ -558,7 +554,7 @@ function createPreChatBillingHandlers({ getDb, admin, secrets, getAppAppleId, cu
           }
           const owner = await checkedOwner({ purchaseToken: identity, linkedPurchaseToken: subscription.linkedPurchaseToken || "" }, uidProof, ownershipState, linkedState);
           entries.push({ state: googleState(subscription, matchedLineItem), owner: owner === "recoverable" ? "match" : owner,
-            recoverableOwner: owner === "recoverable", identity,
+            recoverableOwner: owner === "recoverable", identity, storeObservedAtMs,
             identities: [identity, subscription.linkedPurchaseToken].filter(Boolean).map((id) => seriesIdentity("android", id)),
             expiryMs: Date.parse(matchedLineItem?.expiryTime), subscription, matchedLineItem });
         } else {
@@ -801,11 +797,26 @@ function createPreChatBillingHandlers({ getDb, admin, secrets, getAppAppleId, cu
         if (ownedEntries.length) {
           const eligibleEntries = ownedEntries.filter((entry) => result.state === "active" ? entry.state === "active" : entry.state === "ended");
           const newest = eligibleEntries.reduce((a, b) => a.expiryMs >= b.expiryMs ? a : b);
+          const normalized = input.platform === "android"
+            ? deriveGooglePlayEntitlement({ subscription: newest.subscription, matchedLineItem: newest.matchedLineItem })
+            : deriveSubscriptionState(newest.transaction, Date.now(), { appleStatus: newest.appleStatus, renewalInfo: newest.renewal, storeObservedAtMs: newest.storeObservedAtMs });
+          const deadlineFields = input.platform === "android" ? {
+            expirySource: normalized.expirySource, normalExpiryTime: normalized.normalExpiryTime,
+            graceExpiryTime: normalized.graceExpiryTime, storeObservedAtMs: newest.storeObservedAtMs,
+          } : {
+            expirySource: normalized.expirySource,
+            normalExpiryTime: normalized.normalExpiresDate > 0 ? admin.Timestamp.fromMillis(normalized.normalExpiresDate) : null,
+            graceExpiryTime: normalized.graceExpiresDate > 0 ? admin.Timestamp.fromMillis(normalized.graceExpiresDate) : null,
+            storeObservedAtMs: newest.storeObservedAtMs,
+            storeTransactionTimeMs: normalized.storeTransactionTimeMs,
+          };
+          if (Number(stored.subscriptions?.[input.platform]?.storeObservedAtMs) > Number(newest.storeObservedAtMs || 0) && newest.storeObservedAtMs > 0) return { state: "not_applied" };
           const storeState = input.platform === "android" ? buildAndroidStoreState({
+            ...deadlineFields,
             status: result.state === "active" ? "active" : "expired", expiryTime: admin.Timestamp.fromMillis(newest.expiryMs),
             primaryPurchaseToken: newest.identity, activePurchaseTokens: [...new Set(ownedEntries.map((entry) => entry.identity))],
             subscriptionState: newest.subscription.subscriptionState, source: "prechat_verified_sync", updatedAt: now,
-          }) : buildIosStoreState({ status: result.state === "active" ? "active" : "expired",
+          }) : buildIosStoreState({ ...deadlineFields, status: normalized.status === "revoked" ? "revoked" : result.state === "active" ? "active" : "expired",
             expiryTime: admin.Timestamp.fromMillis(newest.expiryMs), originalTransactionId: newest.originalTransactionId,
             transactionId: newest.transaction.transactionId, environment: newest.transaction.environment,
             source: "prechat_verified_sync", updatedAt: now });

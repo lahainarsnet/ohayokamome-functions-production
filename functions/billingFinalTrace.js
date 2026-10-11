@@ -77,6 +77,19 @@ function createBillingFinalLogger(baseLogger, { traceId, deviceSwitchTraceId, ui
   };
 }
 
+// Error details sent to the app may name another user's UID; keep only its tail in logs.
+function maskErrorDetails(details) {
+  if (!details || typeof details !== "object" || Array.isArray(details)) {
+    return details || null;
+  }
+  const masked = { ...details };
+  if (typeof masked.ownerUid === "string" && masked.ownerUid) {
+    masked.ownerUidTail = masked.ownerUid.slice(-6);
+    delete masked.ownerUid;
+  }
+  return masked;
+}
+
 function summarizeHttpsError(error) {
   if (!error) {
     return null;
@@ -84,7 +97,7 @@ function summarizeHttpsError(error) {
   return {
     code: error.code || null,
     message: error.message || null,
-    details: error.details || null,
+    details: maskErrorDetails(error.details),
   };
 }
 

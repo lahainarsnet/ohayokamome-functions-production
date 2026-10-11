@@ -135,142 +135,25 @@ function pickMatchedLineItem(lineItems) {
   });
 }
 
-function deriveGooglePlayEntitlement({
-  subscription,
-  matchedLineItem,
-  notificationType,
-  forceExpired = false,
-}) {
+function deriveGooglePlayEntitlement({ subscription, matchedLineItem, notificationType, forceExpired = false, now = new Date() }) {
   const subscriptionState = String(subscription?.subscriptionState || "");
   const expiryDate = parseApiExpiryTime(matchedLineItem?.expiryTime);
-  const now = new Date();
-  const expiryIsFuture =
-    expiryDate instanceof Date &&
-    !Number.isNaN(expiryDate.getTime()) &&
-    expiryDate.getTime() > now.getTime();
-
-  if (forceExpired) {
-    return {
-      status: "expired",
-      expiryTime: matchedLineItem?.expiryTime || null,
-      expiryDate,
-      subscriptionState,
-      latestOrderId: subscription?.latestOrderId || "",
-      acknowledgementState: subscription?.acknowledgementState || "",
-      testPurchase: Boolean(subscription?.testPurchase),
-      linkedPurchaseToken: subscription?.linkedPurchaseToken || "",
-    };
-  }
-
-  if (
-    subscriptionState === "SUBSCRIPTION_STATE_ACTIVE" &&
-    expiryIsFuture
-  ) {
-    return {
-      status: "active",
-      expiryTime: matchedLineItem.expiryTime,
-      expiryDate,
-      subscriptionState,
-      latestOrderId: subscription?.latestOrderId || "",
-      acknowledgementState: subscription?.acknowledgementState || "",
-      testPurchase: Boolean(subscription?.testPurchase),
-      linkedPurchaseToken: subscription?.linkedPurchaseToken || "",
-    };
-  }
-
-  if (
-    subscriptionState === "SUBSCRIPTION_STATE_IN_GRACE_PERIOD" &&
-    expiryIsFuture
-  ) {
-    return {
-      status: "active",
-      expiryTime: matchedLineItem.expiryTime,
-      expiryDate,
-      subscriptionState,
-      latestOrderId: subscription?.latestOrderId || "",
-      acknowledgementState: subscription?.acknowledgementState || "",
-      testPurchase: Boolean(subscription?.testPurchase),
-      linkedPurchaseToken: subscription?.linkedPurchaseToken || "",
-    };
-  }
-
-  if (
-    subscriptionState === "SUBSCRIPTION_STATE_CANCELED" &&
-    expiryIsFuture
-  ) {
-    return {
-      status: "active",
-      expiryTime: matchedLineItem.expiryTime,
-      expiryDate,
-      subscriptionState,
-      latestOrderId: subscription?.latestOrderId || "",
-      acknowledgementState: subscription?.acknowledgementState || "",
-      testPurchase: Boolean(subscription?.testPurchase),
-      linkedPurchaseToken: subscription?.linkedPurchaseToken || "",
-    };
-  }
-
-  if (subscriptionState === "SUBSCRIPTION_STATE_EXPIRED") {
-    return {
-      status: "expired",
-      expiryTime: matchedLineItem?.expiryTime || null,
-      expiryDate,
-      subscriptionState,
-      latestOrderId: subscription?.latestOrderId || "",
-      acknowledgementState: subscription?.acknowledgementState || "",
-      testPurchase: Boolean(subscription?.testPurchase),
-      linkedPurchaseToken: subscription?.linkedPurchaseToken || "",
-    };
-  }
-
-  if (subscriptionState === "SUBSCRIPTION_STATE_ON_HOLD") {
-    return {
-      status: "paused",
-      expiryTime: matchedLineItem?.expiryTime || null,
-      expiryDate,
-      subscriptionState,
-      latestOrderId: subscription?.latestOrderId || "",
-      acknowledgementState: subscription?.acknowledgementState || "",
-      testPurchase: Boolean(subscription?.testPurchase),
-      linkedPurchaseToken: subscription?.linkedPurchaseToken || "",
-    };
-  }
-
-  if (subscriptionState === "SUBSCRIPTION_STATE_PAUSED") {
-    return {
-      status: "paused",
-      expiryTime: matchedLineItem?.expiryTime || null,
-      expiryDate,
-      subscriptionState,
-      latestOrderId: subscription?.latestOrderId || "",
-      acknowledgementState: subscription?.acknowledgementState || "",
-      testPurchase: Boolean(subscription?.testPurchase),
-      linkedPurchaseToken: subscription?.linkedPurchaseToken || "",
-    };
-  }
-
-  if (!expiryIsFuture) {
-    return {
-      status: "expired",
-      expiryTime: matchedLineItem?.expiryTime || null,
-      expiryDate,
-      subscriptionState,
-      latestOrderId: subscription?.latestOrderId || "",
-      acknowledgementState: subscription?.acknowledgementState || "",
-      testPurchase: Boolean(subscription?.testPurchase),
-      linkedPurchaseToken: subscription?.linkedPurchaseToken || "",
-    };
-  }
-
+  const future = expiryDate && expiryDate.getTime() > now.getTime();
+  const grace = subscriptionState === "SUBSCRIPTION_STATE_IN_GRACE_PERIOD";
+  let status = "unknown";
+  if (forceExpired || Number(notificationType) === REVOKED_NOTIFICATION_TYPE) status = "expired";
+  else if (["SUBSCRIPTION_STATE_ACTIVE", "SUBSCRIPTION_STATE_IN_GRACE_PERIOD", "SUBSCRIPTION_STATE_CANCELED"].includes(subscriptionState)) {
+    status = expiryDate ? (future ? "active" : subscriptionState === "SUBSCRIPTION_STATE_CANCELED" ? "expired" : "unknown") : "unknown";
+  } else if (subscriptionState === "SUBSCRIPTION_STATE_EXPIRED") status = "expired";
+  else if (["SUBSCRIPTION_STATE_ON_HOLD", "SUBSCRIPTION_STATE_PAUSED", "SUBSCRIPTION_STATE_PENDING", "SUBSCRIPTION_STATE_PENDING_PURCHASE_CANCELED"].includes(subscriptionState)) status = "paused";
   return {
-    status: "none",
-    expiryTime: matchedLineItem?.expiryTime || null,
-    expiryDate,
-    subscriptionState,
-    latestOrderId: subscription?.latestOrderId || "",
+    status, expiryTime: matchedLineItem?.expiryTime || null, expiryDate,
+    expirySource: grace ? "grace" : "normal",
+    normalExpiryTime: grace ? null : matchedLineItem?.expiryTime || null,
+    graceExpiryTime: grace ? matchedLineItem?.expiryTime || null : null,
+    subscriptionState, latestOrderId: subscription?.latestOrderId || "",
     acknowledgementState: subscription?.acknowledgementState || "",
-    testPurchase: Boolean(subscription?.testPurchase),
-    linkedPurchaseToken: subscription?.linkedPurchaseToken || "",
+    testPurchase: Boolean(subscription?.testPurchase), linkedPurchaseToken: subscription?.linkedPurchaseToken || "",
   };
 }
 
@@ -290,6 +173,7 @@ async function createAndroidPublisherClient() {
 }
 
 async function syncGooglePlaySubscriptionByPurchaseToken(packageName, purchaseToken) {
+  const storeObservedAtMs = Date.now();
   const androidpublisher = await createAndroidPublisherClient();
   const response = await androidpublisher.purchases.subscriptionsv2.get({
     packageName,
@@ -297,7 +181,7 @@ async function syncGooglePlaySubscriptionByPurchaseToken(packageName, purchaseTo
   });
   const subscription = response.data || {};
   const matchedLineItem = pickMatchedLineItem(subscription.lineItems);
-  return { subscription, matchedLineItem };
+  return { subscription, matchedLineItem, storeObservedAtMs };
 }
 
 function isRevocationNotification(forceExpired, notificationType) {
@@ -479,7 +363,7 @@ function resolveRevocationUserEntitlement({
 
 async function syncEntitlementForToken(packageName, purchaseToken) {
   try {
-    const { subscription, matchedLineItem } =
+    const { subscription, matchedLineItem, storeObservedAtMs } =
       await syncGooglePlaySubscriptionByPurchaseToken(packageName, purchaseToken);
     const derived = deriveGooglePlayEntitlement({
       subscription,
@@ -487,6 +371,7 @@ async function syncEntitlementForToken(packageName, purchaseToken) {
       notificationType: null,
       forceExpired: false,
     });
+    derived.storeObservedAtMs = storeObservedAtMs;
     const knownState = [
       "SUBSCRIPTION_STATE_ACTIVE", "SUBSCRIPTION_STATE_IN_GRACE_PERIOD",
       "SUBSCRIPTION_STATE_CANCELED", "SUBSCRIPTION_STATE_EXPIRED",
@@ -1007,7 +892,11 @@ async function applyGoogleSubscriptionUpdateToUser(
     ...staleFields,
   });
 
-  if (evaluation.skipped) {
+  const priorStore = existingData.subscriptions?.android;
+  const freshSameSeries = derived.storeObservedAtMs > Number(priorStore?.storeObservedAtMs || 0) &&
+    Number(priorStore?.storeObservedAtMs) > 0 && purchaseToken &&
+    purchaseToken === String(priorStore.primaryPurchaseToken || existingData.googlePlayPrimaryPurchaseToken || "");
+  if (evaluation.skipped && !freshSameSeries) {
     logAndroidStaleTrace(options.logger, {
       step: "stale_skip",
       source: staleSource,
@@ -1077,6 +966,10 @@ async function applyGoogleSubscriptionUpdateToUser(
 
   const storeState = buildAndroidStoreState({
     status: derived.status,
+    expirySource: derived.expirySource,
+    normalExpiryTime: derived.normalExpiryTime,
+    graceExpiryTime: derived.graceExpiryTime,
+    storeObservedAtMs: derived.storeObservedAtMs,
     expiryTime: derived.expiryTime || null,
     autoRenewing,
     primaryPurchaseToken,
@@ -1455,6 +1348,7 @@ function createGooglePlayRtdnHandler({ getDb, admin, logger }) {
         forceExpired,
       });
 
+      derived.storeObservedAtMs = developerApiStartedAt;
       if (!linkedPurchaseToken && derived.linkedPurchaseToken) {
         linkedPurchaseToken = derived.linkedPurchaseToken;
       }

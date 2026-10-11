@@ -115,15 +115,25 @@ function recordSubscriptionEventActivity(fields = {}, options = {}) {
   const platform = sanitizeMetricKey(fields.platform, "unknown");
   const notificationType = sanitizeMetricKey(fields.notificationType || fields.type, "unknown");
   const status = sanitizeMetricKey(fields.status, "unknown");
-  scheduleIncrement(
-    {
-      "activity.billing.subscriptionEvents.total": 1,
-      [`activity.billing.subscriptionEvents.byPlatform.${platform}`]: 1,
-      [`activity.billing.subscriptionEvents.byType.${notificationType}`]: 1,
-      [`activity.billing.subscriptionEvents.byStatus.${status}`]: 1,
-    },
-    { ...options, context: "dailyReport.billing.subscriptionEvent" },
-  );
+  const increments = {
+    "activity.billing.subscriptionEvents.total": 1,
+    [`activity.billing.subscriptionEvents.byPlatform.${platform}`]: 1,
+    [`activity.billing.subscriptionEvents.byType.${notificationType}`]: 1,
+    [`activity.billing.subscriptionEvents.byStatus.${status}`]: 1,
+  };
+  if (isCancellationEvent(fields)) {
+    const period = String(fields.subscriptionStatus || "").toLowerCase() === "trial" ? "trial" : "paid";
+    increments["activity.billing.cancellations.total"] = 1;
+    increments[`activity.billing.cancellations.${period}`] = 1;
+  }
+  scheduleIncrement(increments, { ...options, context: "dailyReport.billing.subscriptionEvent" });
+}
+
+// Only explicit store cancellation notices are counted.  Expiry, a failed
+// renewal, and a transient billing state are intentionally not cancellations.
+function isCancellationEvent(fields = {}) {
+  const type = `${fields.notificationTypeName || ""} ${fields.notificationType || ""} ${fields.subtype || ""}`.toUpperCase();
+  return type.includes("SUBSCRIPTION_CANCELED") || type.includes("AUTO_RENEW_DISABLED");
 }
 
 module.exports = {
@@ -137,5 +147,6 @@ module.exports = {
   recordSttSuccess,
   recordSttFailure,
   recordAccountDeletion,
+  isCancellationEvent,
   recordSubscriptionEventActivity,
 };

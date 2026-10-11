@@ -259,6 +259,8 @@ function createClaimActiveDeviceHandler({ admin, logger }) {
             uidSuffix, newDeviceIdSuffix, platform: verifiedPlatform,
             deviceSwitchTraceId: input.deviceSwitchTraceId,
             usable: entitlement.usable, decisionSource: entitlement.decisionSource,
+            // Case 13: the Android contract that an iPhone transfer relied on (null for the iPhone's own contract).
+            sourcePlatform: entitlement.sourcePlatform || null,
             contractState: entitlement.usable ? "active"
               : ["legacy_other_platform", "invalid_platform", "legacy_platform_mismatch"].includes(entitlement.denyReason) ? "dedicatedStop"
               : entitlement.status === "none" ? "noPurchase"

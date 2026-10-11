@@ -117,20 +117,24 @@ async function receiverBehavior() {
         ['none', true, false, 'noPurchase'], ['', true, true, 'unknown'],
         ['', false, false, 'unknown'], ['unrecognized', false, false, 'unknown'],
       ]) {
+        // Cases 13 and 14: either device may use an Active contract of the other OS under the same UID.
+        const carried = true;
         const data = {
-          // Aggregate Active from the other OS must not override current OS.
+          // Aggregate Active (entitlementUsable) from the other OS must not override the current OS by itself.
           entitlementUsable: true, entitlementExpiryTime: future,
           subscriptions: { [receiver]: { status, expiryTime: future }, [other]: { status: 'active', expiryTime: future } },
           chatUnknownProvisionalUntil: grace ? future : now,
         };
         const result = resolveRecipientChatEntitlement(data, info, now);
-        assert.equal(result.allowed, allowed, `${sender}->${receiver}:${status}:${grace}`);
-        assert.equal(result.contractState, state);
+        assert.equal(result.allowed, carried ? true : allowed, `${sender}->${receiver}:${status}:${grace}`);
+        assert.equal(result.contractState, carried ? 'active' : state);
+        if (carried) assert.equal(result.provisionalUsed, false, 'a carried Active contract does not need the provisional allowance');
         assert.equal(result.platform, receiver); cases++;
       }
       const otherOsOnly = { subscriptionPlatform: other, subscriptionStatus: 'active', subscriptionExpiryTime: future, chatUnknownProvisionalUntil: future };
       const stop = resolveRecipientChatEntitlement(otherOsOnly, info, now);
-      assert.equal(stop.allowed, false); assert.equal(stop.contractState, 'dedicatedStop'); cases++;
+      assert.equal(stop.allowed, true); assert.equal(stop.contractState, 'active');
+      cases++;
     }
   }
   const unresolvedUnknown = { subscriptionPlatform: 'ios', subscriptionStatus: '', chatUnknownProvisionalUntil: future };

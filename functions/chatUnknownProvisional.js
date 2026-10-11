@@ -3,13 +3,16 @@
 const { HttpsError } = require("firebase-functions/v2/https");
 const { evaluatePlatformEntitlement } = require("./platformEntitlement");
 const {
-  assertActiveDeviceAllowed,
   evaluateActiveDeviceGate,
 } = require("./activeDeviceGate");
 
 const CHAT_UNKNOWN_PROVISIONAL_UNTIL = "chatUnknownProvisionalUntil";
 const CHAT_UNKNOWN_PROVISIONAL_STREAK = "chatUnknownProvisionalUnknownStreak";
 const CHAT_UNKNOWN_PROVISIONAL_UPDATED_AT = "chatUnknownProvisionalUpdatedAt";
+
+const CHAT_UNKNOWN_PROVISIONAL_STARTED_AT = "chatUnknownProvisionalStartedAt";
+const PROVISIONAL_LIMIT_MS = 120 * 60 * 60 * 1000;
+const PROVISIONAL_LIMIT_CODE = "CHAT_UNKNOWN_PROVISIONAL_LIMIT_REACHED";
 
 const PROVISIONAL_MS = 24 * 60 * 60 * 1000;
 const LOG_TAG = "KAMOME_CHAT_UNKNOWN_PROVISIONAL";
@@ -81,17 +84,30 @@ function parseChatUnknownProvisionalUntil(value) {
   return null;
 }
 
+// Old test records adopt their earliest available issuance timestamp on the
+// next write. No migration job or client clock is required.
+function provisionalStartedAt(data, now) {
+  if (data && Object.prototype.hasOwnProperty.call(data, CHAT_UNKNOWN_PROVISIONAL_STARTED_AT)) {
+    const value = parseChatUnknownProvisionalUntil(data[CHAT_UNKNOWN_PROVISIONAL_STARTED_AT]);
+    // Corrupt/future anchors must not restart a rescue period.
+    return value && value <= now ? value : new Date(0);
+  }
+  const until = parseChatUnknownProvisionalUntil(data && data[CHAT_UNKNOWN_PROVISIONAL_UNTIL]);
+  const updated = parseChatUnknownProvisionalUntil(data && data[CHAT_UNKNOWN_PROVISIONAL_UPDATED_AT]);
+  const candidates = [updated, until && new Date(until.getTime() - PROVISIONAL_MS)]
+    .filter(date => date && date <= now);
+  if (candidates.length) return new Date(Math.min(...candidates.map(date => date.getTime())));
+  return until ? now : null;
+}
+
 function isChatUnknownProvisionalActive(userData, now = new Date()) {
-  const until = parseChatUnknownProvisionalUntil(
-    userData && userData[CHAT_UNKNOWN_PROVISIONAL_UNTIL],
-  );
-  if (!until) {
-    return { active: false, until: null };
-  }
-  if (until.getTime() > now.getTime()) {
-    return { active: true, until };
-  }
-  return { active: false, until, expired: true };
+  const until = parseChatUnknownProvisionalUntil(userData && userData[CHAT_UNKNOWN_PROVISIONAL_UNTIL]);
+  const startedAt = provisionalStartedAt(userData, now);
+  const limitAt = startedAt && new Date(startedAt.getTime() + PROVISIONAL_LIMIT_MS);
+  if (limitAt && now >= limitAt) return { active: false, until, limitReached: true };
+  if (!until) return { active: false, until: null };
+  const effectiveUntil = limitAt ? new Date(Math.min(until.getTime(), limitAt.getTime())) : until;
+  return { active: effectiveUntil > now, until: effectiveUntil, expired: effectiveUntil <= now };
 }
 
 /**
@@ -100,7 +116,7 @@ function isChatUnknownProvisionalActive(userData, now = new Date()) {
  */
 function classifyLegacyStatusInactive(status) {
   const normalizedStatus = String(status || "").trim().toLowerCase();
-  if (normalizedStatus === "expired") {
+  if (["expired", "paused", "refunded", "revoked", "inactive"].includes(normalizedStatus)) {
     return CHAT_CONTRACT_OUTCOME.expired;
   }
   if (normalizedStatus === "none") {
@@ -230,6 +246,11 @@ function resolveChatEntitlementWithUnknownProvisional(
     };
   }
   const provisional = isChatUnknownProvisionalActive(userData, now);
+  if (provisional.limitReached) {
+    return { allowed: false, decision, provisionalUsed: false,
+      contractState: CHAT_CONTRACT_OUTCOME.unknown, provisionalLimitReached: true,
+      denyReason: PROVISIONAL_LIMIT_CODE };
+  }
   if (provisional.active) {
     return {
       allowed: true,
@@ -255,6 +276,7 @@ function rejectClientControlledProvisionalFields(data) {
   }
   const forbidden = [
     CHAT_UNKNOWN_PROVISIONAL_UNTIL,
+    CHAT_UNKNOWN_PROVISIONAL_STARTED_AT,
     CHAT_UNKNOWN_PROVISIONAL_STREAK,
     "until",
     "untilMillis",
@@ -277,8 +299,9 @@ function rejectClientControlledProvisionalFields(data) {
   }
 }
 
-function provisionalClearPatch(admin) {
+function provisionalClearPatch(admin, resetStartedAt = false) {
   return {
+    ...(resetStartedAt ? { [CHAT_UNKNOWN_PROVISIONAL_STARTED_AT]: admin.FieldValue.delete() } : {}),
     [CHAT_UNKNOWN_PROVISIONAL_UNTIL]: admin.FieldValue.delete(),
     [CHAT_UNKNOWN_PROVISIONAL_STREAK]: admin.FieldValue.delete(),
     [CHAT_UNKNOWN_PROVISIONAL_UPDATED_AT]:
@@ -291,6 +314,7 @@ function createRecordChatUnknownProvisionalHandler({
   logger,
   platformFromAppCheckAppId,
   parseExpiryWithMeta,
+  clock = () => new Date(),
 }) {
   return async (request) => {
     const uid = request.auth && request.auth.uid;
@@ -313,7 +337,7 @@ function createRecordChatUnknownProvisionalHandler({
         uid, data: request.data, getUserData: async () => data,
       });
       if (!deviceGate.ok) throw deviceGate.httpsError;
-      const now = new Date();
+      const now = clock();
       const classified = classifyChatPlatformEntitlement(data, platform, now, entitlementOptions);
       const metadata = {
         contractState: classified.contractState,
@@ -321,17 +345,32 @@ function createRecordChatUnknownProvisionalHandler({
         decisionSource: classified.decision.decisionSource,
       };
       if (classified.contractState !== CHAT_CONTRACT_OUTCOME.unknown) {
-        transaction.set(userRef, provisionalClearPatch(admin), { merge: true });
+        const active = classified.contractState === CHAT_CONTRACT_OUTCOME.active;
+        const startedAt = provisionalStartedAt(data, now);
+        transaction.set(userRef, { ...provisionalClearPatch(admin, active),
+          ...(!active && startedAt ? { [CHAT_UNKNOWN_PROVISIONAL_STARTED_AT]: admin.Timestamp.fromDate(startedAt) } : {}),
+        }, { merge: true });
         return {
           ...metadata, outcome: classified.contractState, recorded: false,
           ...(classified.contractState === CHAT_CONTRACT_OUTCOME.dedicatedStop
             ? { stopReason: classified.decision.denyReason || null } : {}),
         };
       }
-      const until = new Date(now.getTime() + PROVISIONAL_MS);
+      const startedAt = provisionalStartedAt(data, now) || now;
+      const limitAt = new Date(startedAt.getTime() + PROVISIONAL_LIMIT_MS);
+      if (now >= limitAt) {
+        transaction.set(userRef, {
+          ...provisionalClearPatch(admin),
+          [CHAT_UNKNOWN_PROVISIONAL_STARTED_AT]: admin.Timestamp.fromDate(startedAt),
+        }, { merge: true });
+        return { ...metadata, outcome: CHAT_CONTRACT_OUTCOME.dedicatedStop,
+          recorded: false, stopReason: PROVISIONAL_LIMIT_CODE };
+      }
+      const until = new Date(Math.min(now.getTime() + PROVISIONAL_MS, limitAt.getTime()));
       const prev = Number(data[CHAT_UNKNOWN_PROVISIONAL_STREAK] || 0);
       const unknownStreak = Number.isFinite(prev) && prev > 0 ? prev + 1 : 1;
       transaction.set(userRef, {
+        [CHAT_UNKNOWN_PROVISIONAL_STARTED_AT]: admin.Timestamp.fromDate(startedAt),
         [CHAT_UNKNOWN_PROVISIONAL_UNTIL]: admin.Timestamp.fromDate(until),
         [CHAT_UNKNOWN_PROVISIONAL_STREAK]: unknownStreak,
         [CHAT_UNKNOWN_PROVISIONAL_UPDATED_AT]: admin.FieldValue.serverTimestamp(),
@@ -346,6 +385,7 @@ function createRecordChatUnknownProvisionalHandler({
         action: result.recorded ? "record" : "recordRejected",
         uidSuffix: uidTail(uid), platform, contractState: result.contractState,
         denyReason: result.denyReason, decisionSource: result.decisionSource,
+        stopReason: result.stopReason || null,
         ...(result.recorded ? {
           unknownStreak: result.unknownStreak,
           provisionalUntilIso: new Date(result.untilMillis).toISOString(),
@@ -357,36 +397,42 @@ function createRecordChatUnknownProvisionalHandler({
   };
 }
 
-function createClearChatUnknownProvisionalHandler({ admin, logger }) {
+function createClearChatUnknownProvisionalHandler({ admin, logger,
+  platformFromAppCheckAppId = require("./appCheckPlatform").platformFromAppCheckAppId,
+  clock = () => new Date() }) {
   return async (request) => {
     const uid = request.auth && request.auth.uid;
-    if (!uid) {
-      throw new HttpsError("unauthenticated", "Sign-in is required.");
-    }
+    if (!uid) throw new HttpsError("unauthenticated", "Sign-in is required.");
     rejectClientControlledProvisionalFields(request.data);
-    await assertActiveDeviceAllowed({
-      admin,
-      uid,
-      data: request.data,
-    });
-
-    const userRef = admin.getDb().collection("users").doc(uid);
-    await userRef.set(provisionalClearPatch(admin), { merge: true });
-
-    try {
-      logger.info(LOG_TAG, {
-        action: "clear",
-        uidSuffix: uidTail(uid),
-      });
-    } catch (_) {
-      // logging must not block
+    const platform = platformFromAppCheckAppId(request.app && request.app.appId);
+    if (platform !== "ios" && platform !== "android") {
+      throw new HttpsError("failed-precondition", "UNKNOWN_APP_ID", { code: "UNKNOWN_APP_ID" });
     }
-
+    const userRef = admin.getDb().collection("users").doc(uid);
+    const resetStartedAt = await admin.getDb().runTransaction(async transaction => {
+      const snap = await transaction.get(userRef);
+      if (!snap.exists) throw new HttpsError("not-found", "User document not found.");
+      const data = snap.data() || {};
+      const deviceGate = await evaluateActiveDeviceGate({ uid, data: request.data, getUserData: async () => data });
+      if (!deviceGate.ok) throw deviceGate.httpsError;
+      const now = clock();
+      const active = classifyChatPlatformEntitlement(data, platform, now).contractState === CHAT_CONTRACT_OUTCOME.active;
+      const startedAt = provisionalStartedAt(data, now);
+      transaction.set(userRef, { ...provisionalClearPatch(admin, active),
+        ...(!active && startedAt ? { [CHAT_UNKNOWN_PROVISIONAL_STARTED_AT]: admin.Timestamp.fromDate(startedAt) } : {}),
+      }, { merge: true });
+      return active;
+    });
+    try { logger.info(LOG_TAG, { action: "clear", uidSuffix: uidTail(uid), platform, resetStartedAt }); }
+    catch (_) { /* logging must not block */ }
     return { ok: true, outcome: "cleared" };
   };
 }
 
 module.exports = {
+  CHAT_UNKNOWN_PROVISIONAL_STARTED_AT,
+  PROVISIONAL_LIMIT_MS,
+  PROVISIONAL_LIMIT_CODE,
   CHAT_UNKNOWN_PROVISIONAL_UNTIL,
   CHAT_UNKNOWN_PROVISIONAL_STREAK,
   CHAT_CONTRACT_OUTCOME,

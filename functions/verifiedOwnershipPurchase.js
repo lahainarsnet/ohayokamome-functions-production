@@ -7,6 +7,7 @@ async function verifiedGoogleOwnershipFacts({ db, uid, purchaseToken, subscripti
   const { googleState } = require("./preChatBillingConfirmation");
   const expected = crypto.createHash("sha256").update(`kamome-account:${uid}`).digest("hex");
   const facts = { uidBound: subscription.externalAccountIdentifiers?.obfuscatedExternalAccountId === expected,
+    accountTag: subscription.externalAccountIdentifiers?.obfuscatedExternalAccountId || "",
     purchasedAt: Date.parse(subscription.startTime), active: googleState(subscription, matchedLineItem) === "active" };
   const linkedToken = String(subscription.linkedPurchaseToken || "").trim();
   if (!linkedToken || linkedToken === purchaseToken) return facts;
@@ -14,6 +15,8 @@ async function verifiedGoogleOwnershipFacts({ db, uid, purchaseToken, subscripti
   facts.linkedState = googleState(linked.subscription, linked.matchedLineItem);
   const ownershipId = buildAndroidOwnershipId(linkedToken);
   facts.linkedOwnershipId = ownershipId;
+  // Google's own end time of the linked (older) token; used to prove it ended before this purchase began.
+  facts.linkedExpiryMs = Date.parse(linked.matchedLineItem?.expiryTime);
   const owner = await db.collection("subscription_ownership").doc(ownershipId).get();
   const ownerUid = owner.exists ? String(owner.get("ownerUid") || "") : "";
   facts.linkedLegacyOwners = [];
@@ -31,7 +34,6 @@ async function verifiedGoogleOwnershipFacts({ db, uid, purchaseToken, subscripti
       const user = await db.collection("users").doc(otherUid).get();
       facts.linkedLegacyOwners.push({ ownerUid: otherUid, fingerprint: fingerprint(user) });
     }
-    facts.linkedExpiryMs = Date.parse(linked.matchedLineItem?.expiryTime);
   }
   if (ownerUid && ownerUid !== uid) {
     if (facts.linkedState === "active") throw new HttpsError("failed-precondition", SUBSCRIPTION_ALREADY_LINKED_CODE, {code: SUBSCRIPTION_ALREADY_LINKED_CODE});

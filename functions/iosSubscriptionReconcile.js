@@ -336,6 +336,9 @@ function createReconcileIosSubscriptionHandler({
       throw new HttpsError("unauthenticated", "Authentication required.");
     }
     const uid = request.auth.uid;
+    // ケース⑭: Android の購入前確認など、Apple の契約状態を見るだけの呼び出し。
+    // ロック・Firestore の書き込みをしない（契約情報・端末所有権を変えない）。
+    const probeOnly = request.data?.probeOnly === true;
     const db = getDb();
     const startedAt = Date.now();
     const reconcileTraceId =
@@ -356,7 +359,9 @@ function createReconcileIosSubscriptionHandler({
     };
 
     try {
-      const lock = await acquireReconcileLock(db, admin, uid);
+      const lock = probeOnly
+        ? { acquired: true, lockUntilMs: 0 }
+        : await acquireReconcileLock(db, admin, uid);
       if (!lock.acquired) {
         logger.info(RECONCILE_TRACE, {
           step: "lock.conflict",
@@ -368,7 +373,7 @@ function createReconcileIosSubscriptionHandler({
           code: "RECONCILE_IN_FLIGHT",
         });
       }
-      lockAcquired = true;
+      lockAcquired = !probeOnly;
       lockUntilMs = lock.lockUntilMs;
       logger.info(RECONCILE_TRACE, {
         step: "lock.acquired",
@@ -416,8 +421,8 @@ function createReconcileIosSubscriptionHandler({
           environmentHint,
           secrets,
           {
-            maxHttpAttempts: 6,
-            deadlineMs: 52_000,
+            maxHttpAttempts: probeOnly ? 4 : 6,
+            deadlineMs: probeOnly ? 25_000 : 52_000,
             httpTimeoutMs: 8_000,
             retryBackoffMs: 1_000,
             trace: {
@@ -458,7 +463,7 @@ function createReconcileIosSubscriptionHandler({
       const latestEntry = await pickLatestTransactionEntry(
         apiResult.body,
         (signedInfo) => verifier.verifyAndDecodeTransaction(signedInfo),
-        { activeOnly: false }
+        { activeOnly: false, decodeRenewal: (signedInfo) => verifier.verifyAndDecodeRenewalInfo(signedInfo) }
       );
 
       if (!latestEntry?.transactionInfo) {
@@ -468,7 +473,7 @@ function createReconcileIosSubscriptionHandler({
         });
       }
 
-      const derived = deriveSubscriptionState(latestEntry.transactionInfo);
+      const derived = deriveSubscriptionState(latestEntry.transactionInfo, Date.now(), { appleStatus: latestEntry.appleStatus, renewalInfo: latestEntry.renewalInfo, storeObservedAtMs: apiResult.storeObservedAtMs });
       if (
         derived.validationCode === "BUNDLE_ID_MISMATCH" ||
         derived.validationCode === "PRODUCT_ID_MISMATCH"
@@ -535,6 +540,20 @@ function createReconcileIosSubscriptionHandler({
         appleRevocationDateMs: Number(txnInfo.revocationDate || 0) || null,
       });
 
+      if (probeOnly) {
+        // 読み取り専用: 状態の違い（請求リトライ・取消・不明）を `derivedStatus` で呼び出し側へ伝える。
+        const probeStatus = derived.status === "active" ? "active" : "expired";
+        return finish({
+          outcome: probeStatus,
+          subscriptionStatus: probeStatus,
+          derivedStatus: String(derived.status || "unknown"),
+          validationCode: derived.validationCode,
+          expiresDateMillis:
+            derived.expiresDate > 0 ? derived.expiresDate : null,
+          httpAttempts: apiResult.httpAttempts || null,
+        });
+      }
+
       const writeResult = await applyUserSubscriptionUpdate(
         db,
         admin,
@@ -583,6 +602,7 @@ function createReconcileIosSubscriptionHandler({
       return finish({
         outcome: subscriptionStatus,
         subscriptionStatus,
+        derivedStatus: String(derived.status || "unknown"),
         validationCode: derived.validationCode,
         expiresDateMillis:
           derived.expiresDate > 0 ? derived.expiresDate : null,

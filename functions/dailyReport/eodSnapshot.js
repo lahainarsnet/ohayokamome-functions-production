@@ -18,6 +18,21 @@ function isDeletedUser(data = {}) {
   return data.deleted === true;
 }
 
+// Keep the report vocabulary aligned with the administrator console.  An
+// account being present is not the same thing as having a usable paid plan.
+function classifyUser(data = {}) {
+  const deleted = isDeletedUser(data);
+  const subscriptionStatus = String(data.subscriptionStatus || "unknown").toLowerCase();
+  const trial = !deleted && subscriptionStatus === "trial";
+  const paidUsable = !deleted && !trial && data.entitlementUsable === true;
+  return {
+    deleted,
+    accountActive: !deleted,
+    trial,
+    paidUsable,
+  };
+}
+
 function incrementBucket(map, key, amount = 1) {
   const normalized = key || "unknown";
   map[normalized] = (map[normalized] || 0) + amount;
@@ -34,11 +49,17 @@ function trimTopBuckets(map, limit = TOP_VERSION_LIMIT) {
   return Object.fromEntries(kept);
 }
 
-async function scanUsersSnapshot(getDb) {
+async function scanUsersSnapshot(getDb, reportDate) {
   const totals = {
     total: 0,
     active: 0,
     deleted: 0,
+    trial: 0,
+    paidUsable: 0,
+    canceled: 0,
+    newRegistrations: 0,
+    newTrialRegistrations: 0,
+    newPaidRegistrations: 0,
   };
   const billing = {
     byStatus: {},
@@ -55,10 +76,19 @@ async function scanUsersSnapshot(getDb) {
     for (const doc of snap.docs) {
       totals.total += 1;
       const data = doc.data() || {};
-      if (isDeletedUser(data)) {
+      const classified = classifyUser(data);
+      if (classified.deleted) {
         totals.deleted += 1;
       } else {
         totals.active += 1;
+      }
+      if (classified.trial) totals.trial += 1;
+      if (classified.paidUsable) totals.paidUsable += 1;
+      if (classified.canceled) totals.canceled += 1;
+      if (isTimestampInReportWindow(data.createdAt, reportDate)) {
+        totals.newRegistrations += 1;
+        if (classified.trial) totals.newTrialRegistrations += 1;
+        if (classified.paidUsable) totals.newPaidRegistrations += 1;
       }
       incrementBucket(billing.byStatus, data.subscriptionStatus || "unknown");
       incrementBucket(billing.byPlatform, data.subscriptionPlatform || "unknown");
@@ -133,7 +163,7 @@ async function countTosAgreementsInWindow(getDb, reportDate) {
 
 async function buildEodSnapshotSections(getDb, reportDate) {
   const [userSnapshot, devicesSnapshot, tosAgreements] = await Promise.all([
-    scanUsersSnapshot(getDb),
+    scanUsersSnapshot(getDb, reportDate),
     scanDevicesSnapshot(getDb),
     countTosAgreementsInWindow(getDb, reportDate).catch(() => null),
   ]);
@@ -146,6 +176,9 @@ async function buildEodSnapshotSections(getDb, reportDate) {
     devices: devicesSnapshot,
     activityUsers: {
       tosAgreements: typeof tosAgreements === "number" ? tosAgreements : null,
+      newRegistrations: userSnapshot.users.newRegistrations,
+      newTrialRegistrations: userSnapshot.users.newTrialRegistrations,
+      newPaidRegistrations: userSnapshot.users.newPaidRegistrations,
     },
     quality: {
       tosAgreementsSource:
@@ -228,6 +261,9 @@ async function finalizeDailyReport(reportDate, options = {}) {
     snapshot: sections.snapshot,
     devices: sections.devices,
     "activity.users.tosAgreements": sections.activityUsers.tosAgreements,
+    "activity.users.newRegistrations": sections.activityUsers.newRegistrations,
+    "activity.users.newTrialRegistrations": sections.activityUsers.newTrialRegistrations,
+    "activity.users.newPaidRegistrations": sections.activityUsers.newPaidRegistrations,
     quality: {
       ...(existingData.quality || {}),
       ...sections.quality,
@@ -254,6 +290,7 @@ async function finalizeDailyReport(reportDate, options = {}) {
 
 module.exports = {
   isDeletedUser,
+  classifyUser,
   trimTopBuckets,
   scanUsersSnapshot,
   scanDevicesSnapshot,

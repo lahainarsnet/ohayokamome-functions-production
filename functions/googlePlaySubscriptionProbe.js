@@ -47,6 +47,11 @@ function resolveStoredPrimaryPurchaseToken(userData) {
   if (nested) {
     return nested;
   }
+  // 旧形式の activePurchaseTokens は iPhone の取引番号も入る（両OSで共有）。Android の旧形式の記録
+  // （subscriptionPlatform が android）のときだけ使う。Apple の取引番号を Google Play へ送らない。
+  if (String(userData?.subscriptionPlatform || "").trim().toLowerCase() !== "android") {
+    return "";
+  }
   for (const token of Array.isArray(userData?.activePurchaseTokens)
     ? userData.activePurchaseTokens
     : []) {
@@ -68,6 +73,43 @@ function parseProbeRequest(data) {
     phase: phase === "pre_chat" || phase === "in_chat" ? phase : "",
     clientTraceId,
   };
+}
+
+// Google Play Developer API の公式仕様（purchases.subscriptionsv2 のエラー表）で、購入トークンがもう使えないことを
+// 明確に示す 410 の理由。
+//   subscriptionNoLongerAvailable: 期限切れから長く経ち（60日超）、照会できない。
+//   purchaseTokenNoLongerValid: 購入トークンが恒久的に無効（アカウント削除・購入記録なし）。
+// HTTP 410 と、この理由の両方が確認できたときだけ「有効な契約ではない」とみなす。理由が読み取れない 410、
+// ほかの状態コード、一時的な障害は、従来どおり失敗（安全側の停止）のままにする。
+const GOOGLE_PLAY_TOKEN_GONE_REASONS = new Set([
+  "subscriptionNoLongerAvailable",
+  "purchaseTokenNoLongerValid",
+]);
+
+function googlePlayTokenGoneReason(error) {
+  try {
+    const status = Number(error?.code || error?.response?.status || error?.status || 0);
+    if (status !== 410) {
+      return "";
+    }
+    const reasons = [
+      ...(Array.isArray(error?.errors) ? error.errors : []),
+      ...(Array.isArray(error?.response?.data?.error?.errors) ? error.response.data.error.errors : []),
+    ].map((item) => String(item?.reason || ""));
+    return reasons.find((reason) => GOOGLE_PLAY_TOKEN_GONE_REASONS.has(reason)) || "";
+  } catch (_) {
+    return "";
+  }
+}
+
+// 保留（ON_HOLD）・一時停止（PAUSED）は、今は利用できないが、支払いの修復や再開で有効に戻る。
+// 呼び出し側が「期限切れ」と区別できるよう、理由を分けて返す。
+function isGooglePlaySuspended(derived) {
+  return (
+    derived?.status === "paused" ||
+    derived?.subscriptionState === "SUBSCRIPTION_STATE_ON_HOLD" ||
+    derived?.subscriptionState === "SUBSCRIPTION_STATE_PAUSED"
+  );
 }
 
 function isRetryableGooglePlayApiError(error) {
@@ -244,6 +286,9 @@ function createGooglePlaySubscriptionProbeHandler({
         matchedLineItem,
       });
 
+      derived.storeObservedAtMs = syncResult.storeObservedAtMs;
+      const suspended = isGooglePlaySuspended(derived);
+      const inactiveReason = suspended ? "google_play_suspended" : "google_play_not_active";
       const freshSnap = await userRef.get();
       const freshData = freshSnap.exists ? freshSnap.data() || {} : {};
 
@@ -338,7 +383,7 @@ function createGooglePlaySubscriptionProbeHandler({
       if (!reconcileMode) {
         logger.info(`${PROBE_TRACE} inactive`, {
           uidSuffix,
-          reason: "google_play_not_active",
+          reason: inactiveReason,
           subscriptionState: derived.subscriptionState || "",
           status: derived.status || "",
           expiryTime: derived.expiryTime || null,
@@ -346,7 +391,7 @@ function createGooglePlaySubscriptionProbeHandler({
         });
         return {
           outcome: "inactive",
-          reason: "google_play_not_active",
+          reason: inactiveReason,
           subscriptionState: derived.subscriptionState || "",
           status: derived.status || "",
           expiryTime: derived.expiryTime || null,
@@ -382,7 +427,7 @@ function createGooglePlaySubscriptionProbeHandler({
         });
         return {
           outcome: "inactive",
-          reason: "google_play_not_active",
+          reason: inactiveReason,
           subscriptionState: derived.subscriptionState || "",
           status: derived.status || "",
           expiryTime: derived.expiryTime || null,
@@ -409,7 +454,7 @@ function createGooglePlaySubscriptionProbeHandler({
 
       logger.info(`${PROBE_TRACE} inactive`, {
         uidSuffix,
-        reason: "google_play_not_active",
+        reason: inactiveReason,
         subscriptionState: derived.subscriptionState || "",
         status: derived.status || "",
         expiryTime: derived.expiryTime || null,
@@ -429,7 +474,7 @@ function createGooglePlaySubscriptionProbeHandler({
 
       return {
         outcome: "inactive",
-        reason: "google_play_not_active",
+        reason: inactiveReason,
         subscriptionState: derived.subscriptionState || "",
         status: derived.status || "",
         expiryTime: derived.expiryTime || null,
@@ -438,6 +483,25 @@ function createGooglePlaySubscriptionProbeHandler({
         apiAttempts,
       };
     } catch (error) {
+      // 購入トークンがもう使えないと、公式仕様で明確に分かる 410 だけ「有効な契約ではない」。Firestore は変えない。
+      const goneReason = googlePlayTokenGoneReason(error);
+      if (goneReason) {
+        logger.info(`${PROBE_TRACE} inactive`, {
+          uidSuffix,
+          reason: "google_play_token_no_longer_available",
+          tokenGoneReason: goneReason,
+          tokenSuffix: tokenSuffix(purchaseToken),
+          reconcileMode,
+          phase: phase || "",
+          apiAttempts,
+        });
+        return {
+          outcome: "inactive",
+          reason: "google_play_token_no_longer_available",
+          tokenGoneReason: goneReason,
+          apiAttempts,
+        };
+      }
       logger.warn(`${PROBE_TRACE} failed`, {
         uidSuffix,
         tokenSuffix: tokenSuffix(purchaseToken),

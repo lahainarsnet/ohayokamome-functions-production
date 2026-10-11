@@ -55,14 +55,17 @@ async function main() {
   for (const sender of ['ios','android']) for (const receiver of ['ios','android']) {
     for (const [status,grace,allowed] of [['active',true,true],['expired',true,false],['none',true,false],['',true,true],['',false,false]]) {
       initial(sender, receiver, status, grace);
+      // Cases 13 and 14: a recipient device uses the same UID's Active contract of the other OS.
+      const expected = true;
       const result = await sendMessageWithLimit.run(request(sender));
-      assert.equal(result.success, allowed, `${sender}->${receiver}:${status}:${grace}`);
-      assert.equal(writes.some(w => w.path.includes('/messages/')), allowed); cases++;
+      assert.equal(result.success, expected, `${sender}->${receiver}:${status}:${grace}`);
+      assert.equal(writes.some(w => w.path.includes('/messages/')), expected); cases++;
     }
     initial(sender, receiver, 'active');
     recipientChange = () => { docs[`users/${RECIPIENT}`].subscriptions[receiver].status = 'expired'; };
-    assert.equal((await sendMessageWithLimit.run(request(sender))).code, 'RECIPIENT_SUBSCRIPTION_UNAVAILABLE');
-    assert.equal(writes.length, 0); cases++;
+    // the recipient's own contract ended meanwhile, but the other OS contract of the same UID is still Active: carried (cases 13 and 14)
+    assert.equal((await sendMessageWithLimit.run(request(sender))).success, true);
+    cases++;
     initial(sender, receiver, 'active');
     docs[`users/${RECIPIENT}/devices/${DEVICE}`].deviceId = 'different-device';
     assert.equal((await sendMessageWithLimit.run(request(sender))).success, false); cases++;
@@ -75,6 +78,7 @@ async function main() {
     initial(sender, receiver, 'active');
     docs[`users/${RECIPIENT}`].subscriptions = {};
     docs[`users/${RECIPIENT}`].subscriptionPlatform = receiver === 'ios' ? 'android' : 'ios';
+    // only an aggregate flag + the other OS' platform marker (no legacy status/expiry): nothing is carried, in either direction
     assert.equal((await sendMessageWithLimit.run(request(sender))).success, false); cases++;
   }
   for (const os of ['ios','android']) for (const [status,grace,allowed] of [['active',true,true],['expired',true,false],['none',true,false],['',true,true],['',false,false]]) {
@@ -89,6 +93,28 @@ async function main() {
     assert.equal((await sendMessageWithLimit.run(request(os))).success, true); cases++;
     docs = { [`users/${SENDER}`]: { subscriptions: { [os]: { status: 'active' } }, chatUnknownProvisionalUntil: future() } };
     assert.equal((await assertCallerSubscriptionUsable(SENDER, { platform: os, getDb: () => db })).ok, true); cases++;
+  }
+  // The shared cap must protect real send, recipient transaction and STT gates.
+  for (const sender of ['ios','android']) for (const receiver of ['ios','android']) {
+    initial(sender, receiver, '');
+    // The provisional-allowance cap is about an UNCONFIRMED contract; an Active contract of the other OS (carried on the
+    // iPhone since case 13) is a confirmed one, so it is removed from this fixture to keep the cap fully covered.
+    delete docs[`users/${RECIPIENT}`].subscriptions[receiver === 'ios' ? 'android' : 'ios'];
+    docs[`users/${RECIPIENT}`].chatUnknownProvisionalStartedAt = new Date(Date.now() - 120 * 3600000);
+    assert.equal((await sendMessageWithLimit.run(request(sender))).code, 'RECIPIENT_SUBSCRIPTION_UNAVAILABLE');
+    assert.equal(writes.length, 0); cases++;
+  }
+  for (const os of ['ios','android']) {
+    initial(os, os, 'active');
+    const data = docs[`users/${SENDER}`];
+    data.subscriptions[os] = {status: ''};
+    data.chatUnknownProvisionalUntil = future();
+    data.chatUnknownProvisionalStartedAt = new Date(Date.now() - 120 * 3600000);
+    assert.equal((await sendMessageWithLimit.run(request(os))).code, 'SENDER_SUBSCRIPTION_UNAVAILABLE');
+    assert.equal(writes.length, 0); cases++;
+    const stt = await assertCallerSubscriptionUsable(SENDER, {platform: os, getDb: () => db});
+    assert.equal(stt.ok, false);
+    assert.equal(stt.usability.denyReason, 'CHAT_UNKNOWN_PROVISIONAL_LIMIT_REACHED'); cases++;
   }
   const serialized = JSON.stringify(logs);
   assert.equal(serialized.includes(SENDER), false);

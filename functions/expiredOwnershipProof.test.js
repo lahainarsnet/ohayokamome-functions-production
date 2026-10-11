@@ -7,9 +7,26 @@ const proof={ownershipId:'android_id',ownerUid:'old',fingerprint:fingerprint(own
 const confirmation={state:'eligible',reason:'verified_current_series_ended',checkedAt:new Date(now-1000),expiredForeignSeries:[proof]};
 const args={userData:{billingConfirmation:{android:confirmation}},platform:'android',purchase:{uidBound:true,active:true,purchasedAt:now-500},ownershipId:'android_id',ownerUid:'old',ownerSnapshot:owner,ownerUserSnapshot:owner,now};
 assert.equal(permitsExpiredReassignment(args),true);
-for(const purchase of [{uidBound:false,purchasedAt:now},{uidBound:true,active:true,purchasedAt:now-2000},{uidBound:true,active:true,purchasedAt:NaN},{uidBound:true,active:true,purchasedAt:now+1}]) assert.equal(permitsExpiredReassignment({...args,purchase}),false);
+// Not bound to the requesting UID (and no matching tag), or not reported active by the Store: never accepted.
+for(const purchase of [{uidBound:false,active:true,purchasedAt:now},{uidBound:true,active:false,purchasedAt:now-500}]) assert.equal(permitsExpiredReassignment({...args,purchase}),false);
 assert.equal(permitsExpiredReassignment({...args,ownerUid:'other'}),false);
-assert.equal(permitsExpiredReassignment({...args,ownerSnapshot:{exists:true,data:()=>({ownerUid:'old',status:'active',updatedAt:now})}}),false);
-assert.equal(permitsExpiredReassignment({...args,now:now+16*60*1000}),false);
-for(const state of ['active','unknown','blocked']) assert.equal(permitsExpiredReassignment({...args,userData:{billingConfirmation:{android:{...confirmation,state}}}}),false);
-console.log('Expired ownership proof: 12 safety assertions PASS');
+// "Latest holder wins": a Store-active, UID-bound purchase moves the series even if the old owner's record says active.
+assert.equal(permitsExpiredReassignment({...args,ownerSnapshot:{exists:true,data:()=>({ownerUid:'old',status:'active',updatedAt:now})}}),true);
+// The 15-minute client-confirmation window no longer gates the transfer.
+assert.equal(permitsExpiredReassignment({...args,now:now+16*60*1000}),true);
+for(const state of ['active','unknown','blocked']) assert.equal(permitsExpiredReassignment({...args,userData:{billingConfirmation:{android:{...confirmation,state}}}}),true);
+// iPhone: the shared expired-reassignment decision never moves an ACTIVE contract (dedicated transfer only).
+{
+  const { evaluateOwnershipTransferProof, evaluateExpiredReassignment }=require('./expiredOwnershipProof');
+  const TAG='aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa';
+  const ownRec={exists:true,data:()=>({ownerUid:'old',status:'active',appAccountToken:TAG})};
+  const ownUser={exists:true,data:()=>({subscriptions:{ios:{status:'active',expiryTime:new Date(now+3600000).toISOString()}}})};
+  const base={platform:'ios',ownerUid:'old',ownerSnapshot:ownRec,ownerUserSnapshot:ownUser,ownershipId:'ios_id',now};
+  const ok={active:true,uidBound:false,accountTag:TAG,proofVerified:true,ownershipType:'PURCHASED',purchasedAt:now-1000};
+  assert.equal(evaluateOwnershipTransferProof({...base,purchase:ok}).proof!==null,true,'dedicated: owner tag + device proof + PURCHASED');
+  for(const purchase of [{...ok,proofVerified:false},{...ok,proofVerified:undefined},{...ok,ownershipType:'FAMILY_SHARED'},{...ok,ownershipType:undefined},{...ok,accountTag:'bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb'},{...ok,accountTag:''},{...ok,active:false},{...ok,uidBound:true,accountTag:'bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb'}])
+    assert.equal(evaluateOwnershipTransferProof({...base,purchase}).proof,null,'dedicated refuses '+JSON.stringify(purchase));
+  for(const purchase of [ok,{...ok,uidBound:true},{...ok,uidBound:true,proofVerified:false}])
+    assert.equal(evaluateExpiredReassignment({...base,userData:{},purchase}).proof,null,'shared iOS decision never moves an active contract '+JSON.stringify(purchase));
+}
+console.log('Expired ownership proof: policy assertions PASS');

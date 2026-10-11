@@ -54,6 +54,18 @@ function createInspectSubscriptionSeriesOwnershipHandler({ admin, logger, secret
         traceId: data.billingTraceId,
         verifySeriesState,
       });
+      try {
+        ownershipLogger.info("subscription_ownership.inspect_result", {
+          platform,
+          billingTraceId: data.billingTraceId || null,
+          requestUidTail: String(uid).slice(-6),
+          decision: result.decision,
+          reason: result.reason || null,
+          storeStatus: result.storeStatus || "unknown",
+          hasPurchaseToken: Boolean(data.purchaseToken),
+          hasOriginalTransactionId: Boolean(data.originalTransactionId),
+        });
+      } catch (_) { /* diagnostics only */ }
       return {
         ok: true,
         decision: result.decision,
@@ -62,6 +74,14 @@ function createInspectSubscriptionSeriesOwnershipHandler({ admin, logger, secret
         platform,
       };
     } catch (error) {
+      try {
+        logger.warn("subscription_ownership.inspect_failed", {
+          platform,
+          requestUidTail: String(uid).slice(-6),
+          errorCode: error?.code || null,
+          errorType: error?.constructor?.name || typeof error,
+        });
+      } catch (_) { /* diagnostics only */ }
       if (error instanceof HttpsError) {
         throw error;
       }

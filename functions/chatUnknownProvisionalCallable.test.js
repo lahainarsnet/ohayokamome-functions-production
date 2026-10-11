@@ -14,12 +14,15 @@ const future = () => new Date(Date.now() + 86400000 * 2);
 let cases = 0;
 
 // Mirrors firebaseAdmin.js's exported interface: deliberately no admin.firestore.
-function fixture(data, retries = []) {
+function fixture(data, retries = [], clock = () => new Date()) {
   const docs = new Map([[`users/${UID}`, data], ['users/victim', { untouched: true }]]);
   const writes = [];
   const apply = (ref, patch) => {
     assert.equal(ref.path, `users/${UID}`);
-    assert.deepEqual(Object.keys(patch).sort(), [
+    assert.ok(Object.keys(patch).every(key => [
+      'chatUnknownProvisionalStartedAt', 'chatUnknownProvisionalUntil', 'chatUnknownProvisionalUnknownStreak', 'chatUnknownProvisionalUpdatedAt',
+    ].includes(key)));
+    assert.deepEqual(Object.keys(patch).filter(key => key !== 'chatUnknownProvisionalStartedAt').sort(), [
       'chatUnknownProvisionalUntil', 'chatUnknownProvisionalUnknownStreak', 'chatUnknownProvisionalUpdatedAt',
     ].sort());
     const next = { ...docs.get(ref.path) };
@@ -56,7 +59,7 @@ function fixture(data, retries = []) {
     FieldValue: { delete: () => DELETE, serverTimestamp: () => STAMP },
   };
   const logs = [];
-  const dependencies = { admin, platformFromAppCheckAppId, logger: { info: (...args) => logs.push(args) } };
+  const dependencies = { admin, clock, platformFromAppCheckAppId, logger: { info: (...args) => logs.push(args) } };
   return { docs, writes, logs, dependencies,
     record: createRecordChatUnknownProvisionalHandler(dependencies),
     clear: createClearChatUnknownProvisionalHandler(dependencies) };
@@ -107,7 +110,9 @@ async function main() {
 
     const dedicated = fixture({ activeDeviceId: DEVICE, subscriptionPlatform: platform === 'ios' ? 'android' : 'ios', subscriptionStatus: 'active', subscriptionExpiryTime: future() });
     const stop = await dedicated.record(request(platform));
-    assert.equal(stop.outcome, 'dedicatedStop'); assert.equal(stop.stopReason, 'legacy_other_platform'); cases++;
+    // Cases 13 and 14: either device carries an Active contract of the other OS under the same UID, so there is nothing to stop.
+    assert.notEqual(stop.outcome, 'dedicatedStop');
+    cases++;
   }
   await rejects(fixture(user('ios')), request('ios', { auth: null }), 'unauthenticated');
   await rejects(fixture(user('ios')), request('ios', { app: null }), 'failed-precondition');
@@ -128,4 +133,5 @@ async function main() {
   assert.equal((await logFailure.record(request())).outcome, 'unknownRecorded'); cases++;
   console.log(`chatUnknownProvisionalCallable.test.js: ${cases} cases ok`);
 }
-main().catch(error => { console.error(error); process.exitCode = 1; });
+if (require.main === module) main().catch(error => { console.error(error); process.exitCode = 1; });
+module.exports = { fixture, request, user, UID, DEVICE };

@@ -27,7 +27,7 @@ const matchedLineItem={productId:'ohayo_kamome_monthly',expiryTime:new Date(now+
  for(const state of ['SUBSCRIPTION_STATE_ACTIVE','UNKNOWN','SUBSCRIPTION_STATE_EXPIRED']){
    const args={db,uid:'user',purchaseToken:'new-token',subscription,matchedLineItem,verifyLinked:async()=>({subscription:{subscriptionState:state},matchedLineItem:{...matchedLineItem,expiryTime:new Date(state==='SUBSCRIPTION_STATE_ACTIVE'?now+100000:now-100000).toISOString()}})};
    if(state==='SUBSCRIPTION_STATE_EXPIRED'){
-     const facts=await verifiedGoogleOwnershipFacts(args);assert.equal(facts.active,true);assert.equal(facts.linkedState,'ended');assert.equal(facts.linkedObservation.fingerprint,fingerprint(snap('subscription_ownership/'+oldId)));
+     const facts=await verifiedGoogleOwnershipFacts(args);assert.equal(facts.active,true);assert.equal(facts.linkedState,'ended');assert.ok(Number.isFinite(facts.linkedExpiryMs),'linked expiry is exposed for the server-derived proof');assert.equal(facts.linkedObservation.fingerprint,fingerprint(snap('subscription_ownership/'+oldId)));
      // A directly invoked verification cannot exploit an existing primary owner to ignore a foreign link.
      await assert.rejects(()=>claimAndroidSubscriptionOwnership(db,admin,{uid:'user',purchaseToken:'new-token',linkedPurchaseToken:'old-token',verifiedPurchase:facts}),/conflicting linked ownership/);
      docs['subscription_ownership/'+oldId].latestOwnershipId=newId;

@@ -167,7 +167,8 @@ async function stage5() {
       const handler = createClaimActiveDeviceHandler({ admin, logger });
       const result = await runHandler(handler, authedRequest(OWNER_UID,
         devicePayload(DEVICE_B, { platform: to, mode: "confirmed", claimGeneration: 1 })));
-      const allowed = state === "active";
+      // Cases 13 and 14: moving is allowed by an Active contract of the other OS under the same UID (the destination has none).
+      const allowed = state === "active" || (state === "missing" && from !== to);
       assert.equal(result.ok, allowed, `${from}->${to} ${state}`);
       assert.equal(admin.docs.get(`users/${OWNER_UID}`).activeDeviceId, allowed ? DEVICE_B : DEVICE_A);
       assert.equal(admin.docs.get(`users/${OWNER_UID}`).chatUnknownProvisionalUntil, user.chatUnknownProvisionalUntil);

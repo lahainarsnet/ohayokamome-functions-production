@@ -96,6 +96,11 @@ async function dual(env, platform, source = "shape_test") {
     const run = vm.runInNewContext(`(async () => {${source.slice(from, to)}})`, {
       ...entitlement, verifiedStoreMetadata, admin: { ...admin, getDb: () => env.db }, uid: "user", purchaseToken: "test-token",
       linkedPurchaseToken: "", subscription: {}, subscriptionState: "SUBSCRIPTION_STATE_ACTIVE",
+      googleDeadline: require("./googlePlaySubscriptionNotifications").deriveGooglePlayEntitlement({
+        subscription: { subscriptionState: "SUBSCRIPTION_STATE_ACTIVE" },
+        matchedLineItem: { expiryTime: expiry.toDate().toISOString() },
+      }),
+      googleStoreObservedAtMs: Date.now(),
       GOOGLE_PLAY_MONTHLY_PRODUCT_ID: "ohayo_kamome_monthly", expiryTime: expiry, now: FieldValue.serverTimestamp(), source: "google_verify", console: quiet });
     await run(); shape(env, "android");
   });

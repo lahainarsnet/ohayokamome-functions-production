@@ -36,12 +36,12 @@
 
 - messaging: sentCount, receivedCount, sendBlocked.*
 - stt: attemptCount, successCount, failureCount, limitExceededAttempts, failureByCode.*
-- users: accountDeletions, tosAgreements（EOD クエリ）
-- billing: subscriptionEvents（total / byPlatform / byType / byStatus）
+- users: accountDeletions, tosAgreements, newRegistrations, newTrialRegistrations, newPaidRegistrations（EOD 集計）
+- billing: subscriptionEvents（total / byPlatform / byType / byStatus）と、正式なストア解約通知のみを数える cancellations（total / trial / paid）
 
 ## Snapshot（第1版）
 
-- users: total, active, deleted
+- users: total, active（アカウント未削除）, deleted, trial（無料期間中）, paidUsable（有料で利用可能）
 - billing: byStatus, byPlatform, entitlementUsable
 - devices: byPlatform, byAppVersion, byBuildNumber（上位50+other）
 

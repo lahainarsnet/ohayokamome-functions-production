@@ -162,6 +162,7 @@ async function fetchAppStoreAllSubscriptionStatuses(
   environmentHint,
   secrets
 ) {
+  const storeObservedAtMs = Date.now();
   const jwt = createAppStoreServerApiJwt(secrets);
   const path = `/inApps/v1/subscriptions/${encodeURIComponent(anyTransactionId)}`;
   const errors = [];
@@ -181,6 +182,7 @@ async function fetchAppStoreAllSubscriptionStatuses(
       return {
         environment: environment.name,
         body: responseBody,
+        storeObservedAtMs,
       };
     }
 
@@ -234,6 +236,7 @@ async function fetchAppStoreAllSubscriptionStatusesWithRetry(
     trace = null,
   } = options;
 
+  const storeObservedAtMs = Date.now();
   const jwt = createAppStoreServerApiJwt(secrets);
   const path = `/inApps/v1/subscriptions/${encodeURIComponent(anyTransactionId)}`;
   const headers = {
@@ -318,6 +321,7 @@ async function fetchAppStoreAllSubscriptionStatusesWithRetry(
       return {
         environment: activeEnvironment.name,
         body: responseBody,
+        storeObservedAtMs,
         httpAttempts,
         elapsedMs: Date.now() - startedAt,
       };
@@ -413,61 +417,32 @@ function loadAppleRootCertificates() {
   return buffers;
 }
 
-function deriveSubscriptionState(transactionInfo, nowMillis = Date.now()) {
-  const expiresDate = Number(transactionInfo?.expiresDate || 0);
-  const revocationDate = Number(transactionInfo?.revocationDate || 0);
-  const productId = transactionInfo?.productId || "";
-  const bundleId = transactionInfo?.bundleId || "";
-
-  if (bundleId !== APP_STORE_BUNDLE_ID) {
-    return {
-      status: null,
-      validationCode: "BUNDLE_ID_MISMATCH",
-      expiresDate,
-      latestTransactionId: transactionInfo?.transactionId || "",
-      originalTransactionId: transactionInfo?.originalTransactionId || "",
-      environment: transactionInfo?.environment || "",
-    };
-  }
-  if (productId !== APP_STORE_PRODUCT_ID) {
-    return {
-      status: null,
-      validationCode: "PRODUCT_ID_MISMATCH",
-      expiresDate,
-      latestTransactionId: transactionInfo?.transactionId || "",
-      originalTransactionId: transactionInfo?.originalTransactionId || "",
-      environment: transactionInfo?.environment || "",
-    };
-  }
-  if (revocationDate > 0) {
-    return {
-      status: "none",
-      validationCode: "TRANSACTION_REVOKED",
-      expiresDate,
-      latestTransactionId: transactionInfo?.transactionId || "",
-      originalTransactionId: transactionInfo?.originalTransactionId || "",
-      environment: transactionInfo?.environment || "",
-    };
-  }
-  if (!Number.isFinite(expiresDate) || expiresDate <= nowMillis) {
-    return {
-      status: "expired",
-      validationCode: "SUBSCRIPTION_EXPIRED",
-      expiresDate,
-      latestTransactionId: transactionInfo?.transactionId || "",
-      originalTransactionId: transactionInfo?.originalTransactionId || "",
-      environment: transactionInfo?.environment || "",
-    };
-  }
-
-  return {
-    status: "active",
-    validationCode: "ACTIVE",
-    expiresDate,
+function deriveSubscriptionState(transactionInfo, nowMillis = Date.now(), options = {}) {
+  const normalExpiresDate = Number(transactionInfo?.expiresDate || 0);
+  const graceExpiresDate = Number(options.renewalInfo?.gracePeriodExpiresDate || 0);
+  const appleStatus = Number(options.appleStatus || 0);
+  const base = {
+    expiresDate: normalExpiresDate, normalExpiresDate, graceExpiresDate: null,
+    expirySource: "normal", storeObservedAtMs: options.storeObservedAtMs || 0,
+    storeTransactionTimeMs: Number(transactionInfo?.purchaseDate || 0),
     latestTransactionId: transactionInfo?.transactionId || "",
     originalTransactionId: transactionInfo?.originalTransactionId || "",
     environment: transactionInfo?.environment || "",
   };
+  if (transactionInfo?.bundleId !== APP_STORE_BUNDLE_ID) return { ...base, status: null, validationCode: "BUNDLE_ID_MISMATCH" };
+  if (transactionInfo?.productId !== APP_STORE_PRODUCT_ID) return { ...base, status: null, validationCode: "PRODUCT_ID_MISMATCH" };
+  if (Number(transactionInfo?.revocationDate) > 0 || appleStatus === 5) return { ...base, status: "revoked", validationCode: "TRANSACTION_REVOKED" };
+  if (appleStatus === 3) return { ...base, status: "paused", validationCode: "SUBSCRIPTION_BLOCKED" };
+  if (appleStatus === 4) {
+    if (!(graceExpiresDate > 0) || !Number.isFinite(graceExpiresDate)) return { ...base, status: "unknown", validationCode: "GRACE_EXPIRY_MISSING" };
+    return { ...base, expirySource: "grace", graceExpiresDate, expiresDate: graceExpiresDate,
+      status: graceExpiresDate > nowMillis ? "active" : "expired",
+      validationCode: graceExpiresDate > nowMillis ? "ACTIVE" : "SUBSCRIPTION_EXPIRED" };
+  }
+  if (appleStatus && ![1, 2].includes(appleStatus)) return { ...base, status: "unknown", validationCode: "UNKNOWN_APPLE_STATUS" };
+  if (!(normalExpiresDate > 0) || !Number.isFinite(normalExpiresDate)) return { ...base, status: "unknown", validationCode: "EXPIRY_MISSING" };
+  if (appleStatus === 2 || normalExpiresDate <= nowMillis) return { ...base, status: "expired", validationCode: "SUBSCRIPTION_EXPIRED" };
+  return { ...base, status: "active", validationCode: "ACTIVE" };
 }
 
 async function pickLatestTransactionEntry(statusResponseBody, decodeTransaction, options = {}) {
@@ -495,23 +470,30 @@ async function pickLatestTransactionEntry(statusResponseBody, decodeTransaction,
       try {
         transactionInfo = await decodeTransaction(entry.signedTransactionInfo);
       } catch (error) {
-        continue;
+        throw error; // An unverified newer entry must not leave an older entitlement selected.
       }
       if (transactionInfo?.productId !== APP_STORE_PRODUCT_ID) {
         continue;
       }
-      const expiresDate = Number(transactionInfo?.expiresDate || 0);
+      const renewalInfo = entry.signedRenewalInfo && options.decodeRenewal
+        ? await options.decodeRenewal(entry.signedRenewalInfo) : null;
+      if (renewalInfo?.originalTransactionId && renewalInfo.originalTransactionId !== transactionInfo.originalTransactionId) throw new Error("RENEWAL_SERIES_MISMATCH");
+      const derived = deriveSubscriptionState(transactionInfo, now, { appleStatus: entry.status, renewalInfo });
+      const expiresDate = derived.expiresDate;
       latestCandidateCount += 1;
-      const isActive = Number.isFinite(expiresDate) && expiresDate > now;
+      const isActive = derived.status === "active";
       if (isActive) {
         activeCandidateCount += 1;
       }
       if (activeOnly && !isActive) {
         continue;
       }
-      if (!best || expiresDate > best.expiresDate) {
+      const version = Number(transactionInfo?.purchaseDate || 0);
+      const signedVersion = Math.max(Number(transactionInfo?.signedDate || 0), Number(renewalInfo?.signedDate || 0));
+      if (!best || version > best.version || (version === best.version && signedVersion > best.signedVersion) ||
+          (version === best.version && signedVersion === best.signedVersion && expiresDate > best.expiresDate)) {
         best = {
-          expiresDate,
+          expiresDate, version, signedVersion, renewalInfo,
           transactionInfo,
           renewalInfoSigned: entry.signedRenewalInfo || null,
           appleStatus: entry.status,

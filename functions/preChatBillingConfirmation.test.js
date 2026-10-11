@@ -825,7 +825,9 @@ async function test(name, run) { await run(); passed += 1; console.log(`ok ${pas
           const userData = {appStoreAppAccountToken:currentToken};
           if(cross) Object.assign(userData,{subscriptionPlatform:platform==='ios'?'android':'ios',subscriptionStatus:'active',subscriptionExpiryTime:new Date(Date.now()+100000),subscriptions:{[platform==='ios'?'android':'ios']:{status:'active',expiryTime:new Date(Date.now()+100000),productId:APP_STORE_PRODUCT_ID}}});
           const opposite=platform==='ios'?'android':'ios';
-          const oldData={subscriptions:{[platform]:{status:'active',expiryTime:new Date(Date.now()+100000),productId:APP_STORE_PRODUCT_ID,
+          // iOS: the previous owner's own record must agree that the series ended (same rule as the post-purchase registration).
+          const ownerEnded = platform==='ios' && state==='ended';
+          const oldData={subscriptions:{[platform]:{status:ownerEnded?'expired':'active',expiryTime:new Date(Date.now()+(ownerEnded?-200000:100000)),productId:APP_STORE_PRODUCT_ID,
             ...(platform==='android'?{primaryPurchaseToken:'foreign-token'}:{originalTransactionId:'foreign-original'})},
             [opposite]:{status:'active',expiryTime:new Date(Date.now()+100000),productId:APP_STORE_PRODUCT_ID}},
             ...(platform==='android'?{googlePlayPrimaryPurchaseToken:'foreign-token',activePurchaseTokens:['foreign-token','another-token']}:{appStoreOriginalTransactionId:'foreign-original'})};
@@ -850,9 +852,9 @@ async function test(name, run) { await run(); passed += 1; console.log(`ok ${pas
             assert.equal(stored.subscriptions[platform].originalTransactionId,undefined);
             assert.equal(db.docs.get(`subscription_ownership/${ownerId}`).ownerUid,'old');
             assert.equal(stored.billingConfirmation[platform].expiredForeignSeries[0].ownerUid,'old');
-            // A replay of the expired purchase cannot reassign ownership.
-            await assert.rejects(()=>platform==='android'?claimAndroidSubscriptionOwnership(db,liveAdmin,{uid:'user',purchaseToken:'foreign-token',verifiedPurchase:{uidBound:true,active:true,purchasedAt:expiry-1}}):
-              claimIosSubscriptionOwnership(db,liveAdmin,{uid:'user',update:{appStoreOriginalTransactionId:'foreign-original'},transactionInfo:{appAccountToken:currentToken,expiresDate:Date.now()+100000},verifiedPurchase:{uidBound:true,active:true,purchasedAt:expiry-1}}));
+            // A replay of the expired (Store: not active) purchase cannot reassign ownership.
+            await assert.rejects(()=>platform==='android'?claimAndroidSubscriptionOwnership(db,liveAdmin,{uid:'user',purchaseToken:'foreign-token',verifiedPurchase:{uidBound:true,active:false,purchasedAt:expiry-1}}):
+              claimIosSubscriptionOwnership(db,liveAdmin,{uid:'user',update:{appStoreOriginalTransactionId:'foreign-original'},transactionInfo:{appAccountToken:currentToken,expiresDate:Date.now()-100000},verifiedPurchase:{uidBound:true,active:false,purchasedAt:expiry-(ownerEnded?200000:1)}}));
             // Only a newly verified UID-bound purchase after the server proof can reassign.
             const verifiedPurchase={uidBound:true,active:true,purchasedAt:Date.now()};
             if(platform==='android') await claimAndroidSubscriptionOwnership(db,liveAdmin,{uid:'user',purchaseToken:'foreign-token',verifiedPurchase});
@@ -883,7 +885,7 @@ async function test(name, run) { await run(); passed += 1; console.log(`ok ${pas
 
   await test('Build356 legacy Apple user ownership requires verified expiry and fresh UID-bound purchase', async()=>{
     const original='legacy-original';const token='11111111-1111-4111-8111-111111111111';
-    const db=mockDb({'users/user':{appStoreAppAccountToken:token},'users/old':{appStoreOriginalTransactionId:original,subscriptionStatus:'active',subscriptionPlatform:'ios',subscriptionExpiryTime:new Date(Date.now()+100000)}});
+    const db=mockDb({'users/user':{appStoreAppAccountToken:token},'users/old':{appStoreOriginalTransactionId:original,subscriptionStatus:'expired',subscriptionPlatform:'ios',subscriptionExpiryTime:new Date(Date.now()-200000)}});
     const liveAdmin={...admin,FieldValue:{serverTimestamp:()=>new Date(),delete:()=>({__deleted:true})}};
     const endedExpiry=Date.now()-100000;
     const stableApi=handlers(db,{admin:liveAdmin,inspectOwner:inspectSubscriptionSeriesOwnership,verifyApple:async()=>[{state:'ended',transaction:{...apple(endedExpiry),originalTransactionId:original,appAccountToken:'22222222-2222-4222-8222-222222222222'},originalTransactionId:original,expiryMs:endedExpiry}]});
@@ -944,7 +946,7 @@ async function test(name, run) { await run(); passed += 1; console.log(`ok ${pas
     const original='legacy-foreign';const ownerId=platform==='ios'?buildIosOwnershipId(original):buildAndroidOwnershipId(original);
     const token='11111111-1111-4111-8111-111111111111';
     const db=mockDb({'users/user':{...legacy,appStoreAppAccountToken:token},'users/old':{...legacy,
-      ...(platform==='ios'?{appStoreOriginalTransactionId:original}:{googlePlayPrimaryPurchaseToken:original,activePurchaseTokens:[original]})},
+      ...(platform==='ios'?{appStoreOriginalTransactionId:original,subscriptions:{ios:{status:'expired',expiryTime:new Date(expiry-100000),originalTransactionId:original}}}:{googlePlayPrimaryPurchaseToken:original,activePurchaseTokens:[original]})},
       [`subscription_ownership/${ownerId}`]:{ownerUid:'old',platform}});
     const liveAdmin={...admin,FieldValue:{serverTimestamp:()=>new Date(),delete:()=>({__deleted:true})}};
     const api=handlers(db,{admin:liveAdmin,inspectOwner:inspectSubscriptionSeriesOwnership,

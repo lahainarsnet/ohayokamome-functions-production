@@ -425,6 +425,11 @@ async function applyUserSubscriptionUpdate(
 
   const storeState = buildIosStoreState({
     status: derived.status,
+    expirySource: derived.expirySource,
+    normalExpiryTime: derived.normalExpiresDate > 0 ? admin.Timestamp.fromMillis(derived.normalExpiresDate) : null,
+    graceExpiryTime: derived.graceExpiresDate > 0 ? admin.Timestamp.fromMillis(derived.graceExpiresDate) : null,
+    storeObservedAtMs: derived.storeObservedAtMs,
+    storeTransactionTimeMs: derived.storeTransactionTimeMs,
     expiryTime,
     autoRenewing:
       typeof options.autoRenewing === "boolean" ? options.autoRenewing : null,
@@ -730,7 +735,8 @@ function createAppStoreNotificationHandler({
       }
       const latestEntry = await pickLatestTransactionEntry(
         apiResult.body,
-        (signedInfo) => verifier.verifyAndDecodeTransaction(signedInfo)
+        (signedInfo) => verifier.verifyAndDecodeTransaction(signedInfo),
+        { decodeRenewal: (signedInfo) => verifier.verifyAndDecodeRenewalInfo(signedInfo) }
       );
 
       if (!latestEntry?.transactionInfo) {
@@ -746,7 +752,7 @@ function createAppStoreNotificationHandler({
         return;
       }
 
-      const derived = deriveSubscriptionState(latestEntry.transactionInfo);
+      const derived = deriveSubscriptionState(latestEntry.transactionInfo, Date.now(), { appleStatus: latestEntry.appleStatus, renewalInfo: latestEntry.renewalInfo, storeObservedAtMs: apiResult.storeObservedAtMs });
       if (derived.validationCode === "BUNDLE_ID_MISMATCH" || derived.validationCode === "PRODUCT_ID_MISMATCH") {
         await writeSubscriptionEvent(db, notificationUUID, {
           ...baseFields,

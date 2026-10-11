@@ -105,6 +105,26 @@ function toFirestoreExpiryValue(admin, value) {
   return admin.Timestamp.fromDate(date);
 }
 
+// Select a Store-authorized deadline, never the longest of unrelated deadlines.
+// expiryTime remains the effective deadline for existing Flutter readers.
+function selectStoreExpiry(storeState) {
+  const source = storeState?.expirySource || (normalizeStatus(storeState?.status) === "grace" ? "grace" : "normal");
+  const explicit = storeState && Object.prototype.hasOwnProperty.call(storeState, "expirySource");
+  const value = source === "grace"
+    ? (explicit ? storeState.graceExpiryTime : storeState.expiryTime)
+    : (explicit ? storeState.normalExpiryTime : storeState?.expiryTime);
+  return { expirySource: source, expiryDate: parseExpiryToDate(value) };
+}
+
+function storeDeadlineFields({ expiryTime, expirySource = "normal", normalExpiryTime, graceExpiryTime, storeObservedAtMs }) {
+  return {
+    expirySource,
+    normalExpiryTime: normalExpiryTime !== undefined ? normalExpiryTime : (expirySource === "normal" ? expiryTime || null : null),
+    graceExpiryTime: graceExpiryTime !== undefined ? graceExpiryTime : (expirySource === "grace" ? expiryTime || null : null),
+    ...(Number(storeObservedAtMs) > 0 ? { storeObservedAtMs: Number(storeObservedAtMs) } : {}),
+  };
+}
+
 function isStoreEntitlementUsable(storeState, now = new Date()) {
   if (!storeState || typeof storeState !== "object") {
     return {
@@ -115,7 +135,10 @@ function isStoreEntitlementUsable(storeState, now = new Date()) {
     };
   }
   const status = normalizeStatus(storeState.status);
-  const expiryDate = parseExpiryToDate(storeState.expiryTime);
+  if (storeState.expirySource && !["normal", "grace"].includes(storeState.expirySource)) {
+    return { usable: false, reason: "inconsistent_store_data", status, expiryDate: null };
+  }
+  const { expiryDate, expirySource } = selectStoreExpiry(storeState);
   const expiryIsFuture =
     expiryDate instanceof Date && expiryDate.getTime() > now.getTime();
 
@@ -154,6 +177,7 @@ function isStoreEntitlementUsable(storeState, now = new Date()) {
   return {
     usable: true,
     reason: "usable",
+    expirySource,
     status,
     expiryDate,
   };
@@ -242,6 +266,7 @@ function summarizeLegacyUpdate(legacyUpdate) {
 }
 
 function buildIosStoreState({
+  expirySource, normalExpiryTime, graceExpiryTime, storeObservedAtMs, storeTransactionTimeMs,
   status,
   expiryTime,
   autoRenewing = null,
@@ -252,6 +277,8 @@ function buildIosStoreState({
   updatedAt,
 }) {
   const state = {
+    ...storeDeadlineFields({ expiryTime, expirySource, normalExpiryTime, graceExpiryTime, storeObservedAtMs }),
+    ...(storeTransactionTimeMs > 0 ? { storeTransactionTimeMs } : {}),
     status: normalizeStatus(status) || "none",
     originalTransactionId: String(originalTransactionId || ""),
     transactionId: String(transactionId || ""),
@@ -259,9 +286,7 @@ function buildIosStoreState({
     source: String(source || ""),
     updatedAt,
   };
-  if (expiryTime != null && expiryTime !== "") {
-    state.expiryTime = expiryTime;
-  }
+  state.expiryTime = expiryTime != null && expiryTime !== "" ? expiryTime : null;
   if (typeof autoRenewing === "boolean") {
     state.autoRenewing = autoRenewing;
   } else {
@@ -271,6 +296,7 @@ function buildIosStoreState({
 }
 
 function buildAndroidStoreState({
+  expirySource, normalExpiryTime, graceExpiryTime, storeObservedAtMs, storeTransactionTimeMs,
   status,
   expiryTime,
   autoRenewing = null,
@@ -281,15 +307,15 @@ function buildAndroidStoreState({
   updatedAt,
 }) {
   const state = {
+    ...storeDeadlineFields({ expiryTime, expirySource, normalExpiryTime, graceExpiryTime, storeObservedAtMs }),
+    ...(storeTransactionTimeMs > 0 ? { storeTransactionTimeMs } : {}),
     status: normalizeStatus(status) || "none",
     primaryPurchaseToken: String(primaryPurchaseToken || ""),
     subscriptionState: String(subscriptionState || ""),
     source: String(source || ""),
     updatedAt,
   };
-  if (expiryTime != null && expiryTime !== "") {
-    state.expiryTime = expiryTime;
-  }
+  state.expiryTime = expiryTime != null && expiryTime !== "" ? expiryTime : null;
   if (typeof autoRenewing === "boolean") {
     state.autoRenewing = autoRenewing;
   } else {
@@ -623,6 +649,8 @@ async function commitUserSubscriptionDualWrite({
   meta = {},
   completionWrite = null,
   writeGuard = null,
+  // Optional: run inside a caller-owned transaction (all-or-nothing with the caller's other writes).
+  externalTx = null,
 }) {
   const normalizedPlatform = String(platform || "")
     .trim()
@@ -641,7 +669,7 @@ async function commitUserSubscriptionDualWrite({
   const startedAt = Date.now();
 
   try {
-    const result = await db.runTransaction(async (tx) => {
+    const dualWriteBody = async (tx) => {
       const snap = await tx.get(userRef);
       const data = snap.exists ? snap.data() || {} : {};
       let completionExisting = null;
@@ -659,6 +687,22 @@ async function commitUserSubscriptionDualWrite({
           : {};
       const beforeIos = subscriptions.ios || null;
       const beforeAndroid = subscriptions.android || null;
+      const previousStore = normalizedPlatform === "ios" ? beforeIos : beforeAndroid;
+      // A failed/incomplete observation cannot erase an already confirmed stop.
+      if (normalizeStatus(storeState.status) === "unknown" && UNUSABLE_STORE_STATUSES.has(normalizeStatus(previousStore?.status))) {
+        return { reconcileWriteSkipped: true, skipReason: "unknown_cannot_replace_confirmed_stop" };
+      }
+      if (!completionWrite && normalizedPlatform === "ios" && previousStore?.transactionId &&
+          previousStore.transactionId !== storeState.transactionId &&
+          Number(previousStore.storeTransactionTimeMs) > Number(storeState.storeTransactionTimeMs) &&
+          Number(storeState.storeTransactionTimeMs) > 0) {
+        return { reconcileWriteSkipped: true, skipReason: "older_store_transaction" };
+      }
+      // Compare observation order, not expiry length: revocations/shortenings must apply.
+      if (Number(previousStore?.storeObservedAtMs) > Number(storeState.storeObservedAtMs || 0) &&
+          Number(storeState.storeObservedAtMs) > 0) {
+        return { reconcileWriteSkipped: true, skipReason: "older_store_observation" };
+      }
 
       if (typeof writeGuard === "function") {
         const guardDecision = writeGuard(data, storeState, meta);
@@ -792,7 +836,8 @@ async function commitUserSubscriptionDualWrite({
         accountLegacy,
         activePurchaseTokens,
       };
-    });
+    };
+    const result = externalTx ? await dualWriteBody(externalTx) : await db.runTransaction(dualWriteBody);
 
     if (result.reconcileWriteSkipped) {
       const skipPayload = {
@@ -923,6 +968,8 @@ async function recomputeEntitlementFromStoredStores({
 }
 
 module.exports = {
+  selectStoreExpiry,
+  storeDeadlineFields,
   ENTITLEMENT_TRACE,
   USABLE_STORE_STATUSES,
   UNUSABLE_STORE_STATUSES,

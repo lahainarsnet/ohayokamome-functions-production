@@ -540,7 +540,8 @@ async function runTests() {
     now,
     { appId: IOS_FIREBASE_APP_ID },
   );
-  assert.strictEqual(iosGoogleOnly.subscriptionUsable, false);
+  // Case 13 (Android -> iPhone): the same UID's Active Android contract is usable on the iPhone.
+  assert.strictEqual(iosGoogleOnly.subscriptionUsable, true);
 
   const androidGoogleStore = evaluateCallerSubscriptionAccess(
     {
@@ -562,7 +563,8 @@ async function runTests() {
     now,
     { appId: ANDROID_FIREBASE_APP_ID },
   );
-  assert.strictEqual(androidAppleOnly.subscriptionUsable, false);
+  // Case 14: an Active iPhone contract of the same UID is usable on the Android device.
+  assert.strictEqual(androidAppleOnly.subscriptionUsable, true);
 
   const expired = evaluateCallerSubscriptionAccess(
     {
