@@ -690,18 +690,18 @@ async function commitUserSubscriptionDualWrite({
       const previousStore = normalizedPlatform === "ios" ? beforeIos : beforeAndroid;
       // A failed/incomplete observation cannot erase an already confirmed stop.
       if (normalizeStatus(storeState.status) === "unknown" && UNUSABLE_STORE_STATUSES.has(normalizeStatus(previousStore?.status))) {
-        return { reconcileWriteSkipped: true, skipReason: "unknown_cannot_replace_confirmed_stop" };
+        return { reconcileWriteSkipped: true, skipReason: "unknown_cannot_replace_confirmed_stop", billingRevisionAfter: Number(data.billingRevision || 0) };
       }
       if (!completionWrite && normalizedPlatform === "ios" && previousStore?.transactionId &&
           previousStore.transactionId !== storeState.transactionId &&
           Number(previousStore.storeTransactionTimeMs) > Number(storeState.storeTransactionTimeMs) &&
           Number(storeState.storeTransactionTimeMs) > 0) {
-        return { reconcileWriteSkipped: true, skipReason: "older_store_transaction" };
+        return { reconcileWriteSkipped: true, skipReason: "older_store_transaction", billingRevisionAfter: Number(data.billingRevision || 0) };
       }
       // Compare observation order, not expiry length: revocations/shortenings must apply.
       if (Number(previousStore?.storeObservedAtMs) > Number(storeState.storeObservedAtMs || 0) &&
           Number(storeState.storeObservedAtMs) > 0) {
-        return { reconcileWriteSkipped: true, skipReason: "older_store_observation" };
+        return { reconcileWriteSkipped: true, skipReason: "older_store_observation", billingRevisionAfter: Number(data.billingRevision || 0) };
       }
 
       if (typeof writeGuard === "function") {
@@ -715,6 +715,7 @@ async function commitUserSubscriptionDualWrite({
             completionRecordOnly: false,
             reconcileWriteSkipped: true,
             skipReason: String(guardDecision.reason || "write_guard_skip"),
+            billingRevisionAfter: Number(data.billingRevision || 0),
             entitlement: computeAccountEntitlement(beforeIos, beforeAndroid),
             entitlementExpiryTime: null,
             accountLegacy: {},
@@ -831,6 +832,10 @@ async function commitUserSubscriptionDualWrite({
         afterIos: preserveNewerIos ? beforeIos : nextIos,
         afterAndroid: preserveNewerIos ? beforeAndroid : nextAndroid,
         completionRecordOnly: Boolean(preserveNewerIos),
+        // 書き込み後の更新番号（書き込まなかった場合は現在の番号）。A・C1 が結果を照合できるように返す。
+        billingRevisionAfter: preserveNewerIos
+          ? Number(data.billingRevision || 0)
+          : Number(data.billingRevision || 0) + 1,
         entitlement,
         entitlementExpiryTime,
         accountLegacy,

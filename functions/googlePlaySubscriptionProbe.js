@@ -16,6 +16,7 @@ const {
   tokenSuffix,
   ANDROID_STALE_TRACE,
 } = require("./googlePlaySubscriptionNotifications");
+const { buildAndroidOwnershipId } = require("./subscriptionOwnership");
 
 const PROBE_TRACE = "SUBSCRIPTION_ACK_GOOGLE_PLAY_PROBE";
 
@@ -236,6 +237,49 @@ function createGooglePlaySubscriptionProbeHandler({
     }
 
     const baselinePrimaryToken = purchaseToken;
+    // 対策①: 問い合わせ開始時（ストアを呼ぶ前）の更新番号。書き込みのトランザクション内で照合する。
+    const baselineBillingRevision = Number(userData.billingRevision || 0);
+
+    // 別のUIDが所有する購入トークンの契約を、このUIDの契約として同期しない。
+    // 所有権の記録がない（旧形式）場合は、従来どおり通す。
+    try {
+      const ownerSnap = await db
+        .collection("subscription_ownership")
+        .doc(buildAndroidOwnershipId(purchaseToken))
+        .get();
+      const ownerUid = ownerSnap && ownerSnap.exists
+        ? String(
+            (typeof ownerSnap.get === "function"
+              ? ownerSnap.get("ownerUid")
+              : (ownerSnap.data() || {}).ownerUid) || "",
+          ).trim()
+        : "";
+      if (ownerUid && ownerUid !== uid) {
+        logger.warn(`${PROBE_TRACE} ownership mismatch`, {
+          uidSuffix,
+          tokenSuffix: tokenSuffix(purchaseToken),
+          reconcileMode,
+          phase: phase || "",
+        });
+        return {
+          outcome: "failed",
+          reason: "ownership_mismatch",
+          billingRevisionBefore: baselineBillingRevision,
+          billingRevisionAfter: baselineBillingRevision,
+        };
+      }
+    } catch (ownershipError) {
+      logger.warn(`${PROBE_TRACE} ownership check failed`, {
+        uidSuffix,
+        errorType: ownershipError?.constructor?.name || typeof ownershipError,
+      });
+      return {
+        outcome: "failed",
+        reason: "ownership_check_failed",
+        billingRevisionBefore: baselineBillingRevision,
+        billingRevisionAfter: baselineBillingRevision,
+      };
+    }
 
     logger.info(`${PROBE_TRACE} google_play_api start`, {
       uidSuffix,
@@ -277,6 +321,9 @@ function createGooglePlaySubscriptionProbeHandler({
           outcome: "inactive",
           reason: "no_matched_line_item",
           subscriptionState: subscription?.subscriptionState || "",
+          storeState: "unknown",
+          billingRevisionBefore: baselineBillingRevision,
+          billingRevisionAfter: baselineBillingRevision,
           apiAttempts,
         };
       }
@@ -291,6 +338,19 @@ function createGooglePlaySubscriptionProbeHandler({
       const inactiveReason = suspended ? "google_play_suspended" : "google_play_not_active";
       const freshSnap = await userRef.get();
       const freshData = freshSnap.exists ? freshSnap.data() || {} : {};
+      // A・C1へ返す結果。ストアの状態を4分類へ確定できるものだけを expired とし、それ以外は unknown / suspended とする。
+      const freshRevision = Number(freshData.billingRevision || 0);
+      const revisionInfo = (after) => ({
+        billingRevisionBefore: baselineBillingRevision,
+        billingRevisionAfter: Number.isFinite(after) ? after : freshRevision,
+      });
+      const storeState = isUsableEntitlement(derived)
+        ? "active"
+        : derived.status === "expired"
+          ? "expired"
+          : suspended
+            ? "suspended"
+            : "unknown";
 
       if (isUsableEntitlement(derived)) {
         const evaluation = reconcileMode
@@ -327,6 +387,8 @@ function createGooglePlaySubscriptionProbeHandler({
             subscriptionState: derived.subscriptionState || "",
             firestoreApplied: false,
             skipReason: evaluation.reason || "stale_skip",
+            storeState,
+            ...revisionInfo(freshRevision),
             apiAttempts,
           };
         }
@@ -347,6 +409,7 @@ function createGooglePlaySubscriptionProbeHandler({
               : "google_probe",
             primaryPurchaseToken: purchaseToken,
             baselinePrimaryToken,
+            baselineBillingRevision,
           },
         );
 
@@ -376,6 +439,32 @@ function createGooglePlaySubscriptionProbeHandler({
           subscriptionState: derived.subscriptionState || "",
           firestoreApplied: applyResult.applied === true,
           skipReason: applyResult.reason || "",
+          storeState,
+          ...revisionInfo(applyResult.billingRevisionAfter),
+          apiAttempts,
+        };
+      }
+
+      // 契約状態を確定できない応答（状態不明など）では、Firebase の契約情報を変更しない。
+      if (derived.status === "unknown") {
+        logger.info(`${PROBE_TRACE} inactive`, {
+          uidSuffix,
+          reason: "google_play_unknown_state",
+          subscriptionState: derived.subscriptionState || "",
+          reconcileMode,
+          phase: phase || "",
+          apiAttempts,
+        });
+        return {
+          outcome: "inactive",
+          reason: "google_play_unknown_state",
+          subscriptionState: derived.subscriptionState || "",
+          status: derived.status || "",
+          expiryTime: derived.expiryTime || null,
+          firestoreApplied: false,
+          skipReason: "unknown_state_not_applied",
+          storeState,
+          ...revisionInfo(freshRevision),
           apiAttempts,
         };
       }
@@ -395,6 +484,8 @@ function createGooglePlaySubscriptionProbeHandler({
           subscriptionState: derived.subscriptionState || "",
           status: derived.status || "",
           expiryTime: derived.expiryTime || null,
+          storeState,
+          ...revisionInfo(freshRevision),
           apiAttempts,
         };
       }
@@ -433,6 +524,8 @@ function createGooglePlaySubscriptionProbeHandler({
           expiryTime: derived.expiryTime || null,
           firestoreApplied: false,
           skipReason: evaluation.reason || "",
+          storeState,
+          ...revisionInfo(freshRevision),
           apiAttempts,
         };
       }
@@ -449,6 +542,7 @@ function createGooglePlaySubscriptionProbeHandler({
           dualWriteSource: "google_probe_reconcile",
           primaryPurchaseToken: purchaseToken,
           baselinePrimaryToken,
+          baselineBillingRevision,
         },
       );
 
@@ -480,6 +574,8 @@ function createGooglePlaySubscriptionProbeHandler({
         expiryTime: derived.expiryTime || null,
         firestoreApplied: applyResult.applied === true,
         skipReason: applyResult.reason || "",
+        storeState,
+        ...revisionInfo(applyResult.billingRevisionAfter),
         apiAttempts,
       };
     } catch (error) {
@@ -499,6 +595,9 @@ function createGooglePlaySubscriptionProbeHandler({
           outcome: "inactive",
           reason: "google_play_token_no_longer_available",
           tokenGoneReason: goneReason,
+          storeState: "token_gone",
+          billingRevisionBefore: baselineBillingRevision,
+          billingRevisionAfter: baselineBillingRevision,
           apiAttempts,
         };
       }

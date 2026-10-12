@@ -37,6 +37,41 @@ for (const os of ['ios', 'android']) {
       assert.equal((await f.record(request(os))).stopReason, PROVISIONAL_LIMIT_CODE);
     }
   });
+  // 契約が有効な状態（active／grace）のまま期限の日付だけ過ぎている場合も、仮延長の対象。120時間の上限は同じに守られる。
+  test(`${os} time-lapsed Active record: provisional is capped at 120h and never resets the anchor`, async () => {
+    const lapsed = status => user(os, status, {subscriptions: {[os]: {status, expiryTime: at(-1)}}});
+    let now = at(0);
+    const f = fixture(lapsed('active'), [], () => now);
+    // 仮延長なしでは、サーバーは送信・音声認識を許可しない。
+    assert.equal(resolve(stored(f), os, now).allowed, false);
+    const first = await f.record(request(os));
+    assert.equal(first.outcome, 'unknownRecorded');
+    assert.equal(first.untilMillis, at(24).getTime());
+    assert.equal(date(stored(f).chatUnknownProvisionalStartedAt).getTime(), BASE.getTime());
+    assert.equal(resolve(stored(f), os, at(1)).allowed, true, 'provisional allows send / STT');
+    for (const hours of [24, 48, 96, 119]) {
+      now = at(hours);
+      const r = await f.record(request(os));
+      assert.equal(r.untilMillis, at(Math.min(hours + 24, 120)).getTime());
+      assert.equal(date(stored(f).chatUnknownProvisionalStartedAt).getTime(), BASE.getTime(), 'anchor never moves');
+      await f.clear(request(os));
+      assert.equal(date(stored(f).chatUnknownProvisionalStartedAt).getTime(), BASE.getTime(), 'a time-lapsed Active record is not an authenticated Active');
+      await f.record(request(os));
+    }
+    assert.equal(resolve(stored(f), os, at(120 - 1 / HOUR)).allowed, true, '119h59m');
+    for (const hours of [120, 121, 240]) {
+      now = at(hours);
+      assert.equal(resolve(stored(f), os, now).allowed, false, `${hours}h: server refuses send / STT`);
+      assert.equal(resolve(stored(f), os, now).provisionalLimitReached, true);
+      const r = await f.record(request(os));
+      assert.equal(r.outcome, 'dedicatedStop');
+      assert.equal(r.stopReason, PROVISIONAL_LIMIT_CODE, 'no new provisional after 120h');
+      assert.equal(stored(f).chatUnknownProvisionalUntil, undefined);
+    }
+    // 猶予（grace）の状態のまま期限の日付だけ過ぎた場合も同じ。
+    const g = fixture(lapsed('grace'), [], () => at(0));
+    assert.equal((await g.record(request(os))).outcome, 'unknownRecorded');
+  });
   test(`${os} only authenticated current OS Active resets, then new Unknown starts anew`, async () => {
     let now = at(0);
     const f = fixture(user(os), [], () => now);

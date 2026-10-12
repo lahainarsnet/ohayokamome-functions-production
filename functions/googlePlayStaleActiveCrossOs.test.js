@@ -52,6 +52,10 @@ function applyMerge(target, payload) {
 function createQueryDb(userDocs) {
   return {
     collection(name) {
+      if (name === "subscription_ownership") {
+        // 所有権の記録なし（旧形式）として扱う。
+        return { doc: () => ({ get: async () => ({ exists: false }) }) };
+      }
       if (name !== "users") {
         throw new Error(`Unexpected collection: ${name}`);
       }

@@ -46,6 +46,12 @@ const DEDICATED_STOP_DENY_REASONS = new Set([
   "inconsistent_legacy_data",
 ]);
 
+// ストアで終了を確認した記録ではなく、契約が有効な状態（active 等）のまま、期限の日付だけが過ぎている場合の理由。
+// 更新の通知が間に合っていない可能性があるため、確定した期限切れではなく、仮延長の対象（Unknown）とする。
+// 状態が expired / paused / refunded / revoked / none などの確定した終了は、ここには入らない。
+const TIME_LAPSED_DENY_REASONS = new Set(["expiry_expired", "expiry_not_future"]);
+const TIME_LAPSED_USABLE_STATUSES = new Set(["active", "trial", "grace", "canceled", "cancelled"]);
+
 const UNKNOWN_ELIGIBLE_DENY_REASONS = new Set([
   "data_missing",
   "empty_status",
@@ -180,6 +186,16 @@ function classifyChatPlatformEntitlement(userData, platform, now = new Date(), o
   if (decision.usable) {
     return {
       contractState: CHAT_CONTRACT_OUTCOME.active,
+      decision,
+    };
+  }
+  if (
+    TIME_LAPSED_DENY_REASONS.has(String(decision.denyReason || "")) &&
+    decision.expiryDate instanceof Date &&
+    TIME_LAPSED_USABLE_STATUSES.has(String(decision.status || "").trim().toLowerCase())
+  ) {
+    return {
+      contractState: CHAT_CONTRACT_OUTCOME.unknown,
       decision,
     };
   }

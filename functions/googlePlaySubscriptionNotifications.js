@@ -838,11 +838,32 @@ function evaluateAndroidStaleReconcileApply(existingData, derived, context = {})
 const GOOGLE_PROBE_RECONCILE_DUAL_WRITE_SOURCE = "google_probe_reconcile";
 
 function buildGoogleProbeReconcileWriteGuard(derived, options = {}) {
-  if (options.dualWriteSource !== GOOGLE_PROBE_RECONCILE_DUAL_WRITE_SOURCE) {
+  const isReconcile =
+    options.dualWriteSource === GOOGLE_PROBE_RECONCILE_DUAL_WRITE_SOURCE;
+  const hasBaselineRevision =
+    options.baselineBillingRevision !== undefined &&
+    options.baselineBillingRevision !== null &&
+    Number.isFinite(Number(options.baselineBillingRevision));
+  if (!isReconcile && !hasBaselineRevision) {
     return undefined;
   }
   const baselinePrimaryToken = String(options.baselinePrimaryToken || "").trim();
+  const baselineBillingRevision = hasBaselineRevision
+    ? Number(options.baselineBillingRevision)
+    : null;
   return (data) => {
+    // 対策①: 問い合わせ開始時の更新番号と、書き込み直前の更新番号が違えば、別の更新が先に完了している。
+    // 古い問い合わせ結果で上書きしない。
+    if (
+      baselineBillingRevision !== null &&
+      Number(data && data.billingRevision ? data.billingRevision : 0) !==
+        baselineBillingRevision
+    ) {
+      return { skip: true, reason: "revision_changed" };
+    }
+    if (!isReconcile) {
+      return null;
+    }
     const evaluation = evaluateAndroidStaleReconcileApply(data, derived, {
       baselinePrimaryToken,
     });
@@ -1007,7 +1028,11 @@ async function applyGoogleSubscriptionUpdateToUser(
       beforeAndroidExpiry: formatExpiryIso(readStoredAndroidExpiry(existingData)),
       incomingAndroidExpiry: formatExpiryIso(derived.expiryDate),
     });
-    return { applied: false, reason: skipReason };
+    return {
+      applied: false,
+      reason: skipReason,
+      billingRevisionAfter: dualWriteResult.billingRevisionAfter,
+    };
   }
 
   logAndroidStaleTrace(options.logger, {
@@ -1024,7 +1049,10 @@ async function applyGoogleSubscriptionUpdateToUser(
     ...staleFields,
   });
 
-  return { applied: true };
+  return {
+    applied: true,
+    billingRevisionAfter: dualWriteResult && dualWriteResult.billingRevisionAfter,
+  };
 }
 
 function buildBaseEventFields({

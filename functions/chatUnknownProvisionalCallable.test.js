@@ -88,7 +88,13 @@ async function main() {
     const missingExpiry = fixture({ activeDeviceId: DEVICE, subscriptions: { [platform]: { status: 'active' } } });
     assert.equal((await missingExpiry.record(request(platform))).outcome, 'unknownRecorded'); cases++;
     const passedExpiry = fixture({ activeDeviceId: DEVICE, subscriptions: { [platform]: { status: 'active', expiryTime: new Date(Date.now()-1000) } } });
-    assert.equal((await passedExpiry.record(request(platform))).outcome, 'expired'); cases++;
+    // 契約が有効な状態のまま期限の日付だけ過ぎている場合は、確定した期限切れではなく、仮延長の対象（Unknown）。
+    assert.equal((await passedExpiry.record(request(platform))).outcome, 'unknownRecorded'); cases++;
+    // ストアで確定した終了（状態が expired など）は、期限の日付に関係なく、仮延長しない。
+    for (const [status, outcome] of [['expired', 'expired'], ['paused', 'expired'], ['refunded', 'expired'], ['revoked', 'expired'], ['none', 'noPurchase']]) {
+      const definitive = fixture({ activeDeviceId: DEVICE, subscriptions: { [platform]: { status, expiryTime: new Date(Date.now()-1000) } } });
+      assert.equal((await definitive.record(request(platform))).outcome, outcome); cases++;
+    }
     const f = fixture(user(platform));
     const before = Date.now(); const result = await f.record(request(platform)); const after = Date.now();
     assert.equal(result.outcome, 'unknownRecorded');
