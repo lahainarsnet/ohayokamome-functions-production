@@ -22,6 +22,9 @@ const { normalizeUuid, tokenSuffix } = require("./billingFinalTrace");
 const {
   readTrustedIosOwnershipOwner,
   detachStaleAppleIdentifiersFromOtherUsers,
+  isTrustedIosOwnershipStatus,
+  buildIosOwnershipId,
+  SUBSCRIPTION_OWNERSHIP_COLLECTION,
 } = require("./subscriptionOwnership");
 
 const NOTIFICATION_TRACE = "APP_STORE_NOTIFICATION_TRACE";
@@ -349,6 +352,9 @@ function decideAppStoreNotificationApply({
   originalOwnerUid,
   appAccountToken,
   tokenOwnerUids = [],
+  // Optional result of evaluateRecordedTransferProof(). Only a proven formal ownership transfer can turn the
+  // "token owner differs from current owner" deferral into an apply; everything else keeps the old decision.
+  transferProof = null,
 }) {
   const originalUid = String(originalOwnerUid || "").trim();
   const token = normalizeUuid(appAccountToken);
@@ -370,6 +376,14 @@ function decideAppStoreNotificationApply({
     };
   }
   if (owners.length === 1 && originalUid && owners[0] !== originalUid) {
+    if (transferProof && transferProof.ok === true) {
+      return {
+        action: "apply",
+        reason: "token_matches_recorded_ownership_transfer",
+        tokenOwnerUid: owners[0],
+        transferProof: transferProof.reason || "recorded_ownership_transfer",
+      };
+    }
     return {
       action: "defer",
       reason: "deferred_token_mismatch",
@@ -380,6 +394,118 @@ function decideAppStoreNotificationApply({
     return { action: "defer", reason: "deferred_token_ambiguous" };
   }
   return { action: "apply", reason: "legacy_token_unlinked" };
+}
+
+/**
+ * Proof that the current owner holds this contract series through a FORMAL ownership transfer, so that an Apple
+ * notification carrying the previous owner's appAccountToken may be applied to the current owner.
+ *
+ * Every condition must hold (any failure keeps the old "deferred_token_mismatch" behaviour):
+ *  1. the notification token (Apple-signed, verified by the handler) is present;
+ *  2. the series' ownership record names the current owner, is trusted, belongs to this series, and its recorded
+ *     appAccountToken (saved by the server when the purchase/transfer was verified) equals the notification token;
+ *  3. the current owner's own record is bound to this very series (boundSubscriptionSeries.ios.ownershipId);
+ *  4. the token's owner holds the formal transfer record written by the ownership-transfer transaction
+ *     (subscriptions.ios.source === "ownership_transferred" with transferredAt), owns this token, and no longer
+ *     holds the series.
+ * The notification token alone never proves a transfer. Nothing here ever selects the token owner as the target.
+ */
+function evaluateRecordedTransferProof({
+  appAccountToken,
+  originalTransactionId,
+  currentOwnerUid,
+  tokenOwnerUid,
+  ownershipRecord,
+  ownerUser,
+  tokenOwnerUser,
+}) {
+  const reject = (reason) => ({ ok: false, reason });
+  const token = normalizeUuid(appAccountToken);
+  const originalId = String(originalTransactionId || "").trim();
+  const currentUid = String(currentOwnerUid || "").trim();
+  const previousUid = String(tokenOwnerUid || "").trim();
+  if (!token) return reject("notification_token_missing");
+  if (!originalId || !currentUid || !previousUid) return reject("identity_missing");
+  if (currentUid === previousUid) return reject("same_uid");
+  let ownershipId;
+  try {
+    ownershipId = buildIosOwnershipId(originalId);
+  } catch (error) {
+    return reject("series_id_invalid");
+  }
+
+  // 2. ownership record of this series
+  if (!ownershipRecord) return reject("ownership_record_missing");
+  if (String(ownershipRecord.ownerUid || "").trim() !== currentUid) return reject("ownership_owner_mismatch");
+  if (!isTrustedIosOwnershipStatus(ownershipRecord.status)) return reject("ownership_status_untrusted");
+  const recordedOriginalId = String(ownershipRecord.appStoreOriginalTransactionId || "").trim();
+  if (recordedOriginalId && recordedOriginalId !== originalId) return reject("series_mismatch");
+  if (normalizeUuid(ownershipRecord.appAccountToken) !== token) return reject("recorded_token_mismatch");
+
+  // 3. current owner is bound to this series
+  const bound = ownerUser?.boundSubscriptionSeries?.ios;
+  if (!bound || String(bound.ownershipId || "").trim() !== ownershipId) return reject("owner_not_bound_to_series");
+
+  // 4. previous owner (the token's owner) carries the formal transfer record
+  if (!tokenOwnerUser) return reject("token_owner_record_missing");
+  if (normalizeUuid(tokenOwnerUser.appStoreAppAccountToken) !== token) return reject("token_owner_record_mismatch");
+  const previousIos = tokenOwnerUser.subscriptions?.ios;
+  if (!previousIos || String(previousIos.source || "") !== "ownership_transferred") return reject("transfer_record_missing");
+  if (!previousIos.transferredAt) return reject("transfer_time_missing");
+  const previousStillHolds = [previousIos.originalTransactionId, tokenOwnerUser.appStoreOriginalTransactionId]
+    .some((value) => String(value || "").trim() === originalId);
+  if (previousStillHolds) return reject("previous_owner_still_holds_series");
+
+  return { ok: true, reason: "recorded_ownership_transfer", ownershipId };
+}
+
+function snapshotToData(snap) {
+  if (!snap || snap.exists === false) return null;
+  if (typeof snap.data === "function") return snap.data() || {};
+  return null;
+}
+
+// Reads the three records the proof needs. `reader` is db (plain reads) or a transaction (tx.get).
+async function loadTransferProofRecords(reader, db, { originalTransactionId, currentOwnerUid, tokenOwnerUid }) {
+  const ownershipId = buildIosOwnershipId(originalTransactionId);
+  const get = (ref) => (typeof reader.get === "function" && reader !== db ? reader.get(ref) : ref.get());
+  const ownershipSnap = await get(db.collection(SUBSCRIPTION_OWNERSHIP_COLLECTION).doc(ownershipId));
+  const ownerSnap = await get(db.collection("users").doc(currentOwnerUid));
+  const tokenOwnerSnap = await get(db.collection("users").doc(tokenOwnerUid));
+  return {
+    ownershipRecord: snapshotToData(ownershipSnap),
+    ownerUser: snapshotToData(ownerSnap),
+    tokenOwnerUser: snapshotToData(tokenOwnerSnap),
+  };
+}
+
+async function evaluateTransferProofFromDb(reader, db, args) {
+  const records = await loadTransferProofRecords(reader, db, args);
+  return evaluateRecordedTransferProof({ ...args, ...records });
+}
+
+/**
+ * Applies a notification to the current owner while the transfer proof is re-verified INSIDE the write transaction.
+ * If the ownership records changed since the proof was first evaluated, nothing is written and
+ * TRANSFER_PROOF_CHANGED is thrown (the caller defers the notification like any unproven mismatch).
+ */
+async function applyUserSubscriptionUpdateWithTransferGuard(db, admin, uid, derived, source, options, transferProofArgs) {
+  if (!transferProofArgs || String(transferProofArgs.currentOwnerUid || "") !== String(uid || "")) {
+    const mismatch = new Error("TRANSFER_PROOF_CHANGED");
+    mismatch.code = "TRANSFER_PROOF_CHANGED";
+    mismatch.reason = "target_is_not_current_owner";
+    throw mismatch;
+  }
+  return db.runTransaction(async (tx) => {
+    const recheck = await evaluateTransferProofFromDb(tx, db, transferProofArgs);
+    if (!recheck.ok) {
+      const changed = new Error("TRANSFER_PROOF_CHANGED");
+      changed.code = "TRANSFER_PROOF_CHANGED";
+      changed.reason = recheck.reason;
+      throw changed;
+    }
+    return applyUserSubscriptionUpdate(db, admin, uid, derived, source, { ...options, externalTx: tx });
+  });
 }
 
 function autoRenewingFromRenewalInfo(renewalInfo) {
@@ -455,6 +581,8 @@ async function applyUserSubscriptionUpdate(
       originalTransactionId: derived.originalTransactionId || "",
     },
     writeGuard: options.writeGuard || null,
+    // Optional caller-owned transaction (used to re-verify an ownership transfer atomically with this write).
+    externalTx: options.externalTx || null,
   });
   if (dualWriteResult?.reconcileWriteSkipped) {
     return {
@@ -661,11 +789,52 @@ function createAppStoreNotificationHandler({
       const tokenLookup = appleToken
         ? await findUsersByAppAccountToken(db, appleToken)
         : { kind: "none", uids: [] };
-      const applyDecision = decideAppStoreNotificationApply({
+      let applyDecision = decideAppStoreNotificationApply({
         originalOwnerUid: userLookup.uid,
         appAccountToken: appleToken,
         tokenOwnerUids: tokenLookup.uids || [],
       });
+      let transferProofArgs = null;
+      if (
+        applyDecision.action === "defer" &&
+        applyDecision.reason === "deferred_token_mismatch" &&
+        userLookup.resolution === "ownership_document" &&
+        applyDecision.tokenOwnerUid
+      ) {
+        // The token's owner differs from the current (ownership-record) owner. Apply only if a FORMAL ownership
+        // transfer is proven from the server-saved records; otherwise keep deferring exactly as before.
+        transferProofArgs = {
+          appAccountToken: appleToken,
+          originalTransactionId,
+          currentOwnerUid: userLookup.uid,
+          tokenOwnerUid: applyDecision.tokenOwnerUid,
+        };
+        let proof;
+        try {
+          proof = await evaluateTransferProofFromDb(db, db, transferProofArgs);
+        } catch (proofError) {
+          proof = { ok: false, reason: "proof_read_failed" };
+        }
+        logger.info(`${NOTIFICATION_TRACE} transfer_proof`, {
+          notificationUUID,
+          ok: proof.ok === true,
+          reason: proof.reason || null,
+          ownerUidSuffix: tokenSuffix(userLookup.uid),
+          tokenOwnerUidSuffix: tokenSuffix(applyDecision.tokenOwnerUid),
+          originalTransactionIdSuffix: tokenSuffix(originalTransactionId),
+          notificationType: baseFields.notificationType,
+          subtype: baseFields.subtype,
+        });
+        applyDecision = decideAppStoreNotificationApply({
+          originalOwnerUid: userLookup.uid,
+          appAccountToken: appleToken,
+          tokenOwnerUids: tokenLookup.uids || [],
+          transferProof: proof,
+        });
+      }
+      const guardedByTransferProof =
+        applyDecision.action === "apply" &&
+        applyDecision.reason === "token_matches_recorded_ownership_transfer";
       if (applyDecision.action === "defer") {
         await writeSubscriptionEvent(db, notificationUUID, {
           ...baseFields,
@@ -795,18 +964,33 @@ function createAppStoreNotificationHandler({
         storeStatus: derived.status,
       });
       try {
-        await applyUserSubscriptionUpdate(
-          db,
-          admin,
-          userLookup.uid,
-          derived,
-          "app_store_notification_v2",
-          {
-            autoRenewing: autoRenewingFromRenewalInfo(latestRenewalInfo),
-            notificationUUID,
-            logger,
-          }
-        );
+        const applyOptions = {
+          autoRenewing: autoRenewingFromRenewalInfo(latestRenewalInfo),
+          notificationUUID,
+          logger,
+        };
+        if (guardedByTransferProof) {
+          // The owner may change while this notification is processed: re-verify the proof inside the same
+          // transaction as the write (Firestore retries on a conflicting ownership change), and abort otherwise.
+          await applyUserSubscriptionUpdateWithTransferGuard(
+            db,
+            admin,
+            userLookup.uid,
+            derived,
+            "app_store_notification_v2",
+            applyOptions,
+            transferProofArgs
+          );
+        } else {
+          await applyUserSubscriptionUpdate(
+            db,
+            admin,
+            userLookup.uid,
+            derived,
+            "app_store_notification_v2",
+            applyOptions
+          );
+        }
         logger.info(`${NOTIFICATION_TRACE} firestore_update.end`, {
           operationId: notificationUUID,
           uidSuffix: tokenSuffix(userLookup.uid),
@@ -815,6 +999,31 @@ function createAppStoreNotificationHandler({
           storeStatus: derived.status,
         });
       } catch (writeError) {
+        if (writeError && writeError.code === "TRANSFER_PROOF_CHANGED") {
+          // Ownership changed under us: nothing was written. Defer exactly like an unproven mismatch.
+          await writeSubscriptionEvent(db, notificationUUID, {
+            ...baseFields,
+            originalTransactionId,
+            transactionId,
+            uid: userLookup.uid,
+            status: "deferred_token_mismatch",
+            errorCode: "deferred_transfer_proof_changed",
+            tokenOwnerUid: applyDecision.tokenOwnerUid || null,
+            userMatch: userLookup.match,
+          });
+          logger.info(`${NOTIFICATION_TRACE} deferred_token_mismatch`, {
+            notificationUUID,
+            reason: "deferred_transfer_proof_changed",
+            proofReason: writeError.reason || null,
+            oldOwnerUidSuffix: tokenSuffix(userLookup.uid),
+            tokenOwnerUidSuffix: tokenSuffix(applyDecision.tokenOwnerUid || ""),
+            originalTransactionIdSuffix: tokenSuffix(originalTransactionId),
+            notificationType: baseFields.notificationType,
+            subtype: baseFields.subtype,
+          });
+          res.status(200).send("OK");
+          return;
+        }
         logger.warn(`${NOTIFICATION_TRACE} firestore_update.end`, {
           operationId: notificationUUID,
           uidSuffix: tokenSuffix(userLookup.uid),
@@ -854,6 +1063,7 @@ function createAppStoreNotificationHandler({
         subscriptionStatus: derived.status,
         userMatch: userLookup.match,
         resolution: userLookup.resolution || null,
+        ...(guardedByTransferProof ? { transferProof: applyDecision.transferProof, tokenOwnerUid: applyDecision.tokenOwnerUid || null } : {}),
       });
 
       logger.info(`${NOTIFICATION_TRACE} processed`, {
@@ -865,6 +1075,7 @@ function createAppStoreNotificationHandler({
         subscriptionStatus: derived.status,
         resolution: userLookup.resolution || null,
         resolutionReason: userLookup.resolutionReason || null,
+        transferProof: guardedByTransferProof ? applyDecision.transferProof : null,
         originalTransactionIdSuffix: tokenSuffix(originalTransactionId),
         legacyCandidateCount:
           typeof userLookup.legacyCandidateCount === "number"
@@ -908,6 +1119,9 @@ function createAppStoreNotificationHandler({
 module.exports = {
   createAppStoreNotificationHandler,
   decideAppStoreNotificationApply,
+  evaluateRecordedTransferProof,
+  evaluateTransferProofFromDb,
+  applyUserSubscriptionUpdateWithTransferGuard,
   findUsersByAppAccountToken,
   findTargetUser,
   resolveAppStoreNotificationUser,
