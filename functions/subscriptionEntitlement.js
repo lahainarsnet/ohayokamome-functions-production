@@ -630,6 +630,27 @@ function extractPlatformSpecificLegacyUpdate(legacyUpdate) {
   return platformSpecific;
 }
 
+const IOS_RECONCILE_DUAL_WRITE_SOURCE = "ios_subscription_reconcile";
+
+/**
+ * True only for an Apple contract inquiry (source ios_subscription_reconcile) that re-observes the SAME contract:
+ * status, transaction id and expiry are all identical to what is already stored. Nothing about the contract changed, so
+ * the stored billingConfirmation (including the pre-purchase "previous series ended" proof) and billingRevision are kept.
+ * Anything else (purchase, notification, transfer, Android, a missing/empty field) is treated as a change.
+ */
+function isUnchangedIosReconcileObservation({ source, platform, completionWrite, before, incoming }) {
+  if (String(source || "") !== IOS_RECONCILE_DUAL_WRITE_SOURCE || platform !== "ios" || completionWrite) return false;
+  if (!before || typeof before !== "object" || !incoming || typeof incoming !== "object") return false;
+  const beforeStatus = normalizeStatus(before.status);
+  const beforeTxn = String(before.transactionId || "").trim();
+  if (!beforeStatus || !beforeTxn) return false;
+  if (beforeStatus !== (normalizeStatus(incoming.status) || "none")) return false;
+  if (beforeTxn !== String(incoming.transactionId || "").trim()) return false;
+  const beforeExpiry = parseExpiryToDate(before.expiryTime)?.getTime();
+  const incomingExpiry = parseExpiryToDate(incoming.expiryTime)?.getTime();
+  return Number.isFinite(beforeExpiry) && beforeExpiry === incomingExpiry;
+}
+
 /**
  * Atomically:
  * 1) apply platform-specific legacy fields from caller
@@ -773,6 +794,11 @@ async function commitUserSubscriptionDualWrite({
         meta,
       });
 
+      // An Apple inquiry that finds the identical contract (same status, transaction id and expiry) changes nothing
+      // about purchase permission or the pre-purchase proof, so it must not rewrite billingConfirmation/billingRevision.
+      const contractUnchanged = isUnchangedIosReconcileObservation({
+        source, platform: normalizedPlatform, completionWrite, before: beforeIos, incoming: storeState,
+      });
       const writePayload = {
         ...platformSpecificLegacy,
         ...accountLegacy,
@@ -781,10 +807,12 @@ async function commitUserSubscriptionDualWrite({
         entitlementUsable: entitlement.entitlementUsable,
         entitlementSource: entitlement.entitlementSource,
         entitlementUpdatedAt: admin.FieldValue.serverTimestamp(),
+      };
+      if (!contractUnchanged) {
         // Invalidate purchase permission on every verified purchase / notification update.
         // Retain provenance, never manufacture coverage for a legacy account.
-        billingRevision: Number(data.billingRevision || 0) + 1,
-        billingConfirmation: {
+        writePayload.billingRevision = Number(data.billingRevision || 0) + 1;
+        writePayload.billingConfirmation = {
           ...(data.billingConfirmation || {}),
           [normalizedPlatform]: {
             schemaVersion: 1,
@@ -794,8 +822,8 @@ async function commitUserSubscriptionDualWrite({
             checkedAt: admin.FieldValue.serverTimestamp(),
             revision: Number(data.billingRevision || 0) + 1,
           },
-        },
-      };
+        };
+      }
       if (entitlementExpiryTime) {
         writePayload.entitlementExpiryTime = entitlementExpiryTime;
       } else {
@@ -833,7 +861,7 @@ async function commitUserSubscriptionDualWrite({
         afterAndroid: preserveNewerIos ? beforeAndroid : nextAndroid,
         completionRecordOnly: Boolean(preserveNewerIos),
         // 書き込み後の更新番号（書き込まなかった場合は現在の番号）。A・C1 が結果を照合できるように返す。
-        billingRevisionAfter: preserveNewerIos
+        billingRevisionAfter: preserveNewerIos || contractUnchanged
           ? Number(data.billingRevision || 0)
           : Number(data.billingRevision || 0) + 1,
         entitlement,
@@ -973,6 +1001,7 @@ async function recomputeEntitlementFromStoredStores({
 }
 
 module.exports = {
+  isUnchangedIosReconcileObservation,
   selectStoreExpiry,
   storeDeadlineFields,
   ENTITLEMENT_TRACE,
