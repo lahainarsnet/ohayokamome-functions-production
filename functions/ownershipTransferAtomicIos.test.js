@@ -54,12 +54,21 @@ const xUser = (overrides = {}) => ({
   appStoreOriginalTransactionId: ORIG, appStoreTransactionId: TX, activePurchaseTokens: [TX], appStoreAppAccountToken: TAG_X,
   entitlementUsable: true, entitlementSource: "ios", entitlementExpiryTime: iso(NOW + 20 * 24 * HOUR), activeDeviceId: DEVICE_C, ...overrides,
 });
-const baseDocs = (extra = {}) => ({
+const baseDocs = (extra = {}) => {
+  const docs = {
   [`users/${X}`]: xUser(),
   [`users/${Y}`]: { appStoreAppAccountToken: TAG_Y },
   [`subscription_ownership/${OWN_ID}`]: { ownerUid: X, platform: "ios", status: "active", appAccountToken: TAG_X, appStoreOriginalTransactionId: ORIG },
   ...extra,
-});
+};
+  // Registered devices in these existing regression cases are verified on this OS.
+  for (const [path, user] of Object.entries(docs)) {
+    if (/^users\/[^/]+$/.test(path) && user?.activeDeviceId) {
+      docs[`${path}/devices/${user.activeDeviceId}`] = {platform: "ios", platformAppCheckVerified: true, firstUsedAt: {__type:"existing"}};
+    }
+  }
+  return docs;
+};
 const request = (data = {}, uid = Y) => ({
   auth: { uid }, app: { appId: IOS_FIREBASE_APP_ID },
   data: { platform: "ios", deviceId: DEVICE_B, originalTransactionId: ORIG, productId: APP_STORE_PRODUCT_ID, appAccountToken: TAG_X, ...data },
@@ -287,7 +296,7 @@ const usable = (db, uid) => evaluatePlatformEntitlement(db.docs.get(`users/${uid
   assert.equal(committed.platform, "ios"); assert.equal(committed.replacedPreviousDevice, true); assert.equal(committed.billingTraceId, "trace-ios-1");
   const dumped = JSON.stringify(records);
   for (const secret of [ORIG, TX, TAG_X, TAG_Y, X, Y, DEVICE_B, DEVICE_C, OWN_ID]) assert.ok(!dumped.includes(secret), `⑨ log leaks ${secret}`);
-  assert.ok(records.length <= 12, "⑨ bounded log volume (a fixed handful of lines per request)");
+  assert.ok(records.length <= 15, "⑨ bounded log volume (a fixed handful of lines per request)");
   for (const e of ["apple_call", "apple_series", "proof_inputs", "proof_c_result"]) assert.ok(events.includes(e), `⑨ diagnostic stage logged: ${e}`);
   assert.equal(committed.ownershipMoved, true); assert.equal(committed.previousOwnerUpdated, true); assert.equal(committed.contractWritten, true);
   records.length = 0;
@@ -468,5 +477,21 @@ const usable = (db, uid) => evaluatePlatformEntitlement(db.docs.get(`users/${uid
   const androidSource = fs.readFileSync(require.resolve("./ownershipTransferAtomic.js"), "utf8");
   assert.equal((androidSource.match(/ownPurchaseRecovery: true/g) || []).length, 1, "⑭ only the iPhone adapter opts in");
 
+  // Build477: Y's own registered OS is checked inside the same ownership transaction.
+  for (const sourceOs of ["ios", "android", "unknown"]) {
+    const osDocs = baseDocs({[`users/${Y}`]: {activeDeviceId: DEVICE_C}});
+    osDocs[`users/${Y}/devices/${DEVICE_C}`] = {platform:sourceOs,platformAppCheckVerified:sourceOs!=="unknown"};
+    db=makeDb(osDocs);const beforeOs=snapshotOf(db);const osLogs=[];
+    const osLogger={info:(tag,fields)=>osLogs.push({tag,...fields}),warn(){},error(){}};
+    if (sourceOs === "ios") {
+      await handlerFor(db, [entry()], {logger: osLogger})(request({confirmDeviceReplacement:true,osGateTraceId:"og-123456789-1"}));
+      assert(osLogs.some(e=>e.event==="OS_GATE_2_COMMIT"&&e.path==="ownership_transfer"));
+    } else {
+      await rejects(handlerFor(db, [entry()], {logger: osLogger})(request({confirmDeviceReplacement:true,osGateTraceId:"og-123456789-1"})),sourceOs==="unknown"?"OS_GATE_UNKNOWN":"OS_GATE_CROSS_OS","Build477 ownership OS rejection");
+      assert.equal(snapshotOf(db),beforeOs,"ownership OS rejection preserves contracts, devices, owner and FCM");
+      assert(osLogs.some(e=>e.event===(sourceOs==="unknown"?"OS_GATE_2_UNKNOWN":"OS_GATE_2_REJECT")&&e.path==="ownership_transfer"));
+    }
+    assert(osLogs.filter(e=>String(e.event).startsWith("OS_GATE_")).every(e=>e.osGateTraceId==="og-123456789-1"));
+  }
   console.log("ownershipTransferAtomicIos: case-9 atomic transfer checks PASS");
 })().catch((error) => { console.error(error); process.exit(1); });

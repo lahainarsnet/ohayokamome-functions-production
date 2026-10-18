@@ -34,6 +34,14 @@ function devicePayload(deviceId, overrides = {}) {
 }
 
 function createMockAdmin(initialDocs = {}, options = {}) {
+  // These regression fixtures cover same-OS claim behaviour. Build477's
+  // missing/unverified/wrong-OS fixtures are tested separately without defaults.
+  for (const [path, user] of Object.entries(initialDocs)) {
+    if (/^users\/[^/]+$/.test(path) && user.activeDeviceId) {
+      const dp = `${path}/devices/${user.activeDeviceId}`;
+      initialDocs[dp] = { platform: "ios", platformAppCheckVerified: true, ...initialDocs[dp] };
+    }
+  }
   const docs = new Map(Object.entries(initialDocs));
 
   return {
@@ -180,10 +188,7 @@ async function run() {
     devicePayload(DEVICE_A, { mode: "confirmed" })
   );
   assert.equal(explicitConfirmed.mode, "confirmed");
-  const garbageMode = validateClaimActiveDeviceInput(
-    devicePayload(DEVICE_A, { mode: "switch-please" })
-  );
-  assert.equal(garbageMode.mode, "auto");
+  assert.throws(() => validateClaimActiveDeviceInput(devicePayload(DEVICE_A, {mode: "switch-please"})), /Unknown claim mode/);
 
   assert.throws(
     () => validateClaimActiveDeviceInput(devicePayload("not-a-uuid")),
@@ -323,7 +328,8 @@ async function run() {
     },
     [`users/${OWNER_UID}/devices/${DEVICE_A}`]: {
       deviceId: DEVICE_A,
-      platform: "ios",
+      platform: "android",
+      platformAppCheckVerified: true,
       fcmToken: "old-token",
       historyMarker: "keep-a",
     },

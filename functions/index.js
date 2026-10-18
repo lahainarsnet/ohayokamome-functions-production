@@ -3033,6 +3033,15 @@ exports.clearDeviceFcmToken = onCall(
  * Active device claim (1 account = 1 usable device)
  *  - Separate from registerDeviceUsage / registerDeviceFcmToken
  * =======================================================*/
+// Build477: a separate public read-only endpoint. Older deployments return
+// NOT_FOUND, so an undeployed read request can never fall back to auto claim.
+exports.checkDeviceTransferOs = onCall(
+  { region: "us-central1", enforceAppCheck: true },
+  (request) => createClaimActiveDeviceHandler({ admin, logger })({
+    ...request, data: { ...request.data, mode: "os_check" },
+  }),
+);
+
 exports.claimActiveDevice = onCall(
   { region: "us-central1", enforceAppCheck: true },
   createClaimActiveDeviceHandler({ admin, logger }),

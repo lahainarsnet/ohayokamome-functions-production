@@ -1,4 +1,5 @@
 "use strict";
+const { safeTrace, enforceOsDecision } = require("./osTransferGate");
 // Atomic ownership transfer of an ACTIVE Store contract from UID X to UID Y.
 //   Case 3: Android, same Google Play account.   Case 9: iPhone, same Apple Account.
 // Dedicated path only: it skips the "is this device already registered" check (a brand-new UID has no
@@ -263,6 +264,10 @@ function createTransferHandler({ admin, logger = console, adapter, nowMs = () =>
         // Device decision. If Y already uses another device, replacing it needs the user's explicit approval
         // (sent by the app only after the "use this phone" dialog). Without it NOTHING is changed.
         const activeDeviceId = String(yData.activeDeviceId || "").trim();
+        const activeOsSnap = activeDeviceId ? await tx.get(yRef.collection("devices").doc(activeDeviceId)) : null;
+        enforceOsDecision({ logger: safeLogger, path: "ownership_transfer", uid, deviceId, activeDeviceId,
+          deviceData: activeOsSnap?.exists ? activeOsSnap.data() : null, currentOs: adapter.platform,
+          traceId: safeTrace(request.data?.osGateTraceId) });
         const otherActiveDevice = Boolean(activeDeviceId) && activeDeviceId !== deviceId;
         if (otherActiveDevice && !confirmDeviceReplacement) log("warn", "device_confirmation_decision", { frameStage: "judgment",
           uidRelation: alreadyOwner ? "already_owner" : "different_owner_uid",
@@ -292,16 +297,18 @@ function createTransferHandler({ admin, logger = console, adapter, nowMs = () =>
         if (!deviceSnap.exists) deviceUpdate.firstUsedAt = now;
         tx.set(deviceRef, deviceUpdate, { merge: true });
         return { transferred: !alreadyOwner, deviceRegistered: true, replacedPreviousDevice: otherActiveDevice, proofCode,
-          previousOwnerUpdated: Boolean(previousOwnerUpdate) };
+          previousOwnerUpdated: Boolean(previousOwnerUpdate), activeDeviceChanged: activeDeviceId !== deviceId };
       });
     } catch (error) {
       const proofCode = (error && error.details && error.details.proofCode) || null;
+      safeLogger.info("KAMOME_BILLING_OS_GATE", { event: "OS_GATE_2_TRANSACTION_ABORT", osGateTraceId: safeTrace(request.data?.osGateTraceId), path: "ownership_transfer", transactionResult: "aborted", activeDeviceChanged: false, ownershipChanged: false, notificationChanged: false, oldDeviceStopIssued: false, effectsScope: "this_transaction_only", errorCode: codeOf(error), endedAt: new Date().toISOString() });
       log("warn", "transaction_rejected", { code: codeOf(error), proofCode });
       // Refused proofs and unknown series count as failures (not network / conflict / device-consent errors).
       if (proofCode) await recordFailure("PROOF_REFUSED");
       else await recordFailure(codeOf(error));
       throw error;
     }
+    safeLogger.info("KAMOME_BILLING_OS_GATE", { event: "OS_GATE_2_COMMIT", osGateTraceId: safeTrace(request.data?.osGateTraceId), path: "ownership_transfer", transactionResult: "committed", activeDeviceChanged: result.activeDeviceChanged, ownershipChanged: result.transferred, oldDeviceStopStatus: result.replacedPreviousDevice ? "awaiting_client_observation" : "not_required" });
     await clearFailures();
 
     stage = "committed";

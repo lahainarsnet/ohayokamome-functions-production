@@ -37,12 +37,21 @@ const xUser = (overrides = {}) => ({
   entitlementUsable: true, entitlementSource: "android", entitlementExpiryTime: iso(NOW + 20 * 24 * HOUR),
   activeDeviceId: DEVICE_C, ...overrides,
 });
-const baseDocs = (extra = {}) => ({
+const baseDocs = (extra = {}) => {
+  const docs = {
   "users/user-x-abcdefghij0123456789": xUser(),
   "users/user-y-abcdefghij0123456789": {},
   [`subscription_ownership/${OWN_ID}`]: { ownerUid: "user-x-abcdefghij0123456789", platform: "android", status: "active" },
   ...extra,
-});
+};
+  // Registered devices in these existing regression cases are verified on this OS.
+  for (const [path, user] of Object.entries(docs)) {
+    if (/^users\/[^/]+$/.test(path) && user?.activeDeviceId) {
+      docs[`${path}/devices/${user.activeDeviceId}`] = {platform: "android", platformAppCheckVerified: true, firstUsedAt: {__type:"existing"}};
+    }
+  }
+  return docs;
+};
 const request = (data = {}, uid = "user-y-abcdefghij0123456789") => ({
   auth: { uid }, app: { appId: ANDROID_FIREBASE_APP_ID },
   data: { platform: "android", deviceId: DEVICE_B, purchaseToken: TOKEN, productId: "ohayo_kamome_monthly", ...data },
@@ -205,7 +214,7 @@ const rejects = async (promise, code, label) => {
   assert.equal(committed.replacedPreviousDevice, true); assert.equal(committed.stage, "committed"); assert.equal(committed.billingTraceId, "trace-abc-123");
   const dumped = JSON.stringify(records);
   for (const secret of [TOKEN, "user-x-abcdefghij0123456789", "user-y-abcdefghij0123456789", DEVICE_B, DEVICE_C, tagOf("user-x-abcdefghij0123456789"), OWN_ID]) assert.ok(!dumped.includes(secret), `⑩ log leaks ${secret}`);
-  assert.ok(records.length <= 8, "⑩ bounded log volume (two proof-stage lines added)");
+  assert.ok(records.length <= 11, "⑩ bounded log volume (two proof-stage lines added)");
   records.length = 0;
   db = makeDb(withC());
   await rejects(handlerFor(db, googleObserved(), { logger: recorder })(request()), OWNERSHIP_TRANSFER_CODES.deviceConfirmationRequired, "⑩ rejection");
@@ -287,5 +296,21 @@ const rejects = async (promise, code, label) => {
     assert.equal(shared.proof, null, "⑬ shared decision does not move an active Android contract");
   }
 
+  // Build477: Y's own registered OS is checked inside the same ownership transaction.
+  for (const sourceOs of ["android", "ios", "unknown"]) {
+    const osDocs = baseDocs({[`users/user-y-abcdefghij0123456789`]: {activeDeviceId: DEVICE_C}});
+    osDocs[`users/user-y-abcdefghij0123456789/devices/${DEVICE_C}`] = {platform:sourceOs,platformAppCheckVerified:sourceOs!=="unknown"};
+    db=makeDb(osDocs);const beforeOs=snapshotOf(db);const osLogs=[];
+    const osLogger={info:(tag,fields)=>osLogs.push({tag,...fields}),warn(){},error(){}};
+    if (sourceOs === "android") {
+      await handlerFor(db, googleObserved(), {logger: osLogger})(request({confirmDeviceReplacement:true,osGateTraceId:"og-123456789-1"}));
+      assert(osLogs.some(e=>e.event==="OS_GATE_2_COMMIT"&&e.path==="ownership_transfer"));
+    } else {
+      await rejects(handlerFor(db, googleObserved(), {logger: osLogger})(request({confirmDeviceReplacement:true,osGateTraceId:"og-123456789-1"})),sourceOs==="unknown"?"OS_GATE_UNKNOWN":"OS_GATE_CROSS_OS","Build477 ownership OS rejection");
+      assert.equal(snapshotOf(db),beforeOs,"ownership OS rejection preserves contracts, devices, owner and FCM");
+      assert(osLogs.some(e=>e.event===(sourceOs==="unknown"?"OS_GATE_2_UNKNOWN":"OS_GATE_2_REJECT")&&e.path==="ownership_transfer"));
+    }
+    assert(osLogs.filter(e=>String(e.event).startsWith("OS_GATE_")).every(e=>e.osGateTraceId==="og-123456789-1"));
+  }
   console.log("ownershipTransferAtomic: case-3 atomic transfer checks PASS");
 })().catch((error) => { console.error(error); process.exit(1); });

@@ -163,16 +163,16 @@ async function stage5() {
         subscriptions: { [to]: {status: state, expiryTime: new Date(Date.now() + 86400000)} } };
       if (state === "missing") { user.subscriptions = { [from]: { status: "active", expiryTime: new Date(Date.now()+86400000) } }; if(from === to) delete user.subscriptions[to]; }
       const admin = createMockAdmin({ [`users/${OWNER_UID}`]: user,
-        [`users/${OWNER_UID}/devices/${DEVICE_A}`]: { platform: from } });
+        [`users/${OWNER_UID}/devices/${DEVICE_A}`]: { platform: from, platformAppCheckVerified: true } });
       const handler = createClaimActiveDeviceHandler({ admin, logger });
       const result = await runHandler(handler, authedRequest(OWNER_UID,
         devicePayload(DEVICE_B, { platform: to, mode: "confirmed", claimGeneration: 1 })));
-      // Cases 13 and 14: moving is allowed by an Active contract of the other OS under the same UID (the destination has none).
-      const allowed = state === "active" || (state === "missing" && from !== to);
+      // Build477: cases13/14 are refused, independent of contract status.
+      const allowed = from === to && state === "active";
       assert.equal(result.ok, allowed, `${from}->${to} ${state}`);
       assert.equal(admin.docs.get(`users/${OWNER_UID}`).activeDeviceId, allowed ? DEVICE_B : DEVICE_A);
       assert.equal(admin.docs.get(`users/${OWNER_UID}`).chatUnknownProvisionalUntil, user.chatUnknownProvisionalUntil);
-      if (!allowed) assert.equal(result.error.message, "DEVICE_SWITCH_CONTRACT_NOT_ACTIVE");
+      if (!allowed) assert.equal(result.error.message, from !== to ? "OS_GATE_CROSS_OS" : "DEVICE_SWITCH_CONTRACT_NOT_ACTIVE");
       cases++;
     }
   }

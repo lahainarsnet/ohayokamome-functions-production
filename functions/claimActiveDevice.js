@@ -15,6 +15,8 @@ const {
   MIN_FCM_TOKEN_LENGTH,
 } = require("./registerDeviceFcmToken");
 
+const { safeTrace, logOsDecision, enforceOsDecision } = require("./osTransferGate");
+
 const CLAIM_ACTIVE_DEVICE_TAG = "KAMOME_CLAIM_ACTIVE_DEVICE";
 const CLAIM_ACTIVE_DEVICE_NEEDS_CONFIRMATION = "NEEDS_CONFIRMATION";
 const CLAIM_ACTIVE_DEVICE_STALE_CLAIM = "STALE_ACTIVE_DEVICE_CLAIM";
@@ -66,8 +68,11 @@ function normalizeClaimMode(data) {
     return "auto";
   }
   const mode = String(data.mode ?? "").trim();
-  if (mode === "auto" || mode === "confirmed" || mode === "reserve") {
+  if (mode === "auto" || mode === "confirmed" || mode === "reserve" || mode === "os_check") {
     return mode;
+  }
+  if (mode && !["auto", "confirmed", "reserve", "os_check"].includes(mode)) {
+    throw new HttpsError("invalid-argument", "Unknown claim mode.");
   }
   const reason = normalizeClaimReason(data.claimReason);
   if (reason === "confirmed" || reason === "retry") {
@@ -89,6 +94,8 @@ function validateClaimActiveDeviceInput(data) {
     : "";
   return {
     ...deviceInput,
+    osGateTraceId: safeTrace(data.osGateTraceId),
+    loginKind: data.loginKind === "manual" ? "manual" : "automatic",
     fcmToken,
     claimReason: normalizeClaimReason(data.claimReason),
     claimGeneration: normalizeClaimGeneration(data.claimGeneration),
@@ -140,7 +147,9 @@ function createClaimActiveDeviceHandler({ admin, logger }) {
     const deviceRef = userRef.collection("devices").doc(input.deviceId);
     const now = admin.FieldValue.serverTimestamp();
 
-    const result = await db.runTransaction(async (tx) => {
+    let result;
+    try {
+      result = await db.runTransaction(async (tx) => {
       const userSnap = await tx.get(userRef);
       const deviceSnap = await tx.get(deviceRef);
       const userData = userSnap.exists ? userSnap.data() || {} : {};
@@ -151,7 +160,7 @@ function createClaimActiveDeviceHandler({ admin, logger }) {
       const pendingActiveClaimGeneration = normalizeClaimGeneration(
         userData.pendingActiveClaimGeneration
       );
-      // Source OS is diagnostic only; entitlement always uses verified destination OS.
+      // OS gate reads this authenticated UID's active device; never a previous contract owner.
       const sourceDeviceSnap = previousActiveDeviceId
         ? await tx.get(userRef.collection("devices").doc(previousActiveDeviceId)) : null;
       const sourceData = sourceDeviceSnap && sourceDeviceSnap.exists ? sourceDeviceSnap.data() || {} : {};
@@ -165,6 +174,13 @@ function createClaimActiveDeviceHandler({ admin, logger }) {
         hasPendingDevice: Boolean(pendingActiveDeviceId),
         pendingMatchesRequested: pendingActiveDeviceId === input.deviceId,
         pendingGenerationMatches: pendingActiveClaimGeneration === input.claimGeneration });
+      const osOptions = { logger, path: "normal_transfer", uid, deviceId: input.deviceId,
+        activeDeviceId: previousActiveDeviceId, deviceData: sourceDeviceSnap?.exists ? sourceData : null,
+        currentOs: verifiedPlatform, traceId: input.osGateTraceId, loginKind: input.loginKind };
+      if (input.mode === "os_check") {
+        const decision = logOsDecision({ ...osOptions, stage: 1 });
+        return { osCheck: true, ...decision, currentOs: verifiedPlatform, registeredDeviceSuffix: tokenSuffix(previousActiveDeviceId), osGateTraceId: input.osGateTraceId };
+      }
       const created = !deviceSnap.exists;
       const switched =
         Boolean(previousActiveDeviceId) &&
@@ -224,6 +240,7 @@ function createClaimActiveDeviceHandler({ admin, logger }) {
         };
       }
 
+      enforceOsDecision(osOptions);
       if (input.mode === "confirmed") {
         const sameDeviceRefresh =
           previousActiveDeviceId === input.deviceId && !pendingActiveDeviceId;
@@ -319,7 +336,18 @@ function createClaimActiveDeviceHandler({ admin, logger }) {
         previousActiveDeviceId,
         confirmedAccepted: input.mode === "confirmed",
       };
-    });
+      });
+    } catch (error) {
+      logger.info("KAMOME_BILLING_OS_GATE", { event: input.mode === "os_check" ? "OS_GATE_1_READ_FAILED" : "OS_GATE_2_TRANSACTION_ABORT",
+        osGateTraceId: input.osGateTraceId, path: "normal_transfer", transactionResult: "aborted", activeDeviceChanged: false,
+        ownershipChanged: false, notificationChanged: false, oldDeviceStopIssued: false, effectsScope: "this_transaction_only",
+        errorCode: error?.details?.code || error?.code || "unknown", endedAt: new Date().toISOString() });
+      throw error;
+    }
+
+    if (result.osCheck) return result;
+
+    if (!result.denied && input.mode !== "reserve") logger.info("KAMOME_BILLING_OS_GATE", { event: "OS_GATE_2_COMMIT", osGateTraceId: input.osGateTraceId, path: "normal_transfer", transactionResult: "committed", activeDeviceChanged: result.previousActiveDeviceId !== input.deviceId, oldDeviceStopStatus: result.switched ? "awaiting_client_observation" : "not_required" });
 
     if (result.denied) {
       if (result.stale) {
