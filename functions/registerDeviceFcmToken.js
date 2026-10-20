@@ -1,3 +1,4 @@
+const { randomUUID } = require("node:crypto");
 const { HttpsError } = require("firebase-functions/v2/https");
 const { tokenSuffix } = require("./billingFinalTrace");
 const { UUID_PATTERN } = require("./registerDeviceUsage");
@@ -62,19 +63,25 @@ function createRegisterDeviceFcmTokenHandler({ admin, logger }) {
     const snap = await deviceRef.get();
     const created = !snap.exists;
 
-    await deviceRef.set(
+    const registrationId = randomUUID();
+    const batch = db.batch();
+    batch.set(deviceRef,
       {
         fcmToken: input.fcmToken,
+        fcmRegistrationId: registrationId,
         fcmUpdatedAt: admin.FieldValue.serverTimestamp(),
       },
       { merge: true }
     );
-    await userRef.set(
+    batch.set(userRef,
       {
         fcmToken: input.fcmToken,
+        fcmRegistrationId: registrationId,
       },
       { merge: true }
     );
+
+    await batch.commit();
 
     logger.info(REGISTER_DEVICE_FCM_TOKEN_TAG, {
       uidSuffix: tokenSuffix(uid),

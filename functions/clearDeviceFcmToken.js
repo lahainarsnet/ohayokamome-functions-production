@@ -28,37 +28,42 @@ function createClearDeviceFcmTokenHandler({ admin, logger }) {
 
     // activeDeviceId gate は付けない。旧端末 logout が自分の token だけ消せるようにする。
     const input = validateClearDeviceFcmTokenInput(request.data);
-    const deviceRef = admin
-      .getDb()
-      .collection("users")
-      .doc(uid)
-      .collection("devices")
-      .doc(input.deviceId);
-    const snap = await deviceRef.get();
-    if (!snap.exists) {
-      logger.info(CLEAR_DEVICE_FCM_TOKEN_TAG, {
-        uidSuffix: tokenSuffix(uid),
-        deviceIdSuffix: tokenSuffix(input.deviceId),
-        cleared: false,
-        reason: "missing_doc",
-      });
-      return { ok: true, cleared: false };
+    const expectedUid = request.data.expectedUid;
+    const expectedRegistrationId = request.data.expectedRegistrationId;
+    if (expectedUid !== uid || typeof expectedRegistrationId !== "string" ||
+        !UUID_PATTERN.test(expectedRegistrationId)) {
+      throw new HttpsError("invalid-argument", "Expected UID and registration version required.");
     }
-
-    await deviceRef.set(
-      {
+    const db = admin.getDb();
+    const userRef = db.collection("users").doc(uid);
+    const deviceRef = userRef.collection("devices").doc(input.deviceId);
+    const result = await db.runTransaction(async (tx) => {
+      const device = await tx.get(deviceRef);
+      const user = await tx.get(userRef);
+      if (!device.exists) return { cleared: false, reason: "missing_doc" };
+      const data = device.data();
+      if (data.fcmRegistrationId !== expectedRegistrationId) {
+        return { cleared: false, reason: "registration_changed" };
+      }
+      const fields = {
         fcmToken: admin.FieldValue.delete(),
         fcmUpdatedAt: admin.FieldValue.delete(),
-      },
-      { merge: true }
-    );
-
+        fcmRegistrationId: admin.FieldValue.delete(),
+      };
+      tx.set(deviceRef, fields, { merge: true });
+      const userData = user.data();
+      if (user.exists && userData.fcmRegistrationId === expectedRegistrationId &&
+          userData.fcmToken === data.fcmToken) {
+        tx.set(userRef, fields, { merge: true });
+      }
+      return { cleared: true, reason: "cleared" };
+    });
     logger.info(CLEAR_DEVICE_FCM_TOKEN_TAG, {
       uidSuffix: tokenSuffix(uid),
       deviceIdSuffix: tokenSuffix(input.deviceId),
-      cleared: true,
+      ...result,
     });
-    return { ok: true, cleared: true };
+    return { ok: true, ...result };
   };
 }
 

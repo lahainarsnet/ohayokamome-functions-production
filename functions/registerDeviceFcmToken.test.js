@@ -44,6 +44,13 @@ function createMockAdmin(initialDocs = {}) {
     },
     getDb() {
       return {
+        batch() {
+          const writes = [];
+          return {
+            set(ref, data, options) { writes.push(() => ref.set(data, options)); },
+            async commit() { for (const write of writes) await write(); },
+          };
+        },
         collection(name) {
           if (name !== "users") {
             throw new Error(`Unexpected collection: ${name}`);
@@ -204,6 +211,9 @@ async function run() {
     `users/${OWNER_UID}/devices/${VALID_DEVICE_ID}`
   );
   assert.equal(createdDoc.fcmToken, VALID_FCM_TOKEN);
+  assert.match(createdDoc.fcmRegistrationId, /^[0-9a-f-]{36}$/);
+  assert.equal(admin.docs.get(`users/${OWNER_UID}`).fcmRegistrationId,
+    createdDoc.fcmRegistrationId);
   assert.equal(createdDoc.fcmUpdatedAt.__type, "serverTimestamp");
   assert.equal(createdDoc.platform, undefined);
   assert.equal(
@@ -241,6 +251,9 @@ async function run() {
   assert.equal(merged.result.created, false);
   const mergedDoc = admin.docs.get(existingKey);
   assert.equal(mergedDoc.fcmToken, VALID_FCM_TOKEN);
+  assert.notEqual(mergedDoc.fcmRegistrationId, createdDoc.fcmRegistrationId);
+  assert.equal(admin.docs.get(`users/${OWNER_UID}`).fcmRegistrationId,
+    mergedDoc.fcmRegistrationId);
   assert.equal(mergedDoc.fcmUpdatedAt.__type, "serverTimestamp");
   assert.notEqual(mergedDoc.fcmUpdatedAt.label, "old");
   assert.equal(mergedDoc.platform, "android");

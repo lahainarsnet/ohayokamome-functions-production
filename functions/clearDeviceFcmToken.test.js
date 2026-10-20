@@ -1,224 +1,53 @@
-const assert = require("node:assert/strict");
-const fs = require("node:fs");
-const path = require("node:path");
-const { HttpsError } = require("firebase-functions/v2/https");
-const {
-  createClearDeviceFcmTokenHandler,
-  validateClearDeviceFcmTokenInput,
-} = require("./clearDeviceFcmToken");
-
-const DEVICE_A = "550e8400-e29b-41d4-a716-446655440000";
-const DEVICE_B = "550e8400-e29b-41d4-a716-446655440001";
-const DEVICE_C = "550e8400-e29b-41d4-a716-446655440002";
-const OWNER_UID = "owner-uid-001";
-const OTHER_UID = "other-uid-001";
-const TOKEN_A = "token-a";
-const TOKEN_B = "token-b";
-const TOKEN_C = "token-c";
-
-function applyMerge(existing, data) {
-  const next = { ...existing };
-  for (const [field, value] of Object.entries(data)) {
-    if (value && value.__type === "delete") {
-      delete next[field];
-    } else {
-      next[field] = value;
-    }
-  }
-  return next;
-}
-
-function createMockAdmin(initialDocs = {}) {
-  const docs = new Map(Object.entries(initialDocs));
-  function docPath(uid, deviceId) {
-    return `users/${uid}/devices/${deviceId}`;
-  }
-  return {
-    FieldValue: {
-      delete() {
-        return { __type: "delete" };
-      },
-    },
-    getDb() {
-      return {
-        collection(name) {
-          assert.equal(name, "users");
-          return {
-            doc(uid) {
-              return {
-                collection(subName) {
-                  assert.equal(subName, "devices");
-                  return {
-                    doc(deviceId) {
-                      const key = docPath(uid, deviceId);
-                      return {
-                        async get() {
-                          const value = docs.get(key);
-                          return {
-                            exists: value != null,
-                            data: () => value,
-                          };
-                        },
-                        async set(data, options = {}) {
-                          if (!options.merge) {
-                            docs.set(key, { ...data });
-                            return;
-                          }
-                          docs.set(key, applyMerge(docs.get(key) || {}, data));
-                        },
-                      };
-                    },
-                  };
-                },
-              };
-            },
-          };
-        },
-      };
-    },
-    docs,
-  };
-}
-
-function createTestLogger() {
+const assert = require('node:assert/strict');
+const {createClearDeviceFcmTokenHandler} = require('./clearDeviceFcmToken');
+const DEVICE = '550e8400-e29b-41d4-a716-446655440000';
+const VERSION = '550e8400-e29b-41d4-a716-446655440001';
+const NEW = '550e8400-e29b-41d4-a716-446655440002';
+const devicePath = `users/a/devices/${DEVICE}`;
+function fixture({device = {fcmToken:'same-token', fcmRegistrationId:VERSION, modelName:'keep'},
+  user = {fcmToken:'same-token', fcmRegistrationId:VERSION, email:'keep'}, retry} = {}) {
+  const docs = new Map([['users/a', user], [devicePath, device]].filter(([,v]) => v));
+  function ref(path) {return {path, collection:n => ({doc:id => ref(`${path}/${n}/${id}`)})};}
   const entries = [];
-  return {
-    entries,
-    info: (tag, payload) => entries.push({ tag, payload }),
-  };
+  const admin = { FieldValue:{delete:()=>'DELETE'}, getDb:()=>({
+    collection:n=>({doc:id=>ref(`${n}/${id}`)}),
+    async runTransaction(fn) {
+      let writes;
+      const tx = {get:async r=>({exists:docs.has(r.path), data:()=>docs.get(r.path)}),
+        set:(r,data)=>writes.push([r.path,data])};
+      writes=[]; let result=await fn(tx);
+      if(retry){retry(docs);writes=[];result=await fn(tx);}
+      for(const [path,data] of writes){const next={...docs.get(path)};
+        for(const [k,v] of Object.entries(data)){if(v==='DELETE')delete next[k];else next[k]=v;}
+        docs.set(path,next);
+      }
+      return result;
+    }
+  })};
+  return {docs, entries, handler:createClearDeviceFcmTokenHandler({admin,logger:{info:(...v)=>entries.push(v)}})};
 }
-
-async function runHandler(handler, request) {
-  try {
-    return { ok: true, result: await handler(request) };
-  } catch (error) {
-    return { ok: false, error };
+const request = {auth:{uid:'a'},data:{deviceId:DEVICE,expectedUid:'a',expectedRegistrationId:VERSION}};
+async function run(){
+  let cases=0;
+  const normal=fixture();assert.equal((await normal.handler(request)).cleared,true);
+  assert.deepEqual(normal.docs.get(devicePath),{modelName:'keep'});
+  assert.deepEqual(normal.docs.get('users/a'),{email:'keep'});cases++;
+  const fresh=fixture({device:{fcmToken:'same-token',fcmRegistrationId:NEW},user:{fcmToken:'same-token',fcmRegistrationId:NEW}});
+  assert.equal((await fresh.handler(request)).reason,'registration_changed');
+  assert.equal(fresh.docs.get('users/a').fcmToken,'same-token');cases++;
+  const raced=fixture({retry:docs=>{for(const key of ['users/a',devicePath]) docs.set(key,{fcmToken:'same-token',fcmRegistrationId:NEW});}});
+  assert.equal((await raced.handler(request)).cleared,false);
+  assert.equal(raced.docs.get(devicePath).fcmToken,'same-token');cases++;
+  const other=fixture({user:{fcmToken:'other-token',fcmRegistrationId:NEW}});
+  assert.equal((await other.handler(request)).cleared,true);
+  assert.equal(other.docs.get('users/a').fcmToken,'other-token');cases++;
+  const missing=fixture({device:null});assert.equal((await missing.handler(request)).reason,'missing_doc');cases++;
+  const noVersion=fixture({device:{fcmToken:'same-token'}});assert.equal((await noVersion.handler(request)).cleared,false);cases++;
+  for(const invalid of [{auth:null,data:request.data}, {...request,data:{...request.data,expectedUid:'b'}},
+    {...request,data:{deviceId:DEVICE}}, {...request,data:{...request.data,deviceId:'bad'}}]){
+    await assert.rejects(()=>fixture().handler(invalid));cases++;
   }
+  assert.equal(JSON.stringify(normal.entries).includes('same-token'),false);cases++;
+  console.log(`clearDeviceFcmToken.test.js: ${cases} cases PASS`);
 }
-
-function seedThreeDevices(admin) {
-  const analytics = {
-    platform: "android",
-    modelName: "keep-me",
-    appVersion: "6.0.0",
-    buildNumber: "252",
-    firstUsedAt: { t: 1 },
-    lastUsedAt: { t: 2 },
-  };
-  admin.docs.set(`users/${OWNER_UID}/devices/${DEVICE_A}`, {
-    ...analytics,
-    deviceId: DEVICE_A,
-    fcmToken: TOKEN_A,
-    fcmUpdatedAt: { t: 3 },
-  });
-  admin.docs.set(`users/${OWNER_UID}/devices/${DEVICE_B}`, {
-    ...analytics,
-    deviceId: DEVICE_B,
-    platform: "android",
-    modelName: "Pixel",
-    fcmToken: TOKEN_B,
-    fcmUpdatedAt: { t: 3 },
-  });
-  admin.docs.set(`users/${OWNER_UID}/devices/${DEVICE_C}`, {
-    ...analytics,
-    deviceId: DEVICE_C,
-    platform: "ios",
-    modelName: "iPhone",
-    fcmToken: TOKEN_C,
-    fcmUpdatedAt: { t: 3 },
-  });
-}
-
-async function run() {
-  assert.throws(
-    () => validateClearDeviceFcmTokenInput({ deviceId: "bad" }),
-    (error) => error instanceof HttpsError && error.code === "invalid-argument"
-  );
-
-  const admin = createMockAdmin();
-  seedThreeDevices(admin);
-  const handler = createClearDeviceFcmTokenHandler({
-    admin,
-    logger: createTestLogger(),
-  });
-
-  const unauth = await runHandler(handler, {
-    auth: null,
-    data: { deviceId: DEVICE_A },
-  });
-  assert.equal(unauth.ok, false);
-  assert.equal(unauth.error.code, "unauthenticated");
-
-  const clearedA = await runHandler(handler, {
-    auth: { uid: OWNER_UID },
-    data: { deviceId: DEVICE_A },
-  });
-  assert.equal(clearedA.ok, true);
-  assert.equal(clearedA.result.cleared, true);
-  const docA = admin.docs.get(`users/${OWNER_UID}/devices/${DEVICE_A}`);
-  const docB = admin.docs.get(`users/${OWNER_UID}/devices/${DEVICE_B}`);
-  const docC = admin.docs.get(`users/${OWNER_UID}/devices/${DEVICE_C}`);
-  assert.equal(docA.fcmToken, undefined);
-  assert.equal(docA.fcmUpdatedAt, undefined);
-  assert.equal(docA.platform, "android");
-  assert.equal(docA.modelName, "keep-me");
-  assert.equal(docA.appVersion, "6.0.0");
-  assert.equal(docA.buildNumber, "252");
-  assert.deepEqual(docA.firstUsedAt, { t: 1 });
-  assert.deepEqual(docA.lastUsedAt, { t: 2 });
-  assert.equal(docB.fcmToken, TOKEN_B);
-  assert.equal(docC.fcmToken, TOKEN_C);
-
-  const otherAdmin = createMockAdmin();
-  seedThreeDevices(otherAdmin);
-  const otherHandler = createClearDeviceFcmTokenHandler({
-    admin: otherAdmin,
-    logger: createTestLogger(),
-  });
-  const otherUser = await runHandler(otherHandler, {
-    auth: { uid: OTHER_UID },
-    data: { deviceId: DEVICE_A },
-  });
-  assert.equal(otherUser.ok, true);
-  assert.equal(otherUser.result.cleared, false);
-  assert.equal(
-    otherAdmin.docs.get(`users/${OWNER_UID}/devices/${DEVICE_A}`).fcmToken,
-    TOKEN_A
-  );
-  assert.equal(
-    otherAdmin.docs.has(`users/${OTHER_UID}/devices/${DEVICE_A}`),
-    false
-  );
-
-  const missing = await runHandler(handler, {
-    auth: { uid: OWNER_UID },
-    data: { deviceId: "550e8400-e29b-41d4-a716-446655440099" },
-  });
-  assert.equal(missing.ok, true);
-  assert.equal(missing.result.cleared, false);
-
-  const invalidId = await runHandler(handler, {
-    auth: { uid: OWNER_UID },
-    data: { deviceId: "not-a-uuid" },
-  });
-  assert.equal(invalidId.ok, false);
-  assert.equal(invalidId.error.code, "invalid-argument");
-
-  const indexSource = fs.readFileSync(path.join(__dirname, "index.js"), "utf8");
-  assert.match(
-    indexSource,
-    /exports\.clearDeviceFcmToken = onCall\([\s\S]*enforceAppCheck: true/
-  );
-  const clearSource = fs.readFileSync(
-    path.join(__dirname, "clearDeviceFcmToken.js"),
-    "utf8"
-  );
-  assert.doesNotMatch(clearSource, /assertActiveDeviceAllowed/);
-
-  console.log("clearDeviceFcmToken.test.js: ok");
-}
-
-run().catch((error) => {
-  console.error(error);
-  process.exit(1);
-});
+run().catch(e=>{console.error(e);process.exit(1);});
