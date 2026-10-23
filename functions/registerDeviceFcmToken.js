@@ -81,7 +81,7 @@ function createRegisterDeviceFcmTokenHandler({ admin, logger }) {
       { merge: true }
     );
 
-    await batch.commit();
+    const writes = await batch.commit();
 
     logger.info(REGISTER_DEVICE_FCM_TOKEN_TAG, {
       uidSuffix: tokenSuffix(uid),
@@ -90,7 +90,18 @@ function createRegisterDeviceFcmTokenHandler({ admin, logger }) {
       created,
     });
 
-    return { ok: true, created };
+    // Return the version actually committed, never a later reread of the device.
+    // The write timestamp orders overlapping registration responses on the client.
+    const writeTime = writes[0].writeTime;
+    return {
+      ok: true,
+      created,
+      registrationId,
+      registrationWriteTime: {
+        seconds: String(writeTime.seconds),
+        nanoseconds: writeTime.nanoseconds,
+      },
+    };
   };
 }
 

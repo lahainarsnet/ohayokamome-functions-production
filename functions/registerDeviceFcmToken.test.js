@@ -48,7 +48,10 @@ function createMockAdmin(initialDocs = {}) {
           const writes = [];
           return {
             set(ref, data, options) { writes.push(() => ref.set(data, options)); },
-            async commit() { for (const write of writes) await write(); },
+            async commit() {
+              for (const write of writes) await write();
+              return writes.map(() => ({ writeTime: { seconds: 1792638000, nanoseconds: 123456789 } }));
+            },
           };
         },
         collection(name) {
@@ -211,6 +214,10 @@ async function run() {
     `users/${OWNER_UID}/devices/${VALID_DEVICE_ID}`
   );
   assert.equal(createdDoc.fcmToken, VALID_FCM_TOKEN);
+  assert.equal(created.result.registrationId, createdDoc.fcmRegistrationId);
+  assert.deepEqual(created.result.registrationWriteTime,
+    { seconds: "1792638000", nanoseconds: 123456789 });
+  assert.equal(created.result.fcmToken, undefined);
   assert.match(createdDoc.fcmRegistrationId, /^[0-9a-f-]{36}$/);
   assert.equal(admin.docs.get(`users/${OWNER_UID}`).fcmRegistrationId,
     createdDoc.fcmRegistrationId);
@@ -251,6 +258,7 @@ async function run() {
   assert.equal(merged.result.created, false);
   const mergedDoc = admin.docs.get(existingKey);
   assert.equal(mergedDoc.fcmToken, VALID_FCM_TOKEN);
+  assert.equal(merged.result.registrationId, mergedDoc.fcmRegistrationId);
   assert.notEqual(mergedDoc.fcmRegistrationId, createdDoc.fcmRegistrationId);
   assert.equal(admin.docs.get(`users/${OWNER_UID}`).fcmRegistrationId,
     mergedDoc.fcmRegistrationId);
