@@ -393,7 +393,7 @@ async function run() {
         },
         log: { info() {}, warn() {} },
       }),
-    (error) => error.message === "simulated owner load failure"
+    (error) => error.details?.code === SUBSCRIPTION_ALREADY_LINKED_CODE
   );
 
   const crossPlatformOnly = isSubscriptionOwnerCurrentlyUsable(

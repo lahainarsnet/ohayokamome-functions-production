@@ -855,22 +855,15 @@ async function test(name, run) { await run(); passed += 1; console.log(`ok ${pas
             // A replay of the expired (Store: not active) purchase cannot reassign ownership.
             await assert.rejects(()=>platform==='android'?claimAndroidSubscriptionOwnership(db,liveAdmin,{uid:'user',purchaseToken:'foreign-token',verifiedPurchase:{uidBound:true,active:false,purchasedAt:expiry-1}}):
               claimIosSubscriptionOwnership(db,liveAdmin,{uid:'user',update:{appStoreOriginalTransactionId:'foreign-original'},transactionInfo:{appAccountToken:currentToken,expiresDate:Date.now()-100000},verifiedPurchase:{uidBound:true,active:false,purchasedAt:expiry-(ownerEnded?200000:1)}}));
-            // Only a newly verified UID-bound purchase after the server proof can reassign.
+            // Build478: protected freshness may report eligible, but the outer
+            // purchase ownership ACTION must never reassign another UID's series.
             const verifiedPurchase={uidBound:true,active:true,purchasedAt:Date.now()};
-            if(platform==='android') await claimAndroidSubscriptionOwnership(db,liveAdmin,{uid:'user',purchaseToken:'foreign-token',verifiedPurchase});
-            else await claimIosSubscriptionOwnership(db,liveAdmin,{uid:'user',update:{appStoreOriginalTransactionId:'foreign-original'},transactionInfo:{appAccountToken:currentToken,expiresDate:Date.now()+100000},verifiedPurchase});
-            assert.equal(db.docs.get(`subscription_ownership/${ownerId}`).ownerUid,'user');
-            assert.equal(db.docs.get('users/old').subscriptions[platform].status,'expired');
-            assert.equal(db.docs.get('users/old').subscriptions[opposite].status,'active');
-            if(platform==='android') {
-              assert.equal(db.docs.get('users/old').googlePlayPrimaryPurchaseToken,undefined);
-              assert.equal(db.docs.get('users/old').subscriptions.android.primaryPurchaseToken,undefined);
-              assert.deepEqual(db.docs.get('users/old').activePurchaseTokens,['another-token']);
-              db.docs.set('users/user',{...db.docs.get('users/user'),googlePlayPrimaryPurchaseToken:'foreign-token',activePurchaseTokens:['foreign-token']});
-              const routed=await require('./googlePlaySubscriptionNotifications').findUserByPurchaseToken(db,'foreign-token','');
-              assert.equal(routed.kind,'single');assert.equal(routed.uid,'user');
-            }
-            assert.equal((await inspectSubscriptionSeriesOwnership(db,{uid:'user',platform,...candidate})).decision,'match');
+            const before=JSON.stringify([...db.docs]);
+            await assert.rejects(()=>platform==='android' ? claimAndroidSubscriptionOwnership(db,liveAdmin,{uid:'user',purchaseToken:'foreign-token',verifiedPurchase}) :
+              claimIosSubscriptionOwnership(db,liveAdmin,{uid:'user',update:{appStoreOriginalTransactionId:'foreign-original'},transactionInfo:{appAccountToken:currentToken,expiresDate:Date.now()+100000},verifiedPurchase}),
+              error=>error.details?.code==='SUBSCRIPTION_ALREADY_LINKED');
+            assert.equal(JSON.stringify([...db.docs]),before);
+            assert.equal(db.docs.get(`subscription_ownership/${ownerId}`).ownerUid,'old');
           }
         });
       }
@@ -883,7 +876,7 @@ async function test(name, run) { await run(); passed += 1; console.log(`ok ${pas
     });
   }
 
-  await test('Build356 legacy Apple user ownership requires verified expiry and fresh UID-bound purchase', async()=>{
+  await test('Build478 legacy Apple ownership cannot move to another UID', async()=>{
     const original='legacy-original';const token='11111111-1111-4111-8111-111111111111';
     const db=mockDb({'users/user':{appStoreAppAccountToken:token},'users/old':{appStoreOriginalTransactionId:original,subscriptionStatus:'expired',subscriptionPlatform:'ios',subscriptionExpiryTime:new Date(Date.now()-200000)}});
     const liveAdmin={...admin,FieldValue:{serverTimestamp:()=>new Date(),delete:()=>({__deleted:true})}};
@@ -895,10 +888,8 @@ async function test(name, run) { await run(); passed += 1; console.log(`ok ${pas
     const stored=db.docs.get('users/user');assert.equal(stored.billingConfirmation.ios.expiredForeignSeries[0].kind,'users');
     const assertOwner=require('./subscriptionOwnership').assertSubscriptionNotLinkedToOtherUser;
     await assert.rejects(()=>assertOwner(db,{uid:'user',platform:'ios',identifiers:{originalTransactionId:original},verifiedPurchase:{uidBound:false,purchasedAt:Date.now()}}));
-    await assertOwner(db,{uid:'user',platform:'ios',identifiers:{originalTransactionId:original},verifiedPurchase:{uidBound:true,active:true,purchasedAt:Date.now()}});
-    await claimIosSubscriptionOwnership(db,liveAdmin,{uid:'user',update:{appStoreOriginalTransactionId:original},transactionInfo:{appAccountToken:token,expiresDate:Date.now()+100000},verifiedPurchase:{uidBound:true,active:true,purchasedAt:Date.now()}});
-    stored.billingConfirmation.ios.state='active';
-    await assertOwner(db,{uid:'user',platform:'ios',identifiers:{originalTransactionId:original},verifiedPurchase:{uidBound:true,active:true,purchasedAt:Date.now()}});
+    await assert.rejects(()=>assertOwner(db,{uid:'user',platform:'ios',identifiers:{originalTransactionId:original},verifiedPurchase:{uidBound:true,active:true,purchasedAt:Date.now()}}),e=>e.details?.code==='SUBSCRIPTION_ALREADY_LINKED');
+    await assert.rejects(()=>claimIosSubscriptionOwnership(db,liveAdmin,{uid:'user',update:{appStoreOriginalTransactionId:original},transactionInfo:{appAccountToken:token,expiresDate:Date.now()+100000},verifiedPurchase:{uidBound:true,active:true,purchasedAt:Date.now()}}),e=>e.details?.code==='SUBSCRIPTION_ALREADY_LINKED');
   });
   for(const platform of ['ios','android']) for(const state of ['active','ended']) await test(`Build356 owned ${platform} ${state} preserves normal path`,async()=>{
     const expiry=state==='active'?Date.now()+100000:Date.now()-100000;
@@ -911,7 +902,7 @@ async function test(name, run) { await run(); passed += 1; console.log(`ok ${pas
     assert.equal((await api.read(payload(platform,{storeCandidates:[candidate]}))).state,state==='active'?'active':'eligible');
   });
 
-  await test('Build356 linked Google repurchase detaches only former series and routes RTDN to new UID',async()=>{
+  await test('Build478 linked Google foreign ownership stays unchanged',async()=>{
     const oldId=buildAndroidOwnershipId('old-token');const expiry=Date.now()-100000;
     const db=mockDb({'users/user':{},'users/old':{googlePlayPrimaryPurchaseToken:'old-token',googlePlayLinkedPurchaseToken:'old-token',
       activePurchaseTokens:['old-token','unrelated'],subscriptions:{android:{status:'active',expiryTime:new Date(Date.now()+100000),primaryPurchaseToken:'old-token',activePurchaseTokens:['old-token','unrelated']}}},
@@ -925,21 +916,13 @@ async function test(name, run) { await run(); passed += 1; console.log(`ok ${pas
     const purchaseFacts=await require('./verifiedOwnershipPurchase').verifiedGoogleOwnershipFacts({db,uid:'user',purchaseToken:'new-token',
       subscription:{subscriptionState:'SUBSCRIPTION_STATE_ACTIVE',startTime:new Date().toISOString(),linkedPurchaseToken:'old-token',externalAccountIdentifiers:{obfuscatedExternalAccountId:crypto.createHash('sha256').update('kamome-account:user').digest('hex')}},matchedLineItem:item(Date.now()+100000),
       verifyLinked:async()=>({subscription:{subscriptionState:'SUBSCRIPTION_STATE_EXPIRED'},matchedLineItem:item(expiry)})});
-    await claimAndroidSubscriptionOwnership(db,liveAdmin,{uid:'user',purchaseToken:'new-token',linkedPurchaseToken:'old-token',verifiedPurchase:purchaseFacts});
-    assert.equal(db.docs.get('users/old').subscriptions.android.status,'expired');
-    assert.deepEqual(db.docs.get('users/old').activePurchaseTokens,['unrelated']);
-    assert.deepEqual(db.docs.get('users/old').subscriptions.android.activePurchaseTokens,['unrelated']);
-    assert.equal(db.docs.get('users/old').googlePlayLinkedPurchaseToken,undefined);
-    assert.equal(db.docs.get(`subscription_ownership/${oldId}`).ownerUid,'old'); // Ownership history retained.
-    db.docs.set('users/user',{...db.docs.get('users/user'),googlePlayPrimaryPurchaseToken:'new-token',activePurchaseTokens:['new-token','old-token']});
-    const routed=await require('./googlePlaySubscriptionNotifications').findUserByPurchaseToken(db,'new-token','old-token');
-    assert.equal(routed.kind,'single');assert.equal(routed.uid,'user');
-    const inspected=await inspectSubscriptionSeriesOwnership(db,{uid:'user',platform:'android',purchaseToken:'new-token',linkedPurchaseToken:'old-token',
-      verifySeriesState:async({conflictingOwnershipIds})=>{assert.deepEqual(conflictingOwnershipIds,[oldId]);return 'ended';}});
-    assert.equal(inspected.decision,'match');
+    const before=JSON.stringify([...db.docs]);
+    await assert.rejects(()=>claimAndroidSubscriptionOwnership(db,liveAdmin,{uid:'user',purchaseToken:'new-token',linkedPurchaseToken:'old-token',verifiedPurchase:purchaseFacts}),e=>e.details?.code==='SUBSCRIPTION_ALREADY_LINKED');
+    assert.equal(JSON.stringify([...db.docs]),before);
+    assert.equal(db.docs.get(`subscription_ownership/${oldId}`).ownerUid,'old');
   });
 
-  for (const platform of ['ios','android']) await test(`Build356 ${platform}: foreign Expired sync and reassignment preserve opposite legacy-only contract`, async()=>{
+  for (const platform of ['ios','android']) await test(`Build356 ${platform}: foreign Expired sync remains unchanged; ownership action refuses reassignment`, async()=>{
     const other=platform==='ios'?'android':'ios';const expiry=Date.now()-100000;
     const legacy={subscriptionPlatform:other,subscriptionStatus:'active',subscriptionExpiryTime:new Date(Date.now()+100000),
       entitlementUsable:true,entitlementSource:other,entitlementExpiryTime:new Date(Date.now()+100000)};
@@ -960,12 +943,11 @@ async function test(name, run) { await run(); passed += 1; console.log(`ok ${pas
     assert.equal(db.docs.get('users/user').subscriptions[other],undefined);
     assert.equal((await api.read(input)).state,'eligible');
     const facts={uidBound:true,active:true,purchasedAt:Date.now()};
-    if(platform==='ios') await claimIosSubscriptionOwnership(db,liveAdmin,{uid:'user',update:{appStoreOriginalTransactionId:original},transactionInfo:{appAccountToken:token,expiresDate:Date.now()+100000},verifiedPurchase:facts});
-    else await claimAndroidSubscriptionOwnership(db,liveAdmin,{uid:'user',purchaseToken:original,verifiedPurchase:facts});
-    for(const [key,value] of Object.entries(legacy)) assert.deepEqual(db.docs.get('users/old')[key],value);
-    assert.equal(db.docs.get('users/old').subscriptions[platform].status,'expired');
-    assert.equal(db.docs.get('users/old').subscriptions[other],undefined);
-    assert.equal(db.docs.get(`subscription_ownership/${ownerId}`).ownerUid,'user');
+    const before=JSON.stringify([...db.docs]);
+    await assert.rejects(()=>platform==='ios' ? claimIosSubscriptionOwnership(db,liveAdmin,{uid:'user',update:{appStoreOriginalTransactionId:original},transactionInfo:{appAccountToken:token,expiresDate:Date.now()+100000},verifiedPurchase:facts}) :
+      claimAndroidSubscriptionOwnership(db,liveAdmin,{uid:'user',purchaseToken:original,verifiedPurchase:facts}),e=>e.details?.code==='SUBSCRIPTION_ALREADY_LINKED');
+    assert.equal(JSON.stringify([...db.docs]),before);
+    assert.equal(db.docs.get(`subscription_ownership/${ownerId}`).ownerUid,'old');
   });
 
   await test("purchase-only current contract verifies only the requested series and skips history", async () => {

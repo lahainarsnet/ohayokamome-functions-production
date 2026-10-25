@@ -5,7 +5,6 @@ const {
   normalizeSubscriptionPlatform,
 } = require("./accountAccessUsability");
 const { isStoreEntitlementUsable, computeAccountEntitlement, deriveLegacyAccountFields } = require("./subscriptionEntitlement");
-const { permitsExpiredReassignment, getExpiredReassignmentProof, evaluateExpiredReassignment, fingerprint } = require("./expiredOwnershipProof");
 
 const SUBSCRIPTION_ALREADY_LINKED_CODE = "SUBSCRIPTION_ALREADY_LINKED";
 const SUBSCRIPTION_TOKEN_MISMATCH_CODE = "SUBSCRIPTION_TOKEN_MISMATCH";
@@ -24,6 +23,26 @@ function safeLogInfo(log, message, fields) {
 }
 function safeLogWarn(log, message, fields) {
   try { log.warn(message, fields); } catch (_) { /* diagnostics only */ }
+}
+
+// Exception messages can contain purchase/authentication data. Record the fixed
+// code plus source locations, never an arbitrary provider message or source line.
+function ownershipErrorDetails(error) {
+  try {
+    const rawType = String(error?.constructor?.name || "Error");
+    const type = /^[A-Za-z0-9_]{1,64}$/.test(rawType) ? rawType : "Error";
+    const rawCode = String(error?.details?.code || error?.code || "unknown");
+    const allowedCodes = new Set(["unknown", "cancelled", "invalid-argument", "deadline-exceeded", "not-found",
+      "already-exists", "permission-denied", "resource-exhausted", "failed-precondition", "aborted",
+      "out-of-range", "unimplemented", "internal", "unavailable", "data-loss", "unauthenticated",
+      SUBSCRIPTION_ALREADY_LINKED_CODE, SUBSCRIPTION_TOKEN_MISMATCH_CODE, SUBSCRIPTION_SERIES_AMBIGUOUS_CODE,
+      "OS_GATE_CROSS_OS", "OS_GATE_UNKNOWN", "DEVICE_SWITCH_CONTRACT_NOT_ACTIVE", "DEVICE_SWITCH_UID_CHANGED"]);
+    const code = allowedCodes.has(rawCode) ? rawCode : "redacted";
+    const locations = [...String(error?.stack || "").matchAll(/(?:^|\/)([A-Za-z0-9_.-]+\.m?js:\d+(?::\d+)?)/gm)]
+      .slice(0, 10).map((match) => match[1]);
+    return { errorType: type, errorCode: code, errorMessage: code,
+      errorMessagePolicy: "fixed_code_only", errorStackLocations: locations };
+  } catch (_) { return { errorType: "Error", errorCode: "unknown", errorMessagePolicy: "redacted" }; }
 }
 
 function identifierSuffix(value) {
@@ -520,6 +539,10 @@ async function assertUidSeriesAllowed(
 ) {
   const snap = await db.collection("users").doc(uid).get();
   const userData = snap.exists ? snap.data() || {} : {};
+  return assertUidSeriesDataAllowed(userData, { uid, platform, incomingIds, incomingOriginalTransactionId, log, traceId });
+}
+
+function assertUidSeriesDataAllowed(userData, { uid, platform, incomingIds, incomingOriginalTransactionId = "", log, traceId }) {
   const bound = userData.boundSubscriptionSeries?.[platform] || {};
   const boundIds = boundSeriesIds(bound);
   const sameOsActive = isSubscriptionOwnerCurrentlyUsable(
@@ -779,6 +802,28 @@ async function readOwnershipDoc(tx, db, ownershipId) {
   return { ref, snap };
 }
 
+// Purchase/restore ownership ACTION only. The protected A/B/C1 inspection and
+// safe-sync helpers above remain unchanged. No contract can change its owner UID.
+function assertOwnershipUid(snapshot, { uid, platform, ownershipId, log, traceId, stage }) {
+  if (!snapshot.exists) return;
+  const ownerUid = String(snapshot.get("ownerUid") || "").trim();
+  if (!ownerUid) throw new HttpsError("unavailable", "Subscription ownership is unconfirmed.");
+  if (ownerUid !== uid) {
+    safeLogWarn(log, "subscription_ownership.uid_rejected", {
+      event: "ownership.uid_rejected", occurredAt: new Date().toISOString(),
+      billingTraceId: traceId || null, platform, frameStage: stage,
+      requestUidSuffix: identifierSuffix(uid), ownerUidSuffix: identifierSuffix(ownerUid),
+      ownershipIdSuffix: identifierSuffix(ownershipId), uidRelation: "different",
+      reason: "other_uid_series", ownershipChanged: false, activeDeviceChanged: false,
+      effectsScope: "this_transaction_only",
+    });
+    throwSubscriptionAlreadyLinked({ uid, platform, ownerUid, ownershipId, log, traceId,
+      rejectReason: "other_uid_series" });
+  }
+}
+
+// Build 486 consolidation: used only by ownershipTransferAtomic.js (transferActiveContractOwnership).
+// Copied unchanged from the Build 477-based tree; the purchase/restore claim path below stays at Build 478 behavior.
 function expiredPreviousOwnerUpdate(userData, platform, ownershipId, expiryMs, admin, { transferred = false } = {}) {
   const store = userData.subscriptions?.[platform] || {};
   const rawIdentity = platform === "ios" ? store.originalTransactionId || userData.appStoreOriginalTransactionId :
@@ -813,318 +858,88 @@ function expiredPreviousOwnerUpdate(userData, platform, ownershipId, expiryMs, a
     entitlementUpdatedAt: admin.FieldValue.serverTimestamp(), billingRevision: Number(userData.billingRevision || 0) + 1 };
 }
 
-// Diagnostic record of every "may this UID take over a previous owner's series?" decision. It never
-// carries tokens, e-mail addresses or full identifiers, and a logging failure never changes the decision.
-function emitReassignmentDecision(log, traceId, uid, context, args, result) {
-  try {
-    const sink = result.proof ? log?.info : log?.warn;
-    if (typeof sink !== "function") return;
-    sink.call(log, "subscription_ownership.reassignment_decision", {
-      billingTraceId: traceId || null,
-      context,
-      platform: args.platform,
-      requestUidSuffix: identifierSuffix(uid),
-      ownerUidSuffix: identifierSuffix(args.ownerUid),
-      ownershipIdSuffix: identifierSuffix(args.ownershipId),
-      decision: result.proof ? "allow" : "reject",
-      decisionCode: result.code,
-      evidenceSource: result.source || null,
-      frameStage: "ownership_proof",
-      // Describe Proof A without logging its identifiers or re-running the proof.
-      prePurchaseRecordPresent: Boolean(args.userData?.billingConfirmation?.[args.platform]),
-      prePurchaseRecordEligible: args.userData?.billingConfirmation?.[args.platform]?.state === "eligible",
-      prePurchaseRecordReasonMatches: args.userData?.billingConfirmation?.[args.platform]?.reason === "verified_current_series_ended",
-      prePurchaseForeignSeriesPresent: Array.isArray(args.userData?.billingConfirmation?.[args.platform]?.expiredForeignSeries)
-        && args.userData.billingConfirmation[args.platform].expiredForeignSeries.length > 0,
-      nextAction: result.proof ? "ownership_commit" : "reject_preserve_owner",
-      ...(result.facts || {}),
-    });
-  } catch (_) { /* diagnostics only */ }
-}
-function reassignmentProof(args, { log, traceId, uid, context }) {
-  const result = evaluateExpiredReassignment(args);
-  emitReassignmentDecision(log, traceId, uid, context, args, result);
-  return result.proof;
-}
-
-async function claimOwnershipDocument(
-  db,
-  admin,
-  {
-    uid,
-    ownershipId,
-    platform,
-    ownershipFields,
-    linkedOwnershipId = "",
-    log,
-    traceId,
-    verifiedPurchase,
-  }
-) {
+async function claimOwnershipDocument(db, admin, {
+  uid, ownershipId, platform, ownershipFields, linkedOwnershipId = "", log, traceId, verifiedPurchase,
+}) {
   const now = admin.FieldValue.serverTimestamp();
   const linkedId = String(linkedOwnershipId || "").trim();
-
-  if (hasOwnershipLogger(log)) {
-    safeLogInfo(log, "subscription_ownership.claim.start", {
-      billingTraceId: traceId || null,
-      platform,
-      requestUidSuffix: identifierSuffix(uid),
-      ownershipIdSuffix: identifierSuffix(ownershipId),
-      linkedOwnershipIdSuffix: linkedId ? identifierSuffix(linkedId) : null,
+  safeLogInfo(log, "subscription_ownership.claim.start", {
+    event: "ownership.claim_start", occurredAt: new Date().toISOString(), billingTraceId: traceId || null,
+    platform, requestUidSuffix: identifierSuffix(uid), ownershipIdSuffix: identifierSuffix(ownershipId),
+    linkedOwnershipIdSuffix: linkedId ? identifierSuffix(linkedId) : null,
+  });
+  let action;
+  try {
+    action = await db.runTransaction(async (tx) => {
+      const { ref, snap } = await readOwnershipDoc(tx, db, ownershipId);
+      const user = await tx.get(db.collection("users").doc(uid));
+      const userData = user.exists ? user.data() || {} : {};
+      assertOwnershipUid(snap, { uid, platform, ownershipId, log, traceId, stage: "purchase_commit" });
+      const linked = linkedId && linkedId !== ownershipId ? await readOwnershipDoc(tx, db, linkedId) : null;
+      if (linked) assertOwnershipUid(linked.snap, { uid, platform, ownershipId: linkedId, log, traceId, stage: "linked_purchase_commit" });
+      // Old user-only records are never a source of permission to take ownership.
+      // Re-read known candidates in this transaction; no previous user is modified.
+      const foreign = [
+        ...(verifiedPurchase?.linkedLegacyOwners || []),
+        ...(userData.billingConfirmation?.[platform]?.expiredForeignSeries || []).filter(
+          (entry) => entry.kind === "users" && [ownershipId, linkedId].includes(entry.ownershipId)),
+      ];
+      for (const entry of foreign) {
+        if (!entry.ownerUid || entry.ownerUid === uid) continue;
+        await tx.get(db.collection("users").doc(entry.ownerUid));
+        throwSubscriptionAlreadyLinked({ platform, ownerUid: entry.ownerUid, ownershipId, log, traceId,
+          rejectReason: "other_uid_legacy_series" });
+      }
+      if (verifiedPurchase?.accountTag && verifiedPurchase.uidBound !== true) {
+        throw new HttpsError("failed-precondition", "Purchase account binding mismatch.", { code: SUBSCRIPTION_TOKEN_MISMATCH_CODE });
+      }
+      const series = assertUidSeriesDataAllowed(userData, { uid, platform,
+        incomingIds: [ownershipId, linkedId].filter(Boolean),
+        incomingOriginalTransactionId: ownershipFields?.appStoreOriginalTransactionId || "", log, traceId });
+      const nextAction = snap.exists ? "retained" : "created";
+      tx.set(ref, { ...ownershipFields, ownerUid: uid, platform, status: "active", updatedAt: now,
+        ...(!snap.exists ? { claimedAt: now } : {}), ...(linked?.snap.exists ? { linkedFromOwnershipId: linkedId } : {}),
+      }, { merge: true });
+      if (linked?.snap.exists) tx.set(linked.ref, { updatedAt: now, latestOwnershipId: ownershipId }, { merge: true });
+      return { nextAction, seriesRelation: series.action === "reuse" ? "same" : "new_or_changed" };
     });
+  } catch (error) {
+    safeLogWarn(log, "subscription_ownership.claim.aborted", {
+      event: "ownership.claim_aborted", occurredAt: new Date().toISOString(), billingTraceId: traceId || null,
+      platform, requestUidSuffix: identifierSuffix(uid), ...ownershipErrorDetails(error), frameStage: "purchase_commit",
+      ownershipChanged: false, activeDeviceChanged: false, effectsScope: "this_transaction_only",
+    });
+    throw error;
   }
+  safeLogInfo(log, "Subscription ownership " + action.nextAction + ".", {
+    event: "ownership." + action.nextAction, occurredAt: new Date().toISOString(), billingTraceId: traceId || null,
+    platform, requestUidSuffix: identifierSuffix(uid), ownershipIdSuffix: identifierSuffix(ownershipId),
+    uidRelation: action.nextAction === "created" ? "unowned" : "same", seriesRelation: action.seriesRelation,
+    frameStage: "ownership_commit", transactionResult: "committed",
+  });
+}
 
-  await db.runTransaction(async (tx) => {
-    const { ref, snap } = await readOwnershipDoc(tx, db, ownershipId);
-    const requestUserSnap = await tx.get(db.collection("users").doc(uid));
-    const requestUser = requestUserSnap.exists ? requestUserSnap.data() || {} : {};
-    const linkedLegacyUpdates = [];
-    for (const observed of verifiedPurchase?.linkedLegacyOwners || []) {
-      const ownerRef = db.collection("users").doc(observed.ownerUid);
-      const owner = await tx.get(ownerRef);
-      if (verifiedPurchase?.linkedState !== "ended" || verifiedPurchase?.linkedOwnershipId !== linkedId ||
-          observed.fingerprint !== fingerprint(owner)) throw new HttpsError("unavailable", "Linked legacy ownership changed or is unconfirmed.");
-      if (!snap.exists || snap.get("ownerUid") !== uid || verifiedPurchase?.uidBound !== true) {
-        if (!reassignmentProof({ userData: requestUser, platform, purchase: verifiedPurchase,
-          ownershipId: linkedId, ownerUid: observed.ownerUid, ownerSnapshot: owner, kind: "users" },
-          { log, traceId, uid, context: "linked_legacy_owner" }))
-          throw new HttpsError("unavailable", "Linked legacy purchase requires confirmed expired ownership.");
-      }
-      const update = expiredPreviousOwnerUpdate(owner.data() || {}, platform, linkedId, verifiedPurchase.linkedExpiryMs, admin);
-      if (update) linkedLegacyUpdates.push({ ref: ownerRef, update });
-    }
-    const assertLinkedObservation = (owner, ownerUser) => {
-      const observed = verifiedPurchase?.linkedObservation;
-      if (verifiedPurchase?.linkedState !== "ended" || observed?.ownershipId !== linkedId ||
-          observed.ownerUid !== owner.get("ownerUid") || observed.fingerprint !== fingerprint(owner) ||
-          observed.ownerUserFingerprint !== fingerprint(ownerUser)) throw new HttpsError("unavailable", "Linked ownership changed or is unconfirmed.");
-    };
-    if (snap.exists && linkedId) {
-      const linked = await readOwnershipDoc(tx, db, linkedId);
-      const linkedOwnerUid = linked.snap.exists ? String(linked.snap.get("ownerUid") || "") : "";
-      if (linkedOwnerUid && linkedOwnerUid !== uid) {
-        const linkedUser = await tx.get(db.collection("users").doc(linkedOwnerUid));
-        assertLinkedObservation(linked.snap, linkedUser);
-        if (snap.get("ownerUid") !== uid || linked.snap.get("latestOwnershipId") !== ownershipId || verifiedPurchase?.uidBound !== true)
-          throw new HttpsError("unavailable", "Existing primary has conflicting linked ownership.");
-      }
-    }
-
-    if (!snap.exists && linkedId) {
-      const linked = await readOwnershipDoc(tx, db, linkedId);
-      if (linked.snap.exists) {
-        const linkedOwnerUid = String(linked.snap.get("ownerUid") || "").trim();
-        if (linkedOwnerUid && linkedOwnerUid !== uid) {
-          const linkedOwnerRef = db.collection("users").doc(linkedOwnerUid);
-          const linkedOwnerSnap = await tx.get(linkedOwnerRef);
-          assertLinkedObservation(linked.snap, linkedOwnerSnap);
-          const linkedOwnerUsability = linkedOwnerSnap.exists
-            ? isSubscriptionOwnerCurrentlyUsable(
-                linkedOwnerSnap.data() || {},
-                platform,
-                new Date()
-              )
-            : {
-                ownerCurrentlyUsable: false,
-                decisionSource: "missing_owner_doc",
-              };
-          const proof = reassignmentProof({ userData: requestUser, platform, purchase: verifiedPurchase,
-            ownershipId: linkedId, ownerUid: linkedOwnerUid, ownerSnapshot: linked.snap, ownerUserSnapshot: linkedOwnerSnap },
-            { log, traceId, uid, context: "linked_ownership_conflict" });
-          if (!proof) {
-            if (hasOwnershipLogger(log)) {
-              safeLogInfo(log, "subscription_ownership.ownershipCandidateFound", {
-                billingTraceId: traceId || null,
-                platform,
-                ownerUidSuffix: identifierSuffix(linkedOwnerUid),
-                ownerCurrentlyUsable: linkedOwnerUsability.ownerCurrentlyUsable,
-                decision: "reject_active_owner",
-                decisionSource: linkedOwnerUsability.decisionSource,
-                context: "linked_ownership_conflict",
-              });
-            }
-            throwSubscriptionAlreadyLinked({
-              platform,
-              ownerUid: linkedOwnerUid,
-              ownershipId: linkedId,
-              log,
-              traceId,
-              rejectReason: "linked_ownership_conflict",
-            });
-          }
-          if (linkedOwnerSnap.exists) {
-            const update = expiredPreviousOwnerUpdate(linkedOwnerSnap.data() || {}, platform, linkedId, proof.expiryMs, admin);
-            if (update) tx.set(linkedOwnerRef, update, { merge: true });
-          }
-        }
-        tx.set(
-          ref,
-          {
-            ownerUid: uid,
-            platform,
-            status: "active",
-            claimedAt: now,
-            updatedAt: now,
-            linkedFromOwnershipId: linkedId,
-            ...ownershipFields,
-          },
-          { merge: true }
-        );
-        tx.set(
-          linked.ref,
-          {
-            updatedAt: now,
-            latestOwnershipId: ownershipId,
-          },
-          { merge: true }
-        );
-        if (hasOwnershipLogger(log)) {
-          safeLogInfo(log, "Subscription ownership claimed via linked token.", {
-            platform,
-            requestUidSuffix: identifierSuffix(uid),
-            ownershipIdSuffix: identifierSuffix(ownershipId),
-            linkedOwnershipIdSuffix: identifierSuffix(linkedId),
-          });
-        }
-        return;
-      }
-    }
-
-    if (!snap.exists) {
-      const legacyUpdates = [];
-      for (const entry of requestUser.billingConfirmation?.[platform]?.expiredForeignSeries || []) {
-        if (entry.kind !== "users" || ![ownershipId, linkedId].includes(entry.ownershipId)) continue;
-        const ownerRef = db.collection("users").doc(entry.ownerUid);
-        const owner = await tx.get(ownerRef);
-        const proof = reassignmentProof({ userData: requestUser, platform, purchase: verifiedPurchase,
-          ownershipId: entry.ownershipId, ownerUid: entry.ownerUid, ownerSnapshot: owner, kind: "users" },
-          { log, traceId, uid, context: "legacy_user_series" });
-        if (!proof) throw new HttpsError("unavailable", "Previous owner changed after expiry confirmation.");
-        if (entry.ownershipId === linkedId && verifiedPurchase?.linkedState !== "ended") throw new HttpsError("unavailable", "Linked legacy ownership is unconfirmed.");
-        const update = expiredPreviousOwnerUpdate(owner.data() || {}, platform, entry.ownershipId, proof.expiryMs, admin);
-        if (update) legacyUpdates.push({ ref: ownerRef, update });
-      }
-      for (const previous of legacyUpdates) tx.set(previous.ref, previous.update, { merge: true });
-      tx.set(ref, {
-        ownerUid: uid,
-        platform,
-        status: "active",
-        claimedAt: now,
-        updatedAt: now,
-        ...ownershipFields,
-      });
-      if (hasOwnershipLogger(log)) {
-        safeLogInfo(log, "Subscription ownership created.", {
-          platform,
-          traceId: traceId || null,
-          event: "ownership.created",
-          uidRelation: "new_ownership_record",
-          frameStage: "ownership_commit",
-          requestUidSuffix: identifierSuffix(uid),
-          ownershipIdSuffix: identifierSuffix(ownershipId),
-        });
-      }
-      return;
-    }
-
-    const existingOwnerUid = String(snap.get("ownerUid") || "").trim();
-    if (!existingOwnerUid || existingOwnerUid === uid) {
-      safeLogInfo(log, "Subscription ownership retained.", {
-        event: "ownership.retained", frameStage: "ownership_commit",
-        traceId: traceId || null, platform,
-        requestUidSuffix: identifierSuffix(uid),
-        existingOwnerPresent: Boolean(existingOwnerUid),
-        uidRelation: existingOwnerUid === uid ? "same_owner_uid" : "owner_unset",
-      });
-      for (const previous of linkedLegacyUpdates) tx.set(previous.ref, previous.update, { merge: true });
-      tx.set(
-        ref,
-        {
-          ownerUid: uid,
-          platform,
-          status: "active",
-          updatedAt: now,
-          ...ownershipFields,
-        },
-        { merge: true }
-      );
-      if (hasOwnershipLogger(log)) {
-        safeLogInfo(log, "Subscription ownership reused.", {
-          platform,
-          requestUidSuffix: identifierSuffix(uid),
-          ownershipIdSuffix: identifierSuffix(ownershipId),
-        });
-      }
-      return;
-    }
-
-    const existingOwnerRef = db.collection("users").doc(existingOwnerUid);
-    const existingOwnerSnap = await tx.get(existingOwnerRef);
-    const existingOwnerUsability = existingOwnerSnap.exists
-      ? isSubscriptionOwnerCurrentlyUsable(
-          existingOwnerSnap.data() || {},
-          platform,
-          new Date()
-        )
-      : {
-          ownerCurrentlyUsable: false,
-          decisionSource: "missing_owner_doc",
-        };
-
-    const proof = reassignmentProof({ userData: requestUser, platform, purchase: verifiedPurchase,
-      ownershipId, ownerUid: existingOwnerUid, ownerSnapshot: snap, ownerUserSnapshot: existingOwnerSnap },
-      { log, traceId, uid, context: "existing_owner_conflict" });
-    if (!proof) {
-      if (hasOwnershipLogger(log)) {
-        safeLogInfo(log, "subscription_ownership.ownershipCandidateFound", {
-          billingTraceId: traceId || null,
-          platform,
-          ownerUidSuffix: identifierSuffix(existingOwnerUid),
-          ownerCurrentlyUsable: existingOwnerUsability.ownerCurrentlyUsable,
-          decision: "reject_active_owner",
-          decisionSource: existingOwnerUsability.decisionSource,
-          context: "existing_owner_conflict",
-        });
-      }
-      throwSubscriptionAlreadyLinked({
-        platform,
-        ownerUid: existingOwnerUid,
-        ownershipId,
-        log,
-        traceId,
-        rejectReason: "existing_owner_conflict",
-      });
-    }
-
-    if (existingOwnerSnap.exists) {
-      const update = expiredPreviousOwnerUpdate(existingOwnerSnap.data() || {}, platform, ownershipId, proof.expiryMs, admin);
-      if (update) tx.set(existingOwnerRef, update, { merge: true });
-    }
-    for (const previous of linkedLegacyUpdates) tx.set(previous.ref, previous.update, { merge: true });
-
-    tx.set(
-      ref,
-      {
-        ownerUid: uid,
-        platform,
-        status: "active",
-        updatedAt: now,
-        ...ownershipFields,
-      },
-      { merge: true }
-    );
-    if (hasOwnershipLogger(log)) {
-      safeLogInfo(log, "Subscription ownership reassigned from inactive owner.", {
-        billingTraceId: traceId || null,
-        platform,
-        requestUidSuffix: identifierSuffix(uid),
-        previousOwnerUidSuffix: identifierSuffix(existingOwnerUid),
-        ownershipIdSuffix: identifierSuffix(ownershipId),
-        evidenceSource: proof.source || "client_confirmed",
-        previousOwnerEndedAt: Number.isFinite(proof.expiryMs) ? new Date(proof.expiryMs).toISOString() : null,
-      });
-    }
-    return;
+// Final device switch reads the saved contract's owner in the same transaction
+// that switches activeDeviceId. No Store-account comparison and no owner writes.
+async function assertStoredSubscriptionOwnership(tx, db, { uid, platform, userData, log, traceId }) {
+  const store = userData.subscriptions?.[platform] || {};
+  const primary = platform === "ios" ? store.originalTransactionId || userData.appStoreOriginalTransactionId
+    : store.primaryPurchaseToken || userData.googlePlayPrimaryPurchaseToken;
+  const bound = userData.boundSubscriptionSeries?.[platform] || {};
+  const primaryId = primary ? (platform === "ios" ? buildIosOwnershipId(primary) : buildAndroidOwnershipId(primary)) : bound.ownershipId;
+  if (!primaryId) throw new HttpsError("unavailable", "Saved subscription series is unconfirmed.");
+  const ids = [primaryId];
+  const linkedToken = platform === "android" && (store.linkedPurchaseToken || userData.googlePlayLinkedPurchaseToken);
+  if (linkedToken) ids.push(buildAndroidOwnershipId(linkedToken));
+  for (const ownershipId of [...new Set(ids)]) {
+    const { snap } = await readOwnershipDoc(tx, db, ownershipId);
+    if (!snap.exists) throw new HttpsError("unavailable", "Saved subscription owner is unconfirmed.");
+    assertOwnershipUid(snap, { uid, platform, ownershipId, log, traceId, stage: "device_commit" });
+  }
+  safeLogInfo(log, "subscription_ownership.device_owner_confirmed", {
+    event: "ownership.device_owner_confirmed", occurredAt: new Date().toISOString(), billingTraceId: traceId || null,
+    platform, requestUidSuffix: identifierSuffix(uid), ownershipIdSuffix: identifierSuffix(primaryId),
+    uidRelation: "same", frameStage: "device_commit", ownershipChanged: false,
   });
 }
 
@@ -1217,27 +1032,7 @@ async function assertSubscriptionNotLinkedToOtherUser(
     return;
   }
 
-  const userSnap = await db.collection("users").doc(uid).get();
-  const userData = userSnap.exists ? userSnap.data() || {} : {};
-  const proofIds = platform === "ios" ? [buildIosOwnershipId(identifiers.originalTransactionId || identifiers.transactionId)] :
-    incomingAndroidSeriesIds(identifiers.purchaseToken, identifiers.linkedPurchaseToken);
-  const ownerUidList = [];
-  for (const ownerUid of ownerUids) {
-    let permitted = false;
-    for (const id of proofIds) {
-      const owner = await db.collection(SUBSCRIPTION_OWNERSHIP_COLLECTION).doc(id).get();
-      const legacyOwner = await db.collection("users").doc(ownerUid).get();
-      if (owner.exists && owner.get("ownerUid") === ownerUid && reassignmentProof({
-        userData, platform, purchase: verifiedPurchase, ownershipId: id, ownerUid, ownerSnapshot: owner, ownerUserSnapshot: legacyOwner,
-      }, { log, traceId, uid, context: "users_collection_scan" })) permitted = true;
-      if (!owner.exists) {
-        if (reassignmentProof({ userData, platform, purchase: verifiedPurchase, ownershipId: id,
-          ownerUid, ownerSnapshot: legacyOwner, kind: "users" }, { log, traceId, uid, context: "users_collection_scan_legacy" })) permitted = true;
-      }
-    }
-    if (!permitted) ownerUidList.push(ownerUid);
-  }
-  if (!ownerUidList.length) return;
+  const ownerUidList = [...ownerUids];
   if (hasOwnershipLogger(log)) {
     safeLogWarn(log, "subscription_ownership.users_search.reject", {
       billingTraceId: traceId || null,
@@ -1532,8 +1327,10 @@ module.exports = {
   claimAndroidSubscriptionOwnership,
   inspectSubscriptionSeriesOwnership,
   claimOwnershipDocument,
-  expiredPreviousOwnerUpdate,
+  assertStoredSubscriptionOwnership,
+  ownershipErrorDetails,
   isSubscriptionOwnerCurrentlyUsable,
+  expiredPreviousOwnerUpdate,
   evaluateOwnerCandidates,
   isTrustedIosOwnershipStatus,
   readTrustedIosOwnershipOwner,

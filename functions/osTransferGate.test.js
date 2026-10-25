@@ -16,6 +16,9 @@ const request=(platform,mode="os_check")=>({auth:{uid:UID},app:{appId:platform==
   const db=makeDb({[`users/${UID}`]:{activeDeviceId:A,pendingActiveDeviceId:B,pendingActiveClaimGeneration:1,fcmToken:"PRIVATE_OLD_NOTIFICATION_TOKEN",
     subscriptions:{[to]:{status:state,expiryTime:new Date(Date.now()+86400000).toISOString()}}},
     [`users/${UID}/devices/${A}`]:{platform:from,platformAppCheckVerified:true,fcmToken:"PRIVATE_OLD_DEVICE_TOKEN"}});
+  const ownToken="fixture-os-owned", ownId=to === "ios" ? require("./subscriptionOwnership").buildIosOwnershipId(ownToken) : require("./subscriptionOwnership").buildAndroidOwnershipId(ownToken);
+  db.docs.get(`users/${UID}`).subscriptions[to][to === "ios" ? "originalTransactionId" : "primaryPurchaseToken"]=ownToken;
+  db.docs.set("subscription_ownership/"+ownId,{ownerUid:UID});
   const before=snapshotOf(db);const handler=createClaimActiveDeviceHandler({admin:adminFor(db),logger});
   const decision=await handler(request(to));
   assert.equal(decision.allowed,from===to);assert.equal(decision.osCheck,true);assert.equal(decision.osGateTraceId,trace);

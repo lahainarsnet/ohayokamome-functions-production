@@ -2379,8 +2379,7 @@ exports.verifyAppStoreSubscriptionPurchase = onCall(
         const verifiedPurchase = { active: validation.active, accountTag: info.appAccountToken || "",
           uidBound: Boolean(info.appAccountToken) && info.appAccountToken.toLowerCase() ===
             String(userSnap.get("appStoreAppAccountToken") || "").toLowerCase(), purchasedAt: Number(info.purchaseDate) };
-        // Moving an ACTIVE contract between UIDs is handled ONLY by transferActiveContractOwnership (it requires proof
-        // from the device's own StoreKit). A matching owner tag seen here is never enough; diagnostics only (no values).
+        // No purchase/restore completion may take another Firebase UID's contract.
         try {
           const ownerRecordedTag = owner.exists ? String(owner.get("appAccountToken") || "").toLowerCase() : "";
           if (owner.exists && owner.get("ownerUid") !== uid && ownerRecordedTag && ownerRecordedTag === String(info.appAccountToken || "").toLowerCase()) {
@@ -2391,17 +2390,17 @@ exports.verifyAppStoreSubscriptionPurchase = onCall(
         if (info.appAccountToken && !verifiedPurchase.uidBound) {
           throw new HttpsError("failed-precondition", "Transaction account binding mismatch.", { code: "SUBSCRIPTION_TOKEN_MISMATCH" });
         }
-        if (owner.exists && owner.get("ownerUid") !== uid &&
-            (data.completionMode !== "new_purchase" || !validation.active || !verifiedPurchase.uidBound)) {
+        if (owner.exists && owner.get("ownerUid") !== uid) {
           throw new HttpsError("failed-precondition", "Transaction belongs to another user.", { code: "SUBSCRIPTION_ALREADY_LINKED" });
         }
         await assertSubscriptionNotLinkedToOtherUser(admin.getDb(), {
           uid, platform: "ios", identifiers: ownershipIdentifiersFromAppStoreUpdate(update),
           verifiedPurchase, log: ownershipLog, traceId,
         });
-        // Existing owner: bookkeeping recovery never re-claims ownership.
-        // New verified purchases retain the existing bound-token/expired-owner safeguards.
-        if (!owner.exists || owner.get("ownerUid") !== uid) await claimIosSubscriptionOwnership(admin.getDb(), admin, {
+        // An expired completion replay only acknowledges the existing owner's
+        // transaction. It must not create an Active ownership record.
+        if (!owner.exists && !validation.active) throw new HttpsError("failed-precondition", "Expired transaction has no confirmed owner.");
+        if (!owner.exists) await claimIosSubscriptionOwnership(admin.getDb(), admin, {
           uid, update, transactionInfo: info, verifiedPurchase, productId: APP_STORE_PRODUCT_ID, log: ownershipLog, traceId,
         });
         await writeAppStoreVerifyUserUpdate({ uid, update, log: logger, traceId,

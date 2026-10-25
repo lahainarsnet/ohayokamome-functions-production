@@ -16,6 +16,7 @@ const {
 } = require("./registerDeviceFcmToken");
 
 const { safeTrace, logOsDecision, enforceOsDecision } = require("./osTransferGate");
+const { assertStoredSubscriptionOwnership, ownershipErrorDetails } = require("./subscriptionOwnership");
 
 const CLAIM_ACTIVE_DEVICE_TAG = "KAMOME_CLAIM_ACTIVE_DEVICE";
 const CLAIM_ACTIVE_DEVICE_NEEDS_CONFIRMATION = "NEEDS_CONFIRMATION";
@@ -298,6 +299,9 @@ function createClaimActiveDeviceHandler({ admin, logger }) {
               code: "DEVICE_SWITCH_CONTRACT_NOT_ACTIVE",
             });
           }
+          await assertStoredSubscriptionOwnership(tx, db, {
+            uid, platform: verifiedPlatform, userData, log: logger, traceId: input.deviceSwitchTraceId,
+          });
         }
       }
 
@@ -341,7 +345,7 @@ function createClaimActiveDeviceHandler({ admin, logger }) {
       logger.info("KAMOME_BILLING_OS_GATE", { event: input.mode === "os_check" ? "OS_GATE_1_READ_FAILED" : "OS_GATE_2_TRANSACTION_ABORT",
         osGateTraceId: input.osGateTraceId, path: "normal_transfer", transactionResult: "aborted", activeDeviceChanged: false,
         ownershipChanged: false, notificationChanged: false, oldDeviceStopIssued: false, effectsScope: "this_transaction_only",
-        errorCode: error?.details?.code || error?.code || "unknown", endedAt: new Date().toISOString() });
+        ...ownershipErrorDetails(error), endedAt: new Date().toISOString() });
       throw error;
     }
 

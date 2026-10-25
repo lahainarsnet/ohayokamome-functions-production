@@ -1,7 +1,7 @@
 "use strict";
 
 const { HttpsError } = require("firebase-functions/v2/https");
-const { inspectSubscriptionSeriesOwnership } = require("./subscriptionOwnership");
+const { inspectSubscriptionSeriesOwnership, ownershipErrorDetails } = require("./subscriptionOwnership");
 
 function createInspectSubscriptionSeriesOwnershipHandler({ admin, logger, secrets, getAppAppleId,
   verifySeriesState = async ({ platform, purchaseToken, linkedPurchaseToken, originalTransactionId, conflictingOwnershipIds }) => {
@@ -54,8 +54,17 @@ function createInspectSubscriptionSeriesOwnershipHandler({ admin, logger, secret
         traceId: data.billingTraceId,
         verifySeriesState,
       });
+      // Build 478 entry policy. A/B/C1 keep using the unchanged shared inspector.
+      if (["verified_other_owner_series_ended", "same_uid_series_expired_link_history"].includes(result.reason)) {
+        result.decision = "mismatch";
+        result.reason = "other_uid_series";
+      }
       try {
         ownershipLogger.info("subscription_ownership.inspect_result", {
+          occurredAt: new Date().toISOString(), frameStage: "entry_ownership",
+          uidRelation: result.decision === "match" ? "same" : result.decision === "mismatch" ? "different" : "unknown",
+          ownershipChanged: false, activeDeviceChanged: false,
+          nextAction: result.decision === "mismatch" ? "reject_to_login" : result.decision === "ambiguous" ? "safe_recheck" : "existing_contract_check",
           platform,
           billingTraceId: data.billingTraceId || null,
           requestUidTail: String(uid).slice(-6),
@@ -78,8 +87,8 @@ function createInspectSubscriptionSeriesOwnershipHandler({ admin, logger, secret
         logger.warn("subscription_ownership.inspect_failed", {
           platform,
           requestUidTail: String(uid).slice(-6),
-          errorCode: error?.code || null,
-          errorType: error?.constructor?.name || typeof error,
+          occurredAt: new Date().toISOString(), frameStage: "entry_ownership",
+          ...ownershipErrorDetails(error),
         });
       } catch (_) { /* diagnostics only */ }
       if (error instanceof HttpsError) {

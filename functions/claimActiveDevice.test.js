@@ -42,6 +42,17 @@ function createMockAdmin(initialDocs = {}, options = {}) {
       initialDocs[dp] = { platform: "ios", platformAppCheckVerified: true, ...initialDocs[dp] };
     }
   }
+  for (const [path, user] of Object.entries(initialDocs)) {
+    if (!/^users\/[^/]+$/.test(path)) continue;
+    for (const platform of ["ios", "android"]) {
+      if (!user.subscriptions?.[platform]) continue;
+      const token = "fixture-owned-" + platform;
+      const ownershipId = platform === "ios" ? require("./subscriptionOwnership").buildIosOwnershipId(token)
+        : require("./subscriptionOwnership").buildAndroidOwnershipId(token);
+      user.subscriptions[platform] = { ...user.subscriptions[platform], ...(platform === "ios" ? { originalTransactionId: token } : { primaryPurchaseToken: token }) };
+      initialDocs["subscription_ownership/" + ownershipId] = { ownerUid: path.split("/")[1] };
+    }
+  }
   const docs = new Map(Object.entries(initialDocs));
 
   return {
@@ -53,12 +64,12 @@ function createMockAdmin(initialDocs = {}, options = {}) {
     getDb() {
       return {
         collection(name) {
-          if (name !== "users") {
+          if (name !== "users" && name !== "subscription_ownership") {
             throw new Error(`Unexpected collection: ${name}`);
           }
           return {
             doc(uid) {
-              const userPath = `users/${uid}`;
+              const userPath = `${name}/${uid}`;
               return {
                 path: userPath,
                 collection(subName) {

@@ -29,12 +29,12 @@ const matchedLineItem={productId:'ohayo_kamome_monthly',expiryTime:new Date(now+
    if(state==='SUBSCRIPTION_STATE_EXPIRED'){
      const facts=await verifiedGoogleOwnershipFacts(args);assert.equal(facts.active,true);assert.equal(facts.linkedState,'ended');assert.ok(Number.isFinite(facts.linkedExpiryMs),'linked expiry is exposed for the server-derived proof');assert.equal(facts.linkedObservation.fingerprint,fingerprint(snap('subscription_ownership/'+oldId)));
      // A directly invoked verification cannot exploit an existing primary owner to ignore a foreign link.
-     await assert.rejects(()=>claimAndroidSubscriptionOwnership(db,admin,{uid:'user',purchaseToken:'new-token',linkedPurchaseToken:'old-token',verifiedPurchase:facts}),/conflicting linked ownership/);
+     await assert.rejects(()=>claimAndroidSubscriptionOwnership(db,admin,{uid:'user',purchaseToken:'new-token',linkedPurchaseToken:'old-token',verifiedPurchase:facts}),e=>e.details?.code==='SUBSCRIPTION_ALREADY_LINKED');
      docs['subscription_ownership/'+oldId].latestOwnershipId=newId;
      const historyFacts=await verifiedGoogleOwnershipFacts(args);
-     await assert.rejects(()=>claimAndroidSubscriptionOwnership(db,admin,{uid:'user',purchaseToken:'new-token',linkedPurchaseToken:'old-token',verifiedPurchase:historyFacts}),/unexpected write/);
+     await assert.rejects(()=>claimAndroidSubscriptionOwnership(db,admin,{uid:'user',purchaseToken:'new-token',linkedPurchaseToken:'old-token',verifiedPurchase:historyFacts}),e=>e.details?.code==='SUBSCRIPTION_ALREADY_LINKED');
      docs['users/old'].changedAfterRead=true;
-     await assert.rejects(()=>claimAndroidSubscriptionOwnership(db,admin,{uid:'user',purchaseToken:'new-token',linkedPurchaseToken:'old-token',verifiedPurchase:historyFacts}),/changed or is unconfirmed/);
+     await assert.rejects(()=>claimAndroidSubscriptionOwnership(db,admin,{uid:'user',purchaseToken:'new-token',linkedPurchaseToken:'old-token',verifiedPurchase:historyFacts}),e=>e.details?.code==='SUBSCRIPTION_ALREADY_LINKED');
    } else await assert.rejects(()=>verifiedGoogleOwnershipFacts(args));
  }
  delete docs['subscription_ownership/'+oldId];
@@ -43,9 +43,9 @@ const matchedLineItem={productId:'ohayo_kamome_monthly',expiryTime:new Date(now+
    const args={db,uid:'user',purchaseToken:'new-token',subscription,matchedLineItem,verifyLinked:async()=>({subscription:{subscriptionState:state},matchedLineItem:{...matchedLineItem,expiryTime:new Date(state==='SUBSCRIPTION_STATE_ACTIVE'?now+100000:now-100000).toISOString()}})};
    if(state!=='SUBSCRIPTION_STATE_EXPIRED') await assert.rejects(()=>verifiedGoogleOwnershipFacts(args));
    else {const facts=await verifiedGoogleOwnershipFacts(args);assert.equal(facts.linkedLegacyOwners[0].ownerUid,'old');
-     await assert.rejects(()=>claimAndroidSubscriptionOwnership(db,admin,{uid:'user',purchaseToken:'new-token',linkedPurchaseToken:'old-token',verifiedPurchase:facts}),/unexpected write/);
+     await assert.rejects(()=>claimAndroidSubscriptionOwnership(db,admin,{uid:'user',purchaseToken:'new-token',linkedPurchaseToken:'old-token',verifiedPurchase:facts}),e=>e.details?.code==='SUBSCRIPTION_ALREADY_LINKED');
      docs['users/old'].changed=true;
-     await assert.rejects(()=>claimAndroidSubscriptionOwnership(db,admin,{uid:'user',purchaseToken:'new-token',linkedPurchaseToken:'old-token',verifiedPurchase:facts}),/changed or is unconfirmed/);
+     await assert.rejects(()=>claimAndroidSubscriptionOwnership(db,admin,{uid:'user',purchaseToken:'new-token',linkedPurchaseToken:'old-token',verifiedPurchase:facts}),e=>e.details?.code==='SUBSCRIPTION_ALREADY_LINKED');
    }
  }
  console.log('verifiedOwnershipPurchase: primary existing + foreign linked Active/Unknown/Expired/freshness checks PASS');
