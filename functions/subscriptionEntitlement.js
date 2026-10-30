@@ -7,6 +7,8 @@
  * - Applies caller platform-specific legacy fields (appStore*, googlePlay*, etc.)
  */
 
+const { safeErrorLogFields } = require("./logSafeError");
+
 const ENTITLEMENT_TRACE = "KAMOME_ENTITLEMENT_TRACE";
 
 const APP_STORE_PRODUCT_ID = "ohayo_kamome_monthly";
@@ -933,7 +935,7 @@ async function commitUserSubscriptionDualWrite({
       transactionIdTail: idTail(meta.transactionId),
       originalTransactionIdTail: idTail(meta.originalTransactionId),
       purchaseTokenTail: idTail(meta.purchaseToken),
-      errorMessage: error?.message || String(error),
+      ...safeErrorLogFields(error, "dual_write"),
       elapsedMs: Date.now() - startedAt,
     };
     if (typeof log.error === "function") {

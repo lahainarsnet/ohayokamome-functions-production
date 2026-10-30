@@ -157,6 +157,59 @@ async function runTests() {
     }
   }
 
+  {
+    // >256 chars must not bypass the forbidden-value check.
+    const withEmail = `${"x".repeat(100)}user@example.com${"y".repeat(184)}`;
+    assert.equal(withEmail.length, 300);
+    const harmless = "z".repeat(300);
+    const fields = sanitizeClientDiagFields("billing_purchase_failed", {
+      reason: withEmail,
+      errorCode: harmless,
+      billingTraceId: "aaaaaaaa-bbbb-4ccc-dddd-eeeeeeeeeeee",
+    });
+    assert.equal(fields.reason, "[redacted]");
+    assert.equal(fields.errorCode, "z".repeat(256));
+    assert.equal(fields.billingTraceId, "aaaaaaaa-bbbb-4ccc-dddd-eeeeeeeeeeee");
+
+    const shortCodes = sanitizeClientDiagFields("cf_call_failed", {
+      reason: "ensure_app_store_failed",
+      errorCode: "unavailable",
+      callableName: "ensureAppStoreAppAccountToken",
+    });
+    assert.equal(shortCodes.reason, "ensure_app_store_failed");
+    assert.equal(shortCodes.errorCode, "unavailable");
+    assert.equal(shortCodes.callableName, "ensureAppStoreAppAccountToken");
+  }
+
+  {
+    const logger = createTestLogger();
+    const handler = createEmitKamomeClientDiagHandler({ logger });
+    const response = await runHandler(handler, {
+      auth: { uid: "abcdefghij" },
+      data: { event: `billing_purchase_failed${"x".repeat(300)}`, fields: {} },
+    });
+    assert.equal(response.ok, false);
+    assert.equal(response.error.code, "invalid-argument");
+    assert.equal(logger.entries.length, 0);
+  }
+
+  {
+    const logger = createTestLogger();
+    const handler = createEmitKamomeClientDiagHandler({ logger });
+    const response = await runHandler(handler, {
+      auth: { uid: "abcdefghij" },
+      data: {
+        event: "billing_purchase_failed",
+        fields: { reason: `${"r".repeat(280)}@x`, errorCode: "unavailable" },
+      },
+    });
+    assert.equal(response.ok, true);
+    assert.deepEqual(response.result, { ok: true });
+    assert.equal(logger.entries.length, 1);
+    assert.equal(logger.entries[0].payload.reason, "r".repeat(256));
+    assert.equal(logger.entries[0].payload.errorCode, "unavailable");
+  }
+
   console.log("emitKamomeClientDiag.test.js: all tests passed");
 }
 

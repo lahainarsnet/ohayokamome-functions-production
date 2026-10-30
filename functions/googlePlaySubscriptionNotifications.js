@@ -8,6 +8,7 @@ const {
   inferAndroidAutoRenewing,
   isStoreEntitlementUsable,
 } = require("./subscriptionEntitlement");
+const { safeErrorLogFields } = require("./logSafeError");
 
 const GOOGLE_PLAY_PACKAGE_NAME = "com.lahainarsnet.ohayokamome.live";
 const GOOGLE_PLAY_MONTHLY_PRODUCT_ID = "ohayo_kamome_monthly";
@@ -1473,7 +1474,7 @@ function createGooglePlayRtdnHandler({ getDb, admin, logger }) {
           logger.info(`${NOTIFICATION_TRACE} revocation resolved`, {
             messageId,
             eventId,
-            uid: userLookup.uid,
+            uidSuffix: tokenSuffix(String(userLookup.uid || "")),
             action: revocationResolution.action,
             notificationPurchaseTokenSuffix: tokenSuffix(purchaseToken),
             revokedTokenIgnored: revocationResolution.revokedTokenIgnored
@@ -1522,7 +1523,7 @@ function createGooglePlayRtdnHandler({ getDb, admin, logger }) {
       logger.info(`${NOTIFICATION_TRACE} processed`, {
         messageId,
         eventId,
-        uid: userLookup.uid,
+        uidSuffix: tokenSuffix(String(userLookup.uid || "")),
         purchaseTokenSuffix: tokenSuffix(purchaseToken),
         subscriptionStatus: finalDerived.status,
         result: applyResult.applied ? "user_updated" : applyResult.reason,
@@ -1554,9 +1555,7 @@ function createGooglePlayRtdnHandler({ getDb, admin, logger }) {
       logger.error(`${NOTIFICATION_TRACE} failed`, {
         messageId,
         eventId: fallbackEventId,
-        errorMessage: error?.message || String(error),
-        errorName: error?.name || null,
-        errorStack: error?.stack || null,
+        ...safeErrorLogFields(error, "rtdn_handle"),
         purchaseTokenSuffix: tokenSuffix(
           developerNotification?.subscriptionNotification?.purchaseToken ||
             developerNotification?.voidedPurchaseNotification?.purchaseToken ||

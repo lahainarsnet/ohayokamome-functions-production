@@ -19,6 +19,7 @@ const {
   commitUserSubscriptionDualWrite,
 } = require("./subscriptionEntitlement");
 const { normalizeUuid, tokenSuffix } = require("./billingFinalTrace");
+const { safeErrorLogFields, safeLookupErrorsForLog, redactLogText } = require("./logSafeError");
 const {
   readTrustedIosOwnershipOwner,
   detachStaleAppleIdentifiersFromOtherUsers,
@@ -949,9 +950,9 @@ function createAppStoreNotificationHandler({
           );
         } catch (renewalError) {
           logger.warn(`${NOTIFICATION_TRACE} renewal decode failed`, {
-            uid: userLookup.uid,
+            uidSuffix: tokenSuffix(userLookup.uid),
             notificationUUID,
-            message: renewalError?.message || String(renewalError),
+            ...safeErrorLogFields(renewalError, "renewal_decode"),
           });
         }
       }
@@ -1048,7 +1049,7 @@ function createAppStoreNotificationHandler({
           logger.warn(`${NOTIFICATION_TRACE} detach_stale_failed`, {
             ownerUidSuffix: tokenSuffix(userLookup.uid),
             originalTransactionIdSuffix: tokenSuffix(originalTransactionId),
-            errorMessage: cleanupError?.message || String(cleanupError),
+            ...safeErrorLogFields(cleanupError, "detach_stale"),
           });
         }
       }
@@ -1089,14 +1090,10 @@ function createAppStoreNotificationHandler({
       const notificationUUID = peeked?.notificationUUID || "";
       logger.error(`${NOTIFICATION_TRACE} failed`, {
         notificationUUID: notificationUUID || null,
-        errorMessage: error?.message || String(error),
-        errorName: error?.name || null,
-        errorStack: error?.stack || null,
-        errorStatus: error?.status ?? null,
-        errorCauseMessage: error?.cause?.message ?? null,
-        primaryMessage: error?.primaryMessage,
-        fallbackMessage: error?.fallbackMessage,
-        lookupErrors: error?.lookupErrors || null,
+        ...safeErrorLogFields(error, "notification_handle"),
+        primaryMessage: error?.primaryMessage == null ? undefined : redactLogText(error.primaryMessage),
+        fallbackMessage: error?.fallbackMessage == null ? undefined : redactLogText(error.fallbackMessage),
+        lookupErrors: safeLookupErrorsForLog(error?.lookupErrors),
       });
 
       if (notificationUUID) {

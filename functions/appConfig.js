@@ -1,5 +1,6 @@
 const logger = require("firebase-functions/logger");
 const admin = require("./firebaseAdmin");
+const { safeErrorLogFields } = require("./logSafeError");
 
 const APP_GATE_COLLECTION = "admin";
 const APP_GATE_DOC_ID = "app_gate";
@@ -111,7 +112,7 @@ async function loadAppConfig() {
     logger.info("loadAppConfig resolved", result);
     return result;
   } catch (e) {
-    logger.warn("Failed to read config/app; using defaults.", e);
+    logger.warn("Failed to read config/app; using defaults.", safeErrorLogFields(e, "load_app_config"));
     return {
       ...defaults,
       dailySendLimitFromDoc: null,

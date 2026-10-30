@@ -92,17 +92,16 @@ function sanitizeString(value, { allowUuid = false } = {}) {
   if (!normalized) {
     return "";
   }
-  if (normalized.length > MAX_STRING_LENGTH) {
-    return normalized.slice(0, MAX_STRING_LENGTH);
-  }
+  // Truncate first, then inspect the value that will actually be logged.
+  const bounded = normalized.slice(0, MAX_STRING_LENGTH);
   if (!allowUuid) {
     for (const pattern of FORBIDDEN_VALUE_PATTERNS) {
-      if (pattern.test(normalized)) {
+      if (pattern.test(bounded)) {
         return "[redacted]";
       }
     }
   }
-  return normalized;
+  return bounded;
 }
 
 function sanitizeFieldValue(key, value) {
