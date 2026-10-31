@@ -72,6 +72,7 @@ const {
   claimIosSubscriptionOwnership,
   claimAndroidSubscriptionOwnership,
 } = require("./subscriptionOwnership");
+const { reassignEndedIosSeriesToOwnPurchase } = require("./iosOwnPurchaseReassignment");
 const {
   extractBillingTraceId,
   tokenSuffix: billingTokenSuffix,
@@ -2658,6 +2659,20 @@ exports.verifyAppStoreSubscriptionPurchase = onCall(
           environment: result.environment || null,
         });
       } catch (_) { /* diagnostics only */ }
+      // Build 495: the requester's own purchase made after the previous owner's contract had ended takes the
+      // Apple series over here (same proof as the approved recovery). Without a proof nothing changes and the
+      // checks below refuse as before.
+      const purchaseUserTag = String((await admin.getDb().collection("users").doc(uid).get()).get("appStoreAppAccountToken") || "").toLowerCase();
+      await reassignEndedIosSeriesToOwnPurchase(admin.getDb(), admin, {
+        uid,
+        transactionInfo: result.transactionInfo,
+        purchase: { active: Number(result.transactionInfo.expiresDate) > Date.now() && !result.transactionInfo.revocationDate,
+          accountTag: result.transactionInfo.appAccountToken || "",
+          uidBound: Boolean(result.transactionInfo.appAccountToken) && result.transactionInfo.appAccountToken.toLowerCase() === purchaseUserTag,
+          purchasedAt: Number(result.transactionInfo.purchaseDate) },
+        log: ownershipLog,
+        traceId,
+      });
       await assertSubscriptionNotLinkedToOtherUser(admin.getDb(), {
         uid,
         platform: "ios",
