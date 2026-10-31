@@ -2663,7 +2663,7 @@ exports.verifyAppStoreSubscriptionPurchase = onCall(
       // Apple series over here (same proof as the approved recovery). Without a proof nothing changes and the
       // checks below refuse as before.
       const purchaseUserTag = String((await admin.getDb().collection("users").doc(uid).get()).get("appStoreAppAccountToken") || "").toLowerCase();
-      await reassignEndedIosSeriesToOwnPurchase(admin.getDb(), admin, {
+      const ownPurchaseTakeover = await reassignEndedIosSeriesToOwnPurchase(admin.getDb(), admin, {
         uid,
         transactionInfo: result.transactionInfo,
         purchase: { active: Number(result.transactionInfo.expiresDate) > Date.now() && !result.transactionInfo.revocationDate,
@@ -2688,7 +2688,8 @@ exports.verifyAppStoreSubscriptionPurchase = onCall(
         uid,
         update,
         transactionInfo: result.transactionInfo,
-        verifiedPurchase: { uidBound: true, purchasedAt: Number(result.transactionInfo.purchaseDate) },
+        verifiedPurchase: { uidBound: true, purchasedAt: Number(result.transactionInfo.purchaseDate),
+          reassignedFromUid: ownPurchaseTakeover.previousOwnerUid || "" },
         productId: APP_STORE_PRODUCT_ID,
         log: ownershipLog,
         traceId,

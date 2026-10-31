@@ -2,6 +2,7 @@
 // Build 495: iPhone purchase verification takes over an ENDED Apple series for the requester's own purchase.
 const assert = require("node:assert/strict");
 const { reassignEndedIosSeriesToOwnPurchase } = require("./iosOwnPurchaseReassignment");
+const { claimOwnershipDocument } = require("./subscriptionOwnership");
 const { buildIosOwnershipId } = require("./subscriptionOwnership");
 const { fingerprint } = require("./expiredOwnershipProof");
 const { makeDb, adminFor, snapshotOf } = require("./ownershipTransferTestKit");
@@ -42,6 +43,7 @@ const check = async (name, fn) => { await fn(); results.push(name); };
     const db = makeDb(docs());
     const r = await run(db);
     assert.equal(r.reassigned, true);
+    assert.equal(r.previousOwnerUid, X, "the previous owner is returned so the claim can ignore only that uid's leftover entry");
     assert.equal(r.code, "ALLOW_SERVER_DERIVED_IOS_OWNER_RECORD");
     assert.equal(db.docs.get(`subscription_ownership/${OWN_ID}`).ownerUid, Y);
     const x = db.docs.get(`users/${X}`);
@@ -99,6 +101,25 @@ const check = async (name, fn) => { await fn(); results.push(name); };
     assert.equal(r.reassigned, false);
     assert.equal(r.code, "REASSIGNMENT_NOT_APPLIED");
     assert.equal(snapshotOf(db), before);
+  });
+
+  const claimDocs = (entries) => ({
+    [`users/${Y}`]: { appStoreAppAccountToken: TAG_Y, billingConfirmation: { ios: { expiredForeignSeries: entries } } },
+    [`users/${X}`]: xUser(),
+    [`subscription_ownership/${OWN_ID}`]: { ownerUid: Y, platform: "ios", status: "active" }, // already taken over
+  });
+  const legacyEntry = (ownerUid) => ({ ownershipId: OWN_ID, ownerUid, kind: "users", fingerprint: "f", ownerUserFingerprint: "f", expiryMs: 1 });
+  const claim = (db, reassignedFromUid) => claimOwnershipDocument(db, adminFor(db), { uid: Y, ownershipId: OWN_ID, platform: "ios",
+    verifiedPurchase: { active: true, uidBound: true, accountTag: TAG_Y, purchasedAt: PURCHASED_AT, ...(reassignedFromUid ? { reassignedFromUid } : {}) },
+    ownershipFields: { appStoreOriginalTransactionId: ORIG }, log: { info() {}, warn() {} } });
+  await check("12. claim after a takeover ignores ONLY the taken-over uid's leftover legacy entry", async () => {
+    await claim(makeDb(claimDocs([legacyEntry(X)])), X);
+  });
+  await check("13. claim without a takeover still refuses another uid's legacy entry", async () => {
+    await assert.rejects(() => claim(makeDb(claimDocs([legacyEntry(X)])), ""), (e) => e.details && e.details.code === "SUBSCRIPTION_ALREADY_LINKED");
+  });
+  await check("14. claim after a takeover still refuses a THIRD uid's legacy entry", async () => {
+    await assert.rejects(() => claim(makeDb(claimDocs([legacyEntry(X), legacyEntry("user-third-0123456789")])), X), (e) => e.details && e.details.code === "SUBSCRIPTION_ALREADY_LINKED");
   });
 
   for (const name of results) console.log(`PASS ${name}`);

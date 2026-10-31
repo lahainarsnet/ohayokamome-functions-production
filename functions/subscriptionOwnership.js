@@ -886,6 +886,9 @@ async function claimOwnershipDocument(db, admin, {
       ];
       for (const entry of foreign) {
         if (!entry.ownerUid || entry.ownerUid === uid) continue;
+        // Build 495: the previous owner whose ended series THIS purchase just took over (iosOwnPurchaseReassignment) has
+        // already been resolved with the same proof; only that uid's leftover legacy entry is ignored.
+        if (verifiedPurchase?.reassignedFromUid && entry.ownerUid === verifiedPurchase.reassignedFromUid) continue;
         await tx.get(db.collection("users").doc(entry.ownerUid));
         throwSubscriptionAlreadyLinked({ platform, ownerUid: entry.ownerUid, ownershipId, log, traceId,
           rejectReason: "other_uid_legacy_series" });

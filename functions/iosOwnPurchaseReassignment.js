@@ -45,7 +45,9 @@ async function reassignEndedIosSeriesToOwnPurchase(db, admin, { uid, transaction
     previousOwnerUidSuffix: result.ownerUid ? identifierSuffix(result.ownerUid) : null,
     reassigned: result.reassigned, code: result.code || null, evidence: result.evidence || null, errorType: result.errorType || null,
   });
-  return { reassigned: result.reassigned, code: result.code || null };
+  // previousOwnerUid is returned only for a completed takeover: the caller passes it on so the claim that follows
+  // ignores this one uid's leftover legacy (users-collection) entry in the pre-purchase record.
+  return { reassigned: result.reassigned, code: result.code || null, previousOwnerUid: result.reassigned ? result.ownerUid : "" };
 }
 
 function reassignInTransaction(db, admin, { uid, ownershipId, ownRef, purchase, now }) {
