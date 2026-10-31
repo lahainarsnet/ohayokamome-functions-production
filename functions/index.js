@@ -6,6 +6,12 @@
 
 const { onDocumentCreated } = require("firebase-functions/v2/firestore");
 const { onCall, onRequest, HttpsError } = require("firebase-functions/v2/https");
+const { setGlobalOptions } = require("firebase-functions/v2");
+
+// Keep the production max-instances of 2nd-gen functions at 20 (the value they
+// had before Build 492). Functions that set maxInstances themselves (30) keep
+// their own value; the 1st-gen function is not affected by v2 global options.
+setGlobalOptions({ maxInstances: 20 });
 const { defineSecret, defineString } = require("firebase-functions/params");
 const logger = require("firebase-functions/logger");
 const crypto = require("node:crypto");
